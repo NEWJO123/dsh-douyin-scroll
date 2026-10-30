@@ -28,7 +28,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, utf8_stdio  # noqa: E402
+
+# 体检输出里带昵称（可能含 emoji）—— 被 api-reply.py 读 stdout，崩了整条链就断（Issue #7②）
+utf8_stdio()
+
 import time
 
 HOME = home_str()

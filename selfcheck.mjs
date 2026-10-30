@@ -10,10 +10,11 @@
  * ============================================================================
  */
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { findBrowser } from './lib/chrome.mjs'
+import { homeDir } from './lib/paths.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 let pass = 0
@@ -296,25 +297,45 @@ try {
   console.log('\n4d-2. 人设文件的结构（例子 / 边界 / 称呼）')
   // ⚠️ 下面几段都要用到章程内容，先读出来（原来定义在后面，前面用会 TDZ 报错）
   const charter2 = readFileSync(join(here, 'prompts', 'duty.md'), 'utf8')
-  const personaFile = join(here, 'prompts', 'persona.md')
-  const persona = existsSync(personaFile) ? readFileSync(personaFile, 'utf8') : ''
-  const personaDefault = (() => {
-    try { return readFileSync(join(here, 'prompts', 'persona.default.md'), 'utf8') } catch { return '' }
-  })()
-  // 拿「实际生效的那份」来查：有本地私有配置就用它，否则用中性默认
-  const activePersona = persona || personaDefault
-  // ① 必须有正反对照表（❌ 什么样 / ✅ 什么样），光有形容词没用
-  if (/正反|❌[^\n]*✅|\|\s*❌/.test(activePersona)) {
-    ok('人设里有正反对照（❌ 反例 / ✅ 正例）—— 比抽象形容词管用')
-  } else bad('人设只有抽象形容词（"软一点""别腻"）—— 模型学不会，写出来还是模板腔')
-  // ② 必须有"什么时候该收着"的边界，否则会一直卖弄
-  if (/该收的时候收|收敛|不许.*稀释|别腻/.test(activePersona)) {
-    ok('人设写明了什么时候该收着（讲风险 / 等结果时不许卖弄）')
-  } else bad('人设只有风格没有收敛 —— 讲红线、风险时也在耍宝就废了')
-  // ③ 称呼边界：有个"只能叫某一个人"的概念（不管具体叫法）
-  if (/只能叫|只属于|不许乱叫|只对.*一个/.test(activePersona)) {
-    ok('人设写明了称呼边界（某种称呼只能对一个人用）')
-  } else bad('人设没说称呼边界 —— 会对着路人乱叫')
+  /**
+   * 🔴 2026-10-30 修：这里必须和 `runDuty` 用**同一套三层解析**。
+   *
+   * 原来只认 `prompts/persona.md`，读不到就整段退到 `persona.default.md` 上做断言 ——
+   * 可 default 是**中性默认**，设计上就不带 ❌/✅ 正反对照、不带称呼边界，
+   * 于是「这台机器还没配过自己的人设」被报成了「人设写坏了」。
+   * 而 `git clone` 下来的人 100% 都是这个状态，README 却写着「全部通过再装」——
+   * 干净克隆上那句话**永远不可能成立**，使用者照文档走第一步就卡住。
+   *
+   * 现在的口径：有自己那份（①`$DOUYIN_HOME/persona.md` ②`prompts/persona.md`）
+   * 才查结构；一份都没有 = 正常状态（首次使用），明说"走中性默认"，不判失败。
+   * ⚠️ 中性默认的身份牌不在这里守，它在 4d-5（`persona: default`）。
+   */
+  const minePath = (() => { try { return join(homeDir({ create: false }), 'persona.md') } catch { return '' } })()
+  const ownPersona = [
+    minePath && existsSync(minePath) ? { file: minePath, from: '你自己那份（$DOUYIN_HOME/persona.md）' } : null,
+    existsSync(join(here, 'prompts', 'persona.md')) ? { file: join(here, 'prompts', 'persona.md'), from: '插件自带（prompts/persona.md）' } : null,
+  ].filter(Boolean)[0] || null
+  const personaDefault = readIf(join(here, 'prompts', 'persona.default.md'))
+  // 「实际生效的那份」：有自己那份就用它，否则是中性默认
+  const activePersona = ownPersona ? readIf(ownPersona.file) : personaDefault
+  if (!ownPersona) {
+    if (personaDefault.trim()) ok('本机还没配自己的人设 —— 会落到中性默认 persona.default.md（干净安装就是这个状态，不算失败）')
+    else bad('既没有自己那份人设，也没有 persona.default.md —— 装上等于没有人设')
+    warn('还没配人设 ⇒ 跳过三条结构检查（正反对照 / 何时收着 / 称呼边界）；写了自己那份才会查')
+  } else {
+    // ① 必须有正反对照表（❌ 什么样 / ✅ 什么样），光有形容词没用
+    if (/正反|❌[^\n]*✅|\|\s*❌/.test(activePersona)) {
+      ok('人设里有正反对照（❌ 反例 / ✅ 正例）—— 比抽象形容词管用')
+    } else bad('人设只有抽象形容词（"软一点""别腻"）—— 模型学不会，写出来还是模板腔')
+    // ② 必须有"什么时候该收着"的边界，否则会一直卖弄
+    if (/该收的时候收|收敛|不许.*稀释|别腻/.test(activePersona)) {
+      ok('人设写明了什么时候该收着（讲风险 / 等结果时不许卖弄）')
+    } else bad('人设只有风格没有收敛 —— 讲红线、风险时也在耍宝就废了')
+    // ③ 称呼边界：有个"只能叫某一个人"的概念（不管具体叫法）
+    if (/只能叫|只属于|不许乱叫|只对.*一个/.test(activePersona)) {
+      ok('人设写明了称呼边界（某种称呼只能对一个人用）')
+    } else bad('人设没说称呼边界 —— 会对着路人乱叫')
+  }
   /**
    * ⭐⭐ 4d-2b. **章程与私人口吻的隔离**
    *
@@ -347,18 +368,41 @@ try {
     else bad('pre-push hook 存在但没拦住 —— 形同虚设')
   } else bad('没有 .githooks/pre-push —— 只在文档里写"不许推"，会忘')
   // hook 必须真的挂上（core.hooksPath 指对地方），否则文件在也不生效
+  /**
+   * 🔴 2026-10-30 修：`core.hooksPath` 是**本地配置**，`git clone` 不会带过来 ——
+   * 所以每个新克隆读到的都是空串，原来这里直接判 ❌，「干净克隆全过」永远不成立。
+   * 这一项的意图是「hook 真生效」而不是「文件存在」，那就把它挂上（`--local`，可逆，不联网）。
+   * ⚠️ 只在**本目录就是仓库根**时动手：否则 `--local` 会写进外层仓库的 config。
+   */
   try {
-    const r = spawnSync('git', ['config', 'core.hooksPath'], { cwd: here, encoding: 'utf8', timeout: 15_000 })
-    const hp = String(r.stdout || '').trim()
-    if (hp === '.githooks') ok('core.hooksPath 指向 .githooks（hook 真的生效）')
-    else bad(`core.hooksPath 是 "${hp}" 不是 .githooks —— hook 装了也不跑`)
+    const git = (args) => spawnSync('git', args, { cwd: here, encoding: 'utf8', timeout: 15_000 })
+    const top = String(git(['rev-parse', '--show-toplevel']).stdout || '').trim()
+    const isRepoRoot = top && resolve(top) === resolve(here)
+    const hp = String(git(['config', 'core.hooksPath']).stdout || '').trim()
+    if (hp === '.githooks') {
+      ok('core.hooksPath 指向 .githooks（hook 真的生效）')
+    } else if (!hp && isRepoRoot && existsSync(prePush)) {
+      const r = git(['config', '--local', 'core.hooksPath', '.githooks'])
+      const after = String(git(['config', 'core.hooksPath']).stdout || '').trim()
+      if (r.status === 0 && after === '.githooks') ok('core.hooksPath 原来空着，已顺手设为 .githooks（新克隆不会自动带，这次挂上）')
+      else bad('core.hooksPath 挂不上 —— pre-push 拦不住推送')
+    } else if (!hp) {
+      warn('core.hooksPath 空着，且这里不是 git 仓库根（下载的 zip / 解压包）—— pre-push 拦不住推送')
+    } else {
+      bad(`core.hooksPath 是 "${hp}" 不是 .githooks —— hook 装了也不跑`)
+    }
   } catch { warn('读不到 core.hooksPath（可能不是 git 仓库，或没装 git）') }
   // 文档里要写清版本号怎么用
   if (/不发版本|版本号只跟/.test(charter2) || /版本号只跟/.test(readFileSync(join(here, 'CHANGELOG.md'), 'utf8'))) {
     ok('文档写明了版本号怎么用（只跟"使用者能感觉到的变化"走）')
   } else warn('文档没写版本号规矩 —— 容易随手发版本')
-  if (/persona: douyin-scroll/.test(activePersona.split('\n')[0] || '')) ok('人设文件第一行有身份牌 persona: douyin-scroll')
-  else bad('人设文件第一行缺身份牌 —— 插件会拒绝用它')
+  // ⚠️ 和上面 4d-2 同一个道理：没配人设时「生效的那份」是 default，
+  //    它的身份牌是 `persona: default`（4d-5 守），不该拿 `douyin-scroll` 去要求它。
+  if (!ownPersona) {
+    warn('还没配自己的人设 ⇒ 跳过「第一行身份牌 = persona: douyin-scroll」检查（default 的身份牌在 4d-5 守）')
+  } else if (/persona: douyin-scroll/.test((activePersona.split('\n')[0] || ''))) {
+    ok(`人设文件第一行有身份牌 persona: douyin-scroll（${ownPersona.from}）`)
+  } else bad('人设文件第一行缺身份牌 —— 插件会拒绝用它')
   if (!/cfg\.workspace/.test(idx)) ok('不再从 workspace 读外部 AGENTS.md（口子已封）')
   else bad('index.js 还在用 cfg.workspace —— 那正是"能读到别人插件设定"的口子')
 
@@ -1460,6 +1504,64 @@ try {
     } else bad(`通知解析失败：${JSON.stringify(j).slice(0, 200)}`)
   } catch (e) { bad(`通知解析测试失败：${e.message}`) }
 } catch (e) { bad(`自动发送/跑一轮检查失败：${e.message}`) }
+
+/* ── 4p. 这几个坑不许再回来（2026-10-30，Issue #3 / #5 / #6 / #7 / #8） ── */
+console.log('\n4p. 排障质量：真因不许再被吞掉')
+try {
+  const idx = readFileSync(join(here, 'index.js'), 'utf8')
+  // #6① asar 里的脚本只有 Electron 能读；拿独立 node 跑必然 MODULE_NOT_FOUND
+  if (/isAsarPath/.test(idx) && /jsRunnerFor\(/.test(idx) && !/jsRunner\(\)/.test(idx)) {
+    ok('dsh 入口按目标路径分派解释器（asar → Electron），没有裸 jsRunner()')
+  } else bad('index.js 又回到「一律优先独立 node」—— asar 内的 cli.js 会 MODULE_NOT_FOUND（Issue #6①）')
+  if (/r\.status !== 0\) return false/.test(idx)) {
+    ok('runnable 要求 status=0 **且** 带版本号（不再「有版本形状就算过」）')
+  } else bad('runnable 又变成「有版本号就算通过」—— 假阳性会让真跑时才炸（Issue #6①）')
+  // #6③ webServer 只有桌面/web 版有，留在 inject 会让 headless 永不激活
+  const injectLine = (idx.match(/export const inject = \[([^\]]*)\]/) || [])[1] || ''
+  if (!/webServer/.test(injectLine) && /export const optional = \[[^\]]*webServer/.test(idx)) {
+    ok('webServer 在 optional 里（headless 没有它，值班轮才跑得起来）')
+  } else bad('webServer 又进 inject 了 —— headless 会 pending 到天荒地老（Issue #6③）')
+
+  // #7① Python 脚本不许写死 node 路径（绿色版 / nvm 的机器直接 FileNotFoundError）
+  // ⚠️ 只查**赋值**（`NODE = r"C:\Program Files\…"`）—— 注释里提到那个路径是记账，不是耦合
+  const pyFiles = readdirSync(join(here, 'tools')).filter((x) => x.endsWith('.py'))
+  const hard = pyFiles.filter((f) => /=\s*r?["']C:\\Program Files/i.test(readFileSync(join(here, 'tools', f), 'utf8')))
+  if (!hard.length) ok(`没有 Python 脚本写死 node 路径（查了 ${pyFiles.length} 个）`)
+  else bad(`这些还写死 node 路径：${hard.join(', ')} —— 绿色版 node 会 FileNotFoundError（Issue #7①）`)
+
+  // #7② 会被 MCP 读 stdout 的脚本必须钉 utf-8（GBK 控制台遇 emoji 直接崩）
+  const needUtf8 = ['api-comments.py', 'api-reply.py', 'notice-read.py', 'session-guard.py', 'doctor.py', 'forward-pick.py', 'im-http.py']
+  const missUtf8 = needUtf8.filter((f) => {
+    const t = readFileSync(join(here, 'tools', f), 'utf8')
+    return !/utf8_stdio\(\)|reconfigure\(encoding/.test(t)
+  })
+  if (!missUtf8.length) ok('会打昵称 / emoji 的 Python 脚本都钉了 utf-8')
+  else bad(`这些脚本没钉 utf-8：${missUtf8.join(', ')} —— UnicodeEncodeError 会吃掉真因（Issue #7②）`)
+
+  // #8① 「进程根本没起来」和「CDP 连不上」必须分开报
+  const chrome = readFileSync(join(here, 'lib', 'chrome.mjs'), 'utf8')
+  if (/'exit'/.test(chrome) && /SingletonLock/.test(chrome)) {
+    ok('无头浏览器失败会区分「进程没起来」和「CDP 连不上」，并提示查残留进程')
+  } else bad('ensureChrome 又只报「60 秒连不上 CDP」—— profile 被占的线索全丢了（Issue #8①）')
+
+  // #8② MCP 层吞 error = 排障成本放大器
+  const mcpText = readFileSync(join(here, 'tools', 'mcp-server.mjs'), 'utf8')
+  if (/const explain =/.test(mcpText) && /stderr_tail/.test(mcpText) && /\.\.\.explain\(j, r\)/.test(mcpText)) {
+    ok('MCP 层把子脚本的 error / hint / stderr_tail 原样透出')
+  } else bad('MCP 层又把 error 吞了（Issue #8②）')
+
+  // #5 webhook 地址不校验 = 本机变内网跳板
+  const notifyText = readFileSync(join(here, 'lib', 'notify.mjs'), 'utf8')
+  if (/export function checkWebhookTarget/.test(notifyText) && /checkWebhookTarget\(target/.test(notifyText)) {
+    ok('webhook 发之前先校验目的地址（回环 / link-local / 云元数据全拦）')
+  } else bad('sendWebhook 又把地址直接丢给 fetch 了（CWE-918，Issue #5）')
+
+  // #3 关键词只能是软偏好，不能变硬筛
+  const fpText = readFileSync(join(here, 'tools', 'forward-pick.py'), 'utf8')
+  if (/kw_hits/.test(fpText) && /不参与采集、不硬筛/.test(fpText)) {
+    ok('关键词只做软加分（命中的排前面，不硬筛）')
+  } else bad('关键词要么没接上，要么被做成硬筛了（Issue #3：硬筛会把意外惊喜筛没）')
+} catch (e) { bad(`排障质量检查失败：${e.message}`) }
 
 /* ── 4e. 采集门槛 / 跨天记账 ── */
 console.log('\n4e. 采集门槛 / 跨天')

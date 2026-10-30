@@ -18,7 +18,11 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, node_bin, utf8_stdio  # noqa: E402
+
+# ⚠️ 必须在任何 print 之前 —— GBK 控制台遇到 emoji 会崩（Issue #7②）
+utf8_stdio()
+
 import time
 import urllib.parse
 
@@ -26,7 +30,8 @@ import httpx
 
 HOME = home_str()
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NODE = r"C:\Program Files\nodejs\node.exe"
+# Issue #7①：别再写死 `C:\Program Files\nodejs\node.exe`
+NODE = node_bin()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 VENVPY = os.path.join(HOME, ".venv", "Scripts", "python.exe")
 GUARD = os.path.join(PLUGIN, "tools", "session-guard.py")
@@ -70,7 +75,11 @@ def guard():
 
 def sign(rel):
     env = dict(os.environ, DY_COOKIES=json.dumps(JAR, ensure_ascii=False), DOUYIN_HOME=HOME)
-    p = subprocess.run([NODE, SIGNER, rel], capture_output=True, cwd=PLUGIN, env=env, timeout=240)
+    try:
+        p = subprocess.run([NODE, SIGNER, rel], capture_output=True, cwd=PLUGIN, env=env, timeout=240)
+    except FileNotFoundError:
+        # 找不到 node 时说清楚，而不是让调用方以为「签名坏了」（Issue #7①）
+        return {"err": "找不到 node（%s）—— 设环境变量 DOUYIN_NODE 指向 node.exe 试试" % NODE}
     out = p.stdout.decode("utf-8", "replace")
     i = out.find("{")
     if i < 0:

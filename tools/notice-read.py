@@ -21,7 +21,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, utf8_stdio  # noqa: E402
+
+# ⚠️ 通知里必然有昵称 + emoji，GBK 控制台直接崩（Issue #7②）
+utf8_stdio()
+
 import time
 
 from curl_cffi import requests as creq

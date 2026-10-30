@@ -16,7 +16,10 @@ tools/_home.py —— Python 脚本**唯一**的家目录来源
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import sys
 from pathlib import Path
 
 
@@ -47,4 +50,56 @@ def plugin_dir() -> Path:
 
 
 def node_bin() -> str:
-    return os.environ.get("DOUYIN_NODE") or "node"
+    """node 解释器的路径 —— **唯一**来源（Issue #7①）。
+
+    2026-10-30 之前，`api-comments.py:21` 和 `api-reply.py:29` 各自写死了
+    `C:\\Program Files\\nodejs\\node.exe`。只有「用官方安装包装过 Node」的机器成立；
+    绿色版 / nvm / 自定义目录一律 FileNotFoundError，而这个错误又被 MCP 那层吞掉，
+    表面只剩「评论一条都没拿到」。
+
+    顺序：DOUYIN_NODE → PATH → 家目录 runtime.json 记过的 → 常见安装目录。
+    都找不到返回 "node"，让子进程在 PATH 里再试一次（**不**提前判死）。
+    """
+    def usable(p: str) -> bool:
+        return bool(p) and os.path.isfile(p)
+
+    cands: list[str] = []
+    env = (os.environ.get("DOUYIN_NODE") or "").strip()
+    if env:
+        cands.append(env)
+    found = shutil.which("node")
+    if found:
+        cands.append(found)
+    try:
+        rt = json.loads((home_dir(create=False) / "runtime.json").read_text(encoding="utf-8"))
+        for k in ("node", "nodeExe", "nodePath"):
+            if rt.get(k):
+                cands.append(str(rt[k]))
+    except Exception:
+        pass
+    cands += [
+        r"C:\Program Files\nodejs\node.exe",
+        r"C:\Program Files (x86)\nodejs\node.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe"),
+        os.path.expandvars(r"%APPDATA%\npm\node.exe"),
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ]
+    for c in cands:
+        if usable(c):
+            return c
+    return "node"
+
+
+def utf8_stdio() -> None:
+    """把 stdout/stderr 钉成 utf-8（Issue #7②）。
+
+    Windows 控制台默认 GBK，而昵称和评论正文里必然带 emoji（🍀 🫵 🐱）——
+    `print()` 直接抛 UnicodeEncodeError。这几个脚本是被 MCP 用 subprocess 读 stdout 的，
+    一崩整条链就失败，报错还完全不指向编码。
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass

@@ -116,6 +116,38 @@ def load_collector():
     }
 
 
+def load_keywords():
+    """设置页的「关注关键词」（config.json 里的 keywords）。
+
+    ⭐ Issue #3（2026-10-30）：关键词**不参与采集** —— 抖音 web 没有可用的搜索接口
+    （general/search 被 2483 挡），候选只能来自推荐流 + 热榜。所以这里的用法是
+    **软偏好**：命中的候选排前面（×1.35），没命中也不丢、不扣分。
+    硬筛会把推荐流里的意外惊喜筛没，那才是真损失。
+    """
+    p = os.path.join(HOME, "config.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            j = json.load(f) or {}
+        kws = j.get("keywords") or []
+        return [str(k).strip() for k in kws if str(k).strip()]
+    except Exception:
+        return []
+
+
+def tags_of(a):
+    """话题 / 话题标签：cha_list 优先，text_extra 兜底（接口两种形态都出现过）。"""
+    out = []
+    for c in (a.get("cha_list") or []):
+        n = (c.get("cha_name") or "").strip()
+        if n:
+            out.append(n)
+    for t in (a.get("text_extra") or []):
+        n = (t.get("hashtag_name") or "").strip()
+        if n:
+            out.append(n)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", action="store_true")
@@ -123,6 +155,9 @@ def main():
     args = ap.parse_args()
 
     limits = load_collector()
+    # ⭐ Issue #3：关键词只做**软加分**（不参与采集，也不硬筛）
+    kws = load_keywords()
+    kw_hits_total = 0
     # ⭐ 硬筛计数：报告里要能说清"因为什么跳过了几条"，不能只给个最终条数
     dropped = {"no_desc": 0, "too_short_video": 0, "short_and_quiet": 0}
 
@@ -181,6 +216,14 @@ def main():
             score *= 1.25
         if age_h <= 72:
             score *= 1.15
+        # ⭐ 关键词软加分（Issue #3）：命中就往前排，**不命中也不丢** ——
+        #    硬筛会把推荐流里「没写关键词但确实好看」的筛没，那才是真损失。
+        tags = tags_of(a)
+        hay = (desc + " " + " ".join(tags)).lower()
+        hits = [k for k in kws if k.lower() in hay]
+        if hits:
+            score *= 1.35
+            kw_hits_total += 1
         si = a.get("share_info") or {}
         official = si.get("share_url") or a.get("share_url") or ""
         rows.append({
@@ -199,6 +242,8 @@ def main():
             "share_desc": (si.get("share_link_desc") or "").replace("%s", official).strip(),
             # 网页地址（能在浏览器打开，但不是分享链接）
             "web_url": "%s/video/%s" % (BASE, aid),
+            # ⭐ 命中的关注关键词（软加分用；报告里可以据此标注"你说过想看这类"）
+            "kw_hits": hits[:5],
         })
 
     rows.sort(key=lambda r: -r["score"])
@@ -208,8 +253,12 @@ def main():
     print("硬筛跳过：%s（阈值 文案≥%d 字 / 评论≥%d）" % (
         json.dumps(dropped, ensure_ascii=False), limits["minDescLen"], limits["minComments"]))
     print("去重后候选 %d 条，取前 %d" % (len(rows), len(top)))
+    if kws:
+        # 说清楚关键词到底做了什么、没做什么 —— 这是 Issue #3 的核心误会
+        print("关键词（%d 个）只做软加分：命中 %d 条排前面；**不参与采集、不硬筛**" % (len(kws), kw_hits_total))
     for i, r in enumerate(top, 1):
-        print("%2d. [%s] %s" % (i, fmts(r["digg"]), r["desc"][:46]))
+        hit = ("【命中:%s】" % "/".join(r.get("kw_hits") or [])) if r.get("kw_hits") else ""
+        print("%2d. [%s] %s%s" % (i, fmts(r["digg"]), r["desc"][:46], hit))
         print("    %s · %s · 赞%s 评%s 藏%s 转%s · %s" % (
             r["author"],
             ("%ss" % r["duration_s"]) if r["duration_s"] else "时长未知",
