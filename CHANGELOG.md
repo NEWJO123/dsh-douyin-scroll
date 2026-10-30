@@ -9,7 +9,88 @@
 
 ---
 
+## 0.5.6 — 2026-10-30（预检能过 + 8 个 open issue 里能修的都修了）
+
+> 两个批次合成这一个对外版本：
+> ① 干净克隆上「先跑 `node selfcheck.mjs`，全部通过再装」终于能成立（原来 352 通过 / 5 失败，
+>    5 条全是自检自己的错，跟使用者的环境无关）；
+> ② 社区报的 #3 #5 #6 #7 #8（#1 #2 #4 在 0.5.1–0.5.3 已修，这次只核对）。
+> 共同点：全是「真因被吞掉 / 解释器装错」，不是新功能。
+
+### 一、桌面版后台轮次（#6，最致命）
+
+- 🔴 **`node.exe` 读不了 `app.asar`** ⇒ 每一轮 `MODULE_NOT_FOUND`。
+  `jsRunner()` 一律「有独立 node 就用它」，在任何装了独立 node 的机器上都选错。
+  ✅ 按**目标路径**分派：`jsRunnerFor(target)`，asar 内的入口交回 Electron（`process.execPath`）；
+  `runnable` + 三个候选全部换成它。
+- 🔴 **「已验证可跑」是假阳性**：`runnable` 原来是 `status === 0 || 有版本形状`，有版本号就算过。
+  ✅ 改成 **status=0 且** 带版本号 —— 假阳性比不检查更糟，它炸在最难看的时机。
+- 🔴 **`webServer` 从 inject 挪进 optional**：headless profile 里没这个服务，
+  留着 ⇒ 插件 `pending (waiting for service: webServer)` 永不激活，而值班轮偏偏用 headless 跑。
+  现在缺它只少挂面板和 `/api/douyin-duty`，取候选 / 判断 / 写报告照常。
+- 跑一轮前检查 `$DSH_HOME/profiles/<headless>` 在不在，不在就把
+  `dsh plugin --profile headless add link:<插件目录>` 打进日志（只提示，不替使用者执行）。
+
+### 二、评论 / 回评 / 通知（#7）
+
+- 🔴 **Python 里写死 `C:\Program Files\nodejs\node.exe`**（`api-comments.py` / `api-reply.py`）。
+  绿色版 / nvm / 自定义目录的机器直接 `FileNotFoundError`，这错误还被两层吞掉。
+  ✅ `_home.node_bin()` 真去找：`DOUYIN_NODE` → PATH → 家目录 `runtime.json` → 常见安装目录 → 最后才回 `"node"`。
+  找不到 node 时 `sign()` 返回**写明原因**的错误，不再是一句「签名拉不到」。
+- 🔴 **Windows GBK 控制台遇 emoji 崩在 `print()`**，`UnicodeEncodeError` 一崩整条 MCP 链就断。
+  ✅ `_home.utf8_stdio()` 统一钉 utf-8，补到 `api-reply.py` / `notice-read.py` / `session-guard.py`
+  （`api-comments.py` 之前其实也没有，一并补上）。
+
+### 三、发不出去时看不到原因（#8）
+
+- 🔴 **`ensureChrome` 只会等满 60 秒再报「连不上 CDP」**，profile 被残留进程占着这条线索全丢。
+  ✅ 分开报：进程**立刻退出**（→ 提示 profile 被占 + 给查 PID 的命令 + 指出 `SingletonLock`）
+  vs **活着但 CDP 连不上**（→ 防火墙 / 监听地址）。实测前者从 60 秒降到 **0.6 秒**报出来。
+  ⚠️ 刻意**不**自动换临时 profile 重试：登录态就在那个 profile 里，换一个等于把使用者登出。
+- 🔴 **MCP 层吞 `error`**：`douyin_share_card` 只挑 `ok / sent`，真因字段全丢。
+  ✅ 新增 `explain()` / `stderrTail()`：`error` → `hint` → `detail`，子脚本连 JSON 都没吐就给
+  `stderr_tail`，失败原因同时提到顶层。所有「没返回可解析结果」的兜底也统一带上 `stderr_tail`。
+
+### 四、安全与关键词（#5 / #3）
+
+- **webhook 目的地址校验（CWE-918）**：非 http(s)、回环、link-local、云元数据、组播一律拦；
+  局域网私有段放行（内网机器人是真实用法）。不做 DNS 解析 —— 解析完再连是 TOCTOU，防不住 rebinding，
+  不装作防住了。确实要发本机：`DOUYIN_WEBHOOK_ALLOW_LOCAL=1`。
+- **关键词从「只做标注」改成软加分**（#3 那个误会）：命中文案 / 话题的候选 ×1.35 排前面，
+  **不命中也不丢、不硬筛** —— 硬筛会把推荐流里「没写关键词但确实好看」的筛没。
+  面板和 README 都改成一句话说清「不会替你搜」。
+
+### 五、守门（selfcheck 新增 4p 段，9 条）
+
+上面每条都配了静态断言（`jsRunnerFor` 分派、`runnable` 两个条件、webServer 不在 inject、
+没有 Python 写死 node、utf-8 钉住、ensureChrome 分开报、MCP 透传、webhook 校验、关键词软加分），
+防的是「修完又被改回去」。
+
+> 现状：`node selfcheck.mjs` = **363 通过 / 0 失败**（真克隆；zip 形态 362），`tools/panel-render-check.mjs` 全通过。
+
+### 六、预检：干净克隆上「全部通过再装」终于能成立（先做的那批）
+
+> 起因：README 让使用者 `git clone` 后先跑 `node selfcheck.mjs`，「全部通过再装」。
+> 但实测**任何干净克隆都过不了**（352 通过 / 5 失败），而且 5 条全是自检自己的错，
+> 跟使用者的环境无关 —— 照着文档走第一步就被拦住。
+
+- 🔴 **4d-2 拿中性默认当"使用者的人设"来查**：原来只认 `prompts/persona.md`，
+  读不到就退到 `persona.default.md` 上查「正反对照 / 何时收着 / 称呼边界 / 身份牌」——
+  可 default 是**中性默认**，设计上就不带这些，于是「这台机器还没配过人设」被报成「人设写坏了」。
+  ✅ 改成和 `runDuty` **同一套三层解析**（`$DOUYIN_HOME/persona.md` → `prompts/persona.md` → default）：
+  有自己那份才查结构，一份都没有就明说"走中性默认"并跳过（`persona: default` 的身份牌仍由 4d-5 守）。
+  ⚠️ 闸门没松：写了自己那份但只有形容词，仍然照样报 ❌（已用"软一点，别腻"实测 3 条失败）。
+- 🔴 **`core.hooksPath` 是本地配置，`git clone` 不会带** ⇒ 新克隆读到的永远是空串 ⇒ 直接判 ❌。
+  这一项的意图是「hook 真生效」而不是「文件存在」，所以空着且**本目录就是仓库根**时
+  `git config --local core.hooksPath .githooks` 顺手挂上（可逆、不联网）；
+  指向别处（比如 `.husky`）仍然报 ❌；下载的 zip 不是仓库则只告警。
+  ⚠️ 加了一道「本目录必须是仓库根」的守卫 —— 否则 `--local` 会写进外层仓库的 config。
+- 结果：zip 形态 362 通过 / 0 失败、真 `git clone` 363 通过 / 0 失败。
+
+---
+
 ## 0.5.4 — 2026-10-26 下午（@ 多选 + 总闸 + 写入链 + 群聊 + 面板重设计）
+
 
 > 主人 2026-10-26 连续几轮定稿：@ 支持多个人、开关只当总闸、会话列表只读一次。
 > 这一版把 0.5.3 之后的一整批改动合成一个对外版本号发布。

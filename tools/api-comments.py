@@ -11,14 +11,19 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, node_bin, utf8_stdio  # noqa: E402
+
+# ⚠️ 必须在任何 print 之前 —— Windows 控制台是 GBK，emoji 一进去就 UnicodeEncodeError（Issue #7②）
+utf8_stdio()
+
 import urllib.parse
 
 import httpx
 
 HOME = home_str()
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NODE = r"C:\Program Files\nodejs\node.exe"
+# Issue #7①：原来写死 `C:\Program Files\nodejs\node.exe`，绿色版/node 装在别处的机器直接 FileNotFoundError
+NODE = node_bin()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 COOKIE = open(os.path.join(HOME, "douyin_cookie.txt"), encoding="utf-8").read().strip()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -43,7 +48,11 @@ qs = lambda d: "&".join("%s=%s" % (urllib.parse.quote(str(k)), urllib.parse.quot
 
 def sign(rel):
     env = dict(os.environ, DY_COOKIES=json.dumps(JAR, ensure_ascii=False), DOUYIN_HOME=HOME)
-    p = subprocess.run([NODE, SIGNER, rel], capture_output=True, cwd=PLUGIN, env=env, timeout=240)
+    try:
+        p = subprocess.run([NODE, SIGNER, rel], capture_output=True, cwd=PLUGIN, env=env, timeout=240)
+    except FileNotFoundError:
+        # 找不到 node 时别让它变成一句「签名拉不到」：把真因写清楚（Issue #7①）
+        return {"err": "找不到 node（%s）—— 设环境变量 DOUYIN_NODE 指向 node.exe 试试" % NODE}
     out = p.stdout.decode("utf-8", "replace")
     i = out.find("{")
     if i < 0:

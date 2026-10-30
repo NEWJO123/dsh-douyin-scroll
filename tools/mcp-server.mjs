@@ -97,6 +97,29 @@ const pickJson = (s) => {
   try { return JSON.parse(t.slice(i, j + 1)) } catch { return null }
 }
 
+/**
+ * ⭐ Issue #8②（2026-10-30）：子脚本失败时，「为什么」必须**原样透出**。
+ *
+ * 原来 `douyin_share_card` 只挑 `ok / sent` 两个字段，`error` 一丢，
+ * 排障就从分钟级变成小时级 —— 实测那个案例真因是「profile 被残留进程占着」，
+ * 可返回里只有一个 `ok: false`，谁看都得猜。
+ */
+const stderrTail = (r, lines = 3) => String(r?.stderr || '')
+  .trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(-lines).join(' | ').slice(0, 400)
+
+const explain = (j, r) => {
+  const out = {}
+  const err = String(j?.error || j?.err || '').trim()
+  const tail = stderrTail(r)
+  // 子脚本连 JSON 都没吐（崩溃 / 起不来）时，stderr 尾巴就是唯一的真因
+  if (err) out.error = err
+  else if (tail) out.error = tail
+  if (j?.hint) out.hint = j.hint
+  if (j?.detail) out.detail = j.detail
+  if (err && tail) out.stderr_tail = tail
+  return out
+}
+
 /** 等一会儿（异步，不占 CPU —— 别用 busy-wait，那会把宿主烤热） */
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)))
 
@@ -167,7 +190,7 @@ const TOOLS = [
     handler: () => {
       const r = runNode('doctor.mjs', ['--json'], 90_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '体检脚本没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) return { ok: false, error: '体检脚本没返回可解析结果', stderr_tail: stderrTail(r) }
       return { ...j, hint: (j.must_fix || []).length ? '先把 must_fix 里的修掉' : '没有硬伤' }
     },
   },
@@ -181,7 +204,7 @@ const TOOLS = [
       if (bad) return bad
       const r = runPy('session-guard.py', ['check'], 90_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '体检没返回结果', stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) return { ok: false, error: '体检没返回结果', stderr_tail: stderrTail(r) }
       return { ok: true, logged_in: j.alive === true, ...j }
     },
   },
@@ -245,7 +268,7 @@ const TOOLS = [
       const r = runPy('api-comments.py', [id], 300_000)
       const lines = String(r.stdout || '').split('\n')
       const items = lines.filter((l) => /^\s{2}cid=|^\s{6}└ /.test(l)).map((s) => s.replace(/^\s+/, ''))
-      if (r.status !== 0) return { ok: false, error: '拉评论失败', stderr: String(r.stderr || '').slice(0, 300) }
+      if (r.status !== 0) return { ok: false, error: '拉评论失败', stderr_tail: stderrTail(r) }
       return {
         ok: true,
         aweme_id: id,
@@ -270,7 +293,7 @@ const TOOLS = [
       if (args?.raw) argv.push('--raw')
       const r = run(venvPython(), argv, 150_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '没读到通知', stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) return { ok: false, error: '没读到通知', stderr_tail: stderrTail(r) }
       return j
     },
   },
@@ -325,12 +348,12 @@ const TOOLS = [
         const argv = [ids[i], to]
         if (toId) argv.push('--to-id', toId)
         const r = runNode('card-share.mjs', argv, 200_000)
-        const j = pickJson(r.stdout) || { ok: false, aweme_id: ids[i], stderr: String(r.stderr || '').slice(0, 200) }
-        sent.push(j)
+        const j = pickJson(r.stdout) || { ok: false, aweme_id: ids[i] }
+        sent.push({ j, r })
         if (!(j && j.ok)) break
         if (i < ids.length - 1) await sleep(2200)
       }
-      const okN = sent.filter((x) => x && x.sent).length
+      const okN = sent.filter((x) => x.j && x.j.sent).length
       const reasonText = String(args?.reason || '').trim()
       let reason = null
       if (okN && reasonText) {
@@ -341,12 +364,16 @@ const TOOLS = [
         if (toId) rArgs.push('--to-id', toId)
         rArgs.push('--text', reasonText)
         const r3 = runNode('im-send.mjs', rArgs, 240_000)
-        reason = pickJson(r3.stdout) || { ok: false, error: '理由那一条没返回可解析结果' }
+        reason = pickJson(r3.stdout) || { ok: false, error: '理由那一条没返回可解析结果', ...explain(null, r3) }
       }
+      const failed = sent.filter((x) => !(x.j && x.j.sent)).map((x) => explain(x.j, x.r))
       return {
         ok: okN === ids.length && (!reason || reason.ok),
         sent: okN, total: ids.length, to,
-        results: sent.map((x) => ({ aweme_id: x.aweme_id, ok: !!x.ok, sent: !!x.sent, error: x.error })),
+        results: sent.map(({ j, r }) => ({ aweme_id: j.aweme_id, ok: !!j.ok, sent: !!j.sent, ...explain(j, r) })),
+        // ⭐ 失败原因同时提到顶层：调用方（人）不会挨个翻 results
+        ...(failed[0]?.error ? { error: failed[0].error } : {}),
+        ...(failed[0]?.hint ? { hint: failed[0].hint } : {}),
         reason: reason || undefined,
         note: '卡片是否真的落地，请让使用者自己在抖音里看一眼（这个 MCP 版没做回读）',
       }
@@ -386,7 +413,7 @@ const TOOLS = [
       argv.push('--text', text)
       if (args?.dry) argv.push('--dry')
       const r = runNode('im-send.mjs', argv, 240_000)
-      return pickJson(r.stdout) || { ok: false, error: '发送器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) }
+      return pickJson(r.stdout) || { ok: false, error: '发送器没返回可解析结果', stderr_tail: stderrTail(r) }
     },
   },
   {
@@ -442,7 +469,7 @@ const TOOLS = [
       if (rootCid) argv.push('--root', rootCid)
       const r = runNode('comment-api.mjs', argv, 260_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '发送器没返回可解析结果', stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) return { ok: false, error: '发送器没返回可解析结果', stderr_tail: stderrTail(r) }
       if (j.need_root) {
         return {
           ok: false, need_root: true, ...j,
@@ -485,7 +512,7 @@ const TOOLS = [
       if (toId) argv.push('--to-id', toId)
       const r = runNode('im-send.mjs', argv, 240_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '读不到会话', stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) return { ok: false, error: '读不到会话', stderr_tail: stderrTail(r) }
       if (!j.ok) return j
       const all = Array.isArray(j.messages) ? j.messages : []
       const limit = Math.max(1, Math.min(Number(args?.limit) || 30, 60))
@@ -516,7 +543,7 @@ const TOOLS = [
       const argv = [join(ROOT, 'tools', 'notice-read.py'), '--raw']
       const r = run(venvPython(), argv, 150_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '没读到通知', stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) return { ok: false, error: '没读到通知', stderr_tail: stderrTail(r) }
       const ats = (Array.isArray(j.items) ? j.items : []).filter((x) => x && (x.type === 45 || x.type === 46))
       const limit = Math.max(1, Math.min(Number(args?.limit) || 10, 30))
       return {
@@ -581,7 +608,7 @@ const TOOLS = [
       if (args?.dry === true) argv.push('--dry')
       const r = runNode('comment-mention-ui.mjs', argv, 300_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '真 @ 执行器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr: String(r.stderr || '').slice(0, 300) }
+      if (!j) return { ok: false, error: '真 @ 执行器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr_tail: stderrTail(r) }
       return j
     },
   },

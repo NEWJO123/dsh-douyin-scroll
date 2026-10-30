@@ -52,11 +52,20 @@ import { deliverToSession, makeUserMessage, pickClientTimeZone, relayLine } from
 //    逻辑在 lib/pet-tts.mjs，纯函数 + 依赖注入，有离线单测（tools/pet-tts-test.mjs）。
 
 export const name = 'douyin-scroll'
-export const inject = ['webServer', 'tools', 'settings']
+/**
+ * 🔴 2026-10-30：`webServer` 从 inject 挪进 optional（Issue #6③）。
+ *
+ * 它只在桌面版 / web 版存在，**headless profile 的 bundles 里没有这个服务** ——
+ * 留在 inject 里 ⇒ 插件在 headless 会话里 `pending (waiting for service: webServer)`，
+ * 永不激活；可峰谷值班轮恰恰是用 headless 跑的，自相矛盾。
+ * 现在缺了它只是少挂一个面板和 `/api/douyin-duty` 路由，「取候选 → 判断 → 写报告」照常。
+ */
+export const inject = ['tools', 'settings']
 /** 🔴 2026-10-24：她的对话要用 ctx.get('llm') 调一次真模型。
  *  不能放进 inject —— 那样没模型的环境整个插件都起不来；
- *  用 optional 取，取不到就退回本地小脑（不静默降级：状态里会标 brain:'local'）。 */
-export const optional = ['llm']
+ *  用 optional 取，取不到就退回本地小脑（不静默降级：状态里会标 brain:'local'）。
+ *  同理：webServer 也走 optional（headless 里没有它，见上面）。 */
+export const optional = ['llm', 'webServer']
 
 /**
  * 🔴 每个字段都要 `.extra('volatile', true)`：DSH 的 settings.update() 只认 volatile 字段
@@ -2254,10 +2263,17 @@ export function apply(ctx, config) {
   }
 
   const resolveDsh = () => {
-    // 运行时脚本用哪个解释器：有独立 node 就用它（见上面那段实测说明）
-    const jsRunner = () => nodeExe() || process.execPath
+    /**
+     * 🔴 解释器要按**目标路径**挑，不能一律「有独立 node 就用它」（Issue #6①，2026-10-30）。
+     *
+     * `app.asar` 是 **Electron 的虚拟文件系统**，只有 Electron 本体读得了；
+     * 拿独立 `node.exe` 去跑 asar 里的 `cli.js`，必然 `MODULE_NOT_FOUND`。
+     * 而原来的顺序在**任何装了独立 node 的机器上**都会选中错的那个 ⇒ 后台轮次 100% 起不来。
+     */
+    const isAsarPath = (p) => /\.asar[\\/]/i.test(String(p || ''))
+    const jsRunnerFor = (target) => (isAsarPath(target) ? process.execPath : (nodeExe() || process.execPath))
     const explicit = String(cfg.dshBin || '').trim()
-    if (explicit && existsSync(explicit)) return { command: jsRunner(), args: [explicit], shell: false }
+    if (explicit && existsSync(explicit)) return { command: jsRunnerFor(explicit), args: [explicit], shell: false }
 
     /**
      * ⭐⭐ 2026-10-23 重写（起因：使用者反馈「总是显示找不到 dsh：桌面版多半不是 NPM 全局安装的」）
@@ -2334,29 +2350,32 @@ export function apply(ctx, config) {
     const isAsar = (p) => /\.asar[\\/]/i.test(String(p))
     const runnable = (p) => {
       try {
-        const r = spawnSync(jsRunner(), [p, '--version'], { encoding: 'utf8', windowsHide: true, timeout: 25_000 })
-        const out = `${r.stdout || ''}${r.stderr || ''}`
-        return r.status === 0 || /\d+\.\d+\.\d+/.test(out)
+        const r = spawnSync(jsRunnerFor(p), [p, '--version'], { encoding: 'utf8', windowsHide: true, timeout: 25_000 })
+        // ⚠️ 必须 **status===0 且** 有版本号。原来是 `status === 0 || 有版本形状`，
+        //    于是「独立 node 读不了 asar」也被放行，日志还打「已验证可跑」——
+        //    假阳性比不检查更糟：真跑时才炸，而且炸在最难看的时机。
+        if (r.status !== 0) return false
+        return /\d+\.\d+\.\d+/.test(`${r.stdout || ''}${r.stderr || ''}`)
       } catch { return false }
     }
 
     // ① 真实存在（非 asar）的候选，直接返回
     for (const p of candidates) {
       if (!p || isAsar(p)) continue
-      try { if (existsSync(p)) return { command: jsRunner(), args: [p], shell: false } } catch { /* 下一个 */ }
+      try { if (existsSync(p)) return { command: jsRunnerFor(p), args: [p], shell: false } } catch { /* 下一个 */ }
     }
     // ② asar 内的候选：真跑一次验证（Electron 宿主能跑）
     for (const p of candidates) {
       if (!p || !isAsar(p)) continue
       if (runnable(p)) {
         log(`dsh 入口（asar 内，已验证可跑）：${p}`)
-        return { command: jsRunner(), args: [p], shell: false }
+        return { command: jsRunnerFor(p), args: [p], shell: false }
       }
     }
     // ③ 最后再兜一遍：非 asar 但 existsSync 没命中的（权限/符号链接怪情况）
     for (const p of candidates) {
       if (!p || isAsar(p)) continue
-      if (runnable(p)) return { command: jsRunner(), args: [p], shell: false }
+      if (runnable(p)) return { command: jsRunnerFor(p), args: [p], shell: false }
     }
 
     /**
@@ -3047,6 +3066,20 @@ export function apply(ctx, config) {
             : `证据包没备成（${ev.error}）—— 这一轮照样起，模型会读到空包并如实写进报告`)
           petSay(ev.ok ? `捞到 ${ev.count} 条候选，鱼在挨个看…` : '候选没捞着…鱼空着手也要把这轮跑完')
           const dsh = resolveDsh()
+          /**
+           * ⭐ Issue #6②：桌面版用户机器上通常只有 `desktop`（Electron 独占，命令行用不了），
+           *    而 `headless` 要手动建。profile 不存在时 dsh 只回一句
+           *    `profile "headless" does not exist`，翻 duty.log 很难看出「要先建一个」。
+           *    这里提前把命令打出来 —— 建 profile 要真跑 dsh，插件不替使用者做这件事。
+           */
+          const prof = String(cfg.headlessProfile || 'headless')
+          try {
+            const profilesRoot = join(process.env.DSH_HOME || dirname(stateDir), 'profiles')
+            if (!existsSync(join(profilesRoot, prof))) {
+              log(`⚠️ 本机还没有 profile「${prof}」—— 若这一轮报 profile does not exist，先跑一次：`)
+              log(`   dsh plugin --profile ${prof} add link:${pluginDir || '<本插件目录>'}`)
+            }
+          } catch { /* 查不到就算了，别挡着跑 */ }
           const overlay = ensureOverlay()
           const args = [...dsh.args, '--profile', cfg.headlessProfile || 'headless']
           if (overlay) args.push('--patch', overlay)
@@ -5368,17 +5401,27 @@ export function apply(ctx, config) {
     return sendJson(res, 404, { ok: false, error: `unknown ${req.method} ${path}` })
   }
 
-  try {
-    ctx.effect(() => ctx.webServer.register({
-      kind: 'prefix',
-      path: '/api/douyin-duty',
-      handler: async (req, res) => {
-        try { await handle(req, res, new URL(req.url, 'http://127.0.0.1')) } catch (e) {
-          sendJson(res, 500, { ok: false, error: e?.message ?? String(e) })
-        }
-      },
-    }), 'douyin-duty: /api/douyin-duty 路由')
-  } catch (e) { log(`HTTP 路由没挂上：${e?.message ?? e}`) }
+  /**
+   * 🔴 webServer 是 optional（见文件头）：headless / CLI 模式没有它。
+   *    没挂上面板和 HTTP 路由只影响「设置页 / 外部接口」，不影响值班轮。
+   * ⚠️ 取法跟本文件其它 optional 服务一样（`ctx.get` + try）—— 直接点属性在服务缺席时会抛。
+   */
+  const ws = (() => { try { return ctx.get('webServer') } catch { return null } })()
+  if (!ws) {
+    log('没有 webServer（CLI / headless 模式）：设置页和 /api/douyin-duty 路由不挂，值班轮照常跑')
+  } else {
+    try {
+      ctx.effect(() => ws.register({
+        kind: 'prefix',
+        path: '/api/douyin-duty',
+        handler: async (req, res) => {
+          try { await handle(req, res, new URL(req.url, 'http://127.0.0.1')) } catch (e) {
+            sendJson(res, 500, { ok: false, error: e?.message ?? String(e) })
+          }
+        },
+      }), 'douyin-duty: /api/douyin-duty 路由')
+    } catch (e) { log(`HTTP 路由没挂上：${e?.message ?? e}`) }
+  }
 
   ctx.effect(() => () => { try { mcp?.stop() } catch { /* 收摊 */ } }, 'douyin-duty: 收 MCP 子进程')
   log(`已挂载（家=${stateDir}，采集=推荐流只读接口，python=${cfg.pythonPath}，峰谷=${cfg.peakValley ? '开' : '关'}）`)

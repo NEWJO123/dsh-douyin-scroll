@@ -1471,6 +1471,10 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
               h('div', { 'data-dy-subblock': '' },
                 h('div', { 'data-dy-title': '' }, '刷什么'),
                 h('div', { 'data-dy-sub': '' }, '关注关键词，一行一个（留空 = 用内置默认那几组）'),
+                h('div', { 'data-dy-sub': '' },
+                  '⚠️ 抖音没有能用的搜索接口，所以这几个词**不会替你搜**，也不筛掉别的视频：'
+                  + '它们只做一件事 —— 文案 / 话题里命中了的候选排前面，并在报告里标注。'
+                  + '候选仍然来自推荐流 + 热榜。'),
                 h('textarea', {
                   'data-dy-input': '', rows: 5, value: kwText,
                   placeholder: '搞笑\n美食\n猫',
