@@ -930,20 +930,66 @@ export function apply(ctx, config) {
   }))
 
   /**
-   * 跑插件自带的 node 脚本（tools/*.mjs），返回 {status, stdout, stderr} —— 永不抛
+   * ⭐⭐ 2026-10-31（B 站用户实测「装了插件整个 DSH 卡死」）：**异步**跑子进程。
+   * 🔴 根因：插件代码跑在 DSH 宿主进程里，spawnSync 会把宿主事件循环整个摁住 ——
+   *    最长 240s 的超时里，面板 / HTTP / 其它插件全部僵死。
+   *    换成 spawn + await：调用方语义不变（还是拿到 {status, stdout, stderr} 再继续），
+   *    但宿主全程活着。超时语义对齐 spawnSync（到点先 TERM 再 KILL，status 记 -1）。
+   */
+  const spawnCapture = (cmd, args, { timeout = 240_000, env } = {}) => new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(cmd, args, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e) {
+      return resolve({ status: -1, stdout: '', stderr: String(e?.message ?? e) })
+    }
+    let stdout = '', stderr = '', done = false
+    const kill = (sig) => { try { child.kill(sig) } catch { /* 已经没了 */ } }
+    const timer = setTimeout(() => {
+      if (done) return
+      kill()
+      setTimeout(() => { if (!done) kill('SIGKILL') }, 10_000).unref?.()
+    }, timeout)
+    timer.unref?.()
+    const finish = (status, note) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve({ status: status ?? -1, stdout, stderr: stderr + (note ? (stderr ? '\n' : '') + note : '') })
+    }
+    child.stdout?.on('data', (b) => { stdout += String(b) })
+    child.stderr?.on('data', (b) => { stderr += String(b) })
+    child.on('error', (e) => finish(-1, `起不来：${e?.message ?? e}`))
+    child.on('close', (code) => finish(code, ''))
+  })
+
+  /**
+   * ⭐ 走无头浏览器的脚本互斥（2026-10-31）：以前 spawnSync 把宿主冻住，物理上不会并发；
+   *    改异步后两个浏览器脚本可能真同时跑（抢同一个 chrome-profile / CDP）⇒ 这里排队。
+   *    只排「真碰浏览器」的脚本；纯 HTTP 的（im-http / notice-read / session-guard / forward-pick）不排。
+   */
+  const BROWSER_SCRIPTS = new Set(['im-send.mjs', 'card-share.mjs', 'qr-login.mjs', 'comment-mention-ui.mjs', 'comment-api.mjs'])
+  const scriptLocks = new Map()
+  const withScriptLock = (script, fn) => {
+    if (!BROWSER_SCRIPTS.has(script)) return fn()
+    const prev = scriptLocks.get(script) || Promise.resolve()
+    const next = prev.then(fn, fn)
+    scriptLocks.set(script, next.catch(() => { /* 锁链不吃异常 */ }))
+    return next
+  }
+
+  /**
+   * 跑插件自带的 node 脚本（tools/*.mjs），返回 {status, stdout, stderr} —— 永不抛（**异步**，await 它）
    * ⚠️ 2026-10-22：这里以前写死 `IM_CDP_PORT: '9334'` —— 那等于把 lib/chrome.mjs 的
    *    端口自动探测**废掉**（强制 9334，撞上就死）。现在只注入家目录，端口交给 lib 自己找。
    */
-  const runNodeTool = (script, args = [], { timeout = 240_000 } = {}) => {
+  const runNodeTool = async (script, args = [], { timeout = 240_000 } = {}) => {
     const f = join(pluginDir, 'tools', script)
     if (!existsSync(f)) return { status: -1, stdout: '', stderr: `缺少 tools/${script}` }
-    const r = spawnSync(process.execPath, [f, ...args], {
-      encoding: 'utf8',
+    return withScriptLock(script, () => spawnCapture(process.execPath, [f, ...args], {
       timeout,
       env: pyEnv({ DOUYIN_HOME: stateDir }),
-      windowsHide: true,
-    })
-    return { status: r.status ?? -1, stdout: String(r.stdout || ''), stderr: String(r.stderr || r.error || '') }
+    }))
   }
   /**
    * 跑插件自带的 Python 脚本（tools/*.py），返回 {status, stdout, stderr} —— 永不抛
@@ -951,17 +997,14 @@ export function apply(ctx, config) {
    *    5 个 bb-browser/cookie 驱动。那套东西一个都没跑通过真数据，还被「必须开浏览器」绑着；
    *    现在采集/发送全走「HTTP + 无头 Chrome」，那些全删了。
    */
-  const runPy = (script, args = [], { timeout = 240_000 } = {}) => {
+  const runPy = async (script, args = [], { timeout = 240_000 } = {}) => {
     const f = join(pluginDir, 'tools', script)
     if (!existsSync(f)) return { status: -1, stdout: '', stderr: `缺少 tools/${script}` }
     const py = existsSync(venvPython()) ? venvPython() : (cfg.pythonPath || 'python')
-    const r = spawnSync(py, [f, ...args], {
-      encoding: 'utf8',
+    return spawnCapture(py, [f, ...args], {
       timeout,
       env: pyEnv({ DOUYIN_HOME: stateDir }),
-      windowsHide: true,
     })
-    return { status: r.status ?? -1, stdout: String(r.stdout || ''), stderr: String(r.stderr || r.error || '') }
   }
 
   /** 从脚本输出里抠出最后一个完整 JSON 对象 */
@@ -1062,13 +1105,13 @@ export function apply(ctx, config) {
       try {
         // ① 有 cid 就按 cid 查（最准）
         if (cid) {
-          const cr = runPy('api-comments.py', [aweme], { timeout: 300_000 })
+          const cr = await runPy('api-comments.py', [aweme], { timeout: 300_000 })
           const out = String(cr.stdout || '')
           if (out.includes(cid)) return { state: 'visible', by: 'cid', cid, attempt: i + 1 }
         }
         // ② 没 cid（UI 路径）或 cid 没查到 ⇒ 按正文片段查 DOM（页面默认按最新渲染）
         if (text) {
-          const dr = runNodeTool('comment-read-dom.mjs', ['--aweme', aweme, '--mine', '--scroll', '6'], { timeout: 200_000 })
+          const dr = await runNodeTool('comment-read-dom.mjs', ['--aweme', aweme, '--mine', '--scroll', '6'], { timeout: 200_000 })
           const j = pickJson(dr.stdout)
           const needle = String(text).slice(0, 12)
           const items = Array.isArray(j?.items) ? j.items : []
@@ -1095,7 +1138,7 @@ export function apply(ctx, config) {
     parameters: {},
     async execute() {
       // ⭐ 用纯 Node 版：第一次装的时候还没有 Python，不能让它依赖 Python
-      const r = runNodeTool('doctor.mjs', ['--json'], { timeout: 90_000 })
+      const r = await runNodeTool('doctor.mjs', ['--json'], { timeout: 90_000 })
       const j = pickJson(r.stdout)
       if (!j) {
         return {
@@ -1126,7 +1169,7 @@ export function apply(ctx, config) {
       if (!hasCredential(stateDir)) {
         return { ok: false, logged_in: false, hint: '还没有 Cookie —— 设置页「抖音 Cookie / 登录」扫码，或粘一条 Cookie' }
       }
-      const r = runPy('session-guard.py', ['check'], { timeout: 90_000 })
+      const r = await runPy('session-guard.py', ['check'], { timeout: 90_000 })
       const j = pickJson(r.stdout)
       if (!j) return { ok: false, error: '体检没返回结果', stderr: String(r.stderr || '').slice(0, 300) }
       return { ok: true, logged_in: j.alive === true, ...j }
@@ -1164,7 +1207,7 @@ export function apply(ctx, config) {
       const top = Math.max(1, Math.min(Number(args.top) || 10, 30))
       const wcRaw = args.with_comments === undefined ? 5 : Number(args.with_comments)
       const withComments = Math.max(0, Math.min(Number.isFinite(wcRaw) ? wcRaw : 5, 15))
-      const r = runPy('forward-pick.py', [], { timeout: 300_000 })
+      const r = await runPy('forward-pick.py', [], { timeout: 300_000 })
       if (r.status !== 0) return { ok: false, error: '取候选失败', stderr: String(r.stderr || '').slice(0, 400) }
       let picked = {}
       try { picked = JSON.parse(readFileSync(join(stateDir, 'forward-pick.json'), 'utf8')) } catch { picked = {} }
@@ -1185,7 +1228,7 @@ export function apply(ctx, config) {
           share_url: x.share_url, web_url: x.web_url,
         }
         if (i < withComments && Number(x.comment) > 0) {
-          const c = runPy('api-comments.py', [String(x.aweme_id)], { timeout: 200_000 })
+          const c = await runPy('api-comments.py', [String(x.aweme_id)], { timeout: 200_000 })
           const lines = String(c.stdout || '').split('\n').filter((l) => /^\s{2}cid=/.test(l))
           item.evidence = lines.length
             ? lines.slice(0, 5).map((s) => s.replace(/^\s+/, '').replace(/^cid=\d+\s+/, '').slice(0, 160))
@@ -1213,11 +1256,9 @@ export function apply(ctx, config) {
       }
       const venvPy = join(stateDir, '.venv', 'Scripts', 'python.exe')
       const py = existsSync(venvPy) ? venvPy : (cfg.pythonPath || 'python')
-      const r = spawnSync(py, [script], {
-        encoding: 'utf8',
+      const r = await spawnCapture(py, [script], {
         timeout: 240_000,
         env: pyEnv({ DOUYIN_HOME: stateDir }),
-        windowsHide: true,
       })
       if (r.status !== 0) {
         return { ok: false, error: 'forward-pick.py 执行失败', stderr: String(r.stderr || r.error || '').slice(0, 400) }
@@ -1293,7 +1334,7 @@ export function apply(ctx, config) {
       let file = ''
       if (args.from_list) {
         const n = String(Math.max(1, Math.min(Number(args.top) || 3, 5)))
-        const r1 = runNodeTool('mk-msg.mjs', [n], { timeout: 60_000 })
+        const r1 = await runNodeTool('mk-msg.mjs', [n], { timeout: 60_000 })
         if (r1.status !== 0) return { ok: false, error: '生成清单正文失败', stderr: r1.stderr.slice(0, 300) }
         file = join(stateDir, 'forward-msg.txt')
       }
@@ -1315,7 +1356,7 @@ export function apply(ctx, config) {
       if (file) argv.push('--file', file)
       else argv.push('--text', text)
       if (args.dry) argv.push('--dry')
-      const r = runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
+      const r = await runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
       const res = pickJson(r.stdout)
       if (!res) return { ok: false, error: '发送器没返回可解析结果', stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) }
       if (res.ok) log(`dm -> ${res.to || to}${res.to_sec_uid ? ' (' + res.to_sec_uid + ')' : ''}: ${res.sent ? '已发送' : res.dry ? 'dry-run' : '未发送'}（${res.len} 字）`)
@@ -1369,7 +1410,7 @@ export function apply(ctx, config) {
         }
         rows = readRows()
         if (!rows.length) {
-          runNodeTool('forward-run.mjs', ['--no-toast'], { timeout: 300_000 })
+          await runNodeTool('forward-run.mjs', ['--no-toast'], { timeout: 300_000 })
           rows = readRows()
         }
         ids = rows.slice(0, Math.max(1, Math.min(Number(args.top) || 1, 3))).map((r) => String(r.aweme_id))
@@ -1396,7 +1437,7 @@ export function apply(ctx, config) {
       for (const id of ids) {
         const argv = [id, to]
         if (toId) argv.push('--to-id', toId)
-        const r = runNodeTool('card-share.mjs', argv, { timeout: 200_000 })
+        const r = await runNodeTool('card-share.mjs', argv, { timeout: 200_000 })
         const j = pickJson(r.stdout)
         results.push(j || { ok: false, aweme_id: id, stdout: r.stdout.slice(0, 300), stderr: r.stderr.slice(0, 200) })
         if (!(j && j.ok)) break
@@ -1411,7 +1452,7 @@ export function apply(ctx, config) {
         const rArgs = ['--read']
         if (to) rArgs.push('--to', to)
         if (toId) rArgs.push('--to-id', toId)
-        const r2 = runNodeTool('im-send.mjs', rArgs, { timeout: 240_000 })
+        const r2 = await runNodeTool('im-send.mjs', rArgs, { timeout: 240_000 })
         const j2 = pickJson(r2.stdout)
         if (j2 && j2.ok) {
           const mineCards = (Array.isArray(j2.messages) ? j2.messages : []).filter((m) => m.from === 'me' && m.awe === 800)
@@ -1441,7 +1482,7 @@ export function apply(ctx, config) {
         if (to) rArgs.push('--to', to)
         if (toId) rArgs.push('--to-id', toId)
         rArgs.push('--text', reasonText)
-        const r3 = runNodeTool('im-send.mjs', rArgs, { timeout: 240_000 })
+        const r3 = await runNodeTool('im-send.mjs', rArgs, { timeout: 240_000 })
         const j3 = pickJson(r3.stdout)
         reasonResult = j3
           ? {
@@ -1502,9 +1543,9 @@ export function apply(ctx, config) {
       if (!existsSync(cookiePath(stateDir))) return { ok: false, error: '还没有 Cookie', hint: '先扫码登录' }
       const argv = [join(pluginDir, 'tools', 'notice-read.py')]
       if (args.raw) argv.push('--raw')
-      const r = spawnSync(venvPy, argv, {
-        encoding: 'utf8', timeout: 150_000,
-        env: pyEnv({ DOUYIN_HOME: stateDir }), windowsHide: true,
+      const r = await spawnCapture(venvPy, argv, {
+        timeout: 150_000,
+        env: pyEnv({ DOUYIN_HOME: stateDir }),
       })
       const j = pickJson(r.stdout)
       if (!j) return { ok: false, error: '没读到通知', stderr: String(r.stderr || '').slice(0, 300) }
@@ -1695,7 +1736,7 @@ export function apply(ctx, config) {
       /* ── ② mode=ui：真 @（顶层评论，不找任何目标 ⇒ 没有死锁） ── */
       if (mode === 'ui') {
         if (!selfUidCache) {
-          const g = runPy('session-guard.py', ['check'], { timeout: 90_000 })
+          const g = await runPy('session-guard.py', ['check'], { timeout: 90_000 })
           const j = pickJson(g.stdout)
           if (j?.uid) selfUidCache = String(j.uid)
         }
@@ -1703,7 +1744,7 @@ export function apply(ctx, config) {
           return { ok: false, error: `mention_uid=${mentionUid} 是登录号自己的 uid —— 这是 @ 自己` }
         }
         const mArgs = ['--aweme', aweme, '--name', mentionName, '--text', text]
-        const mr = runNodeTool('comment-mention-ui.mjs', mArgs, { timeout: 300_000 })
+        const mr = await runNodeTool('comment-mention-ui.mjs', mArgs, { timeout: 300_000 })
         const mres = pickJson(mr.stdout)
         if (!mres) {
           return { ok: false, mode, error: '真 @ 执行器没返回可解析结果', stdout: String(mr.stdout || '').slice(0, 400), stderr: String(mr.stderr || '').slice(0, 300) }
@@ -1729,7 +1770,7 @@ export function apply(ctx, config) {
       const argv = ['--aweme', aweme, '--text', text]
       if (replyTo) argv.push('--reply', replyTo)
       if (rootCid) argv.push('--root', rootCid)
-      const r = runNodeTool('comment-api.mjs', argv, { timeout: 260_000 })
+      const r = await runNodeTool('comment-api.mjs', argv, { timeout: 260_000 })
       const res = pickJson(r.stdout)
       if (!res) return { ok: false, mode, error: '发送器没返回可解析结果', stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) }
 
@@ -1794,9 +1835,9 @@ export function apply(ctx, config) {
    *
    * @param {{limit?:number, include_seen?:boolean, mark_seen?:boolean}} args
    */
-  const readAtMe = (args = {}) => {
+  const readAtMe = async (args = {}) => {
     if (!hasCredential(stateDir)) return { ok: false, error: '还没登录', hint: '先在设置页扫码登录' }
-    const r = runPy('notice-read.py', ['--raw'], { timeout: 150_000 })
+    const r = await runPy('notice-read.py', ['--raw'], { timeout: 150_000 })
     const j = pickJson(r.stdout)
     if (!j) return { ok: false, error: '没读到通知', stderr: String(r.stderr || '').slice(0, 300) }
     const items = Array.isArray(j.items) ? j.items : []
@@ -1893,7 +1934,7 @@ export function apply(ctx, config) {
       include_seen: { type: 'boolean', description: '连已经回过的也列出来（默认 false，只看新的）' },
     },
     async execute(args = {}) {
-      return readAtMe({ ...args, mark_seen: false })
+      return await readAtMe({ ...args, mark_seen: false })
     },
   })
 
@@ -1981,7 +2022,7 @@ export function apply(ctx, config) {
       let http = null
       if (toId) {
         try {
-          const r0 = runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', String(limit)], { timeout: 30_000 })
+          const r0 = await runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', String(limit)], { timeout: 30_000 })
           http = pickJson(r0.stdout)
         } catch { http = null }
         if (http && http.ok && http.matched) {
@@ -2015,7 +2056,7 @@ export function apply(ctx, config) {
       const argv = ['--read']
       if (to) argv.push('--to', to)
       if (toId) argv.push('--to-id', toId)
-      const r = runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
+      const r = await runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
       const j = pickJson(r.stdout)
       if (!j) return { ok: false, error: '读不到会话', stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 300) }
       if (!j.ok) return j
@@ -2062,7 +2103,7 @@ export function apply(ctx, config) {
     async execute(args = {}) {
       const id = String(args.aweme_id || '').trim()
       if (!id) return { ok: false, error: '缺 aweme_id' }
-      const r = runPy('api-comments.py', [id], { timeout: 300_000 })
+      const r = await runPy('api-comments.py', [id], { timeout: 300_000 })
       const text = String(r.stdout || '')
       const lines = text.split('\n')
       const head = lines.find((l) => /status_code=/.test(l)) || ''
@@ -2262,7 +2303,7 @@ export function apply(ctx, config) {
     return nodeExeCache
   }
 
-  const resolveDsh = () => {
+  const resolveDsh = async () => {
     /**
      * 🔴 解释器要按**目标路径**挑，不能一律「有独立 node 就用它」（Issue #6①，2026-10-30）。
      *
@@ -2348,9 +2389,11 @@ export function apply(ctx, config) {
      *       —— 这一步是给"没解 asar 的普通桌面安装"准备的。
      */
     const isAsar = (p) => /\.asar[\\/]/i.test(String(p))
-    const runnable = (p) => {
+    // 🔴 2026-10-31：探测改成 **异步** —— 以前 spawnSync 在这里冷启动一整个 Electron
+    //    （25s 超时），宿主全程冻住；装机首日的自动值班正好踩这里（B 站「装了就卡死」）。
+    const runnable = async (p) => {
       try {
-        const r = spawnSync(jsRunnerFor(p), [p, '--version'], { encoding: 'utf8', windowsHide: true, timeout: 25_000 })
+        const r = await spawnCapture(jsRunnerFor(p), [p, '--version'], { timeout: 25_000 })
         // ⚠️ 必须 **status===0 且** 有版本号。原来是 `status === 0 || 有版本形状`，
         //    于是「独立 node 读不了 asar」也被放行，日志还打「已验证可跑」——
         //    假阳性比不检查更糟：真跑时才炸，而且炸在最难看的时机。
@@ -2367,7 +2410,7 @@ export function apply(ctx, config) {
     // ② asar 内的候选：真跑一次验证（Electron 宿主能跑）
     for (const p of candidates) {
       if (!p || !isAsar(p)) continue
-      if (runnable(p)) {
+      if (await runnable(p)) {
         log(`dsh 入口（asar 内，已验证可跑）：${p}`)
         return { command: jsRunnerFor(p), args: [p], shell: false }
       }
@@ -2375,7 +2418,7 @@ export function apply(ctx, config) {
     // ③ 最后再兜一遍：非 asar 但 existsSync 没命中的（权限/符号链接怪情况）
     for (const p of candidates) {
       if (!p || isAsar(p)) continue
-      if (runnable(p)) return { command: jsRunnerFor(p), args: [p], shell: false }
+      if (await runnable(p)) return { command: jsRunnerFor(p), args: [p], shell: false }
     }
 
     /**
@@ -2964,10 +3007,10 @@ export function apply(ctx, config) {
    * 任何 douyin_* 工具了 —— 而且本来也不该有：采集 + 预筛 + 算比值是**代码活**，
    * 交给模型只会烧 token、还会因为"工具失败两次"把整轮预算耗光。
    */
-  const buildEvidence = (limit = 12) => {
+  const buildEvidence = async (limit = 12) => {
     try {
       const max = Math.max(1, Math.min(Number(limit) || 12, 30))
-      const r = runPy('forward-pick.py', ['--limit', String(max)], { timeout: 300_000 })
+      const r = await runPy('forward-pick.py', ['--limit', String(max)], { timeout: 300_000 })
       if (r.status !== 0) return { ok: false, error: String(r.stderr || '').slice(0, 300) }
       let picked = {}
       try { picked = JSON.parse(readFileSync(join(stateDir, 'forward-pick.json'), 'utf8')) } catch { picked = {} }
@@ -2988,7 +3031,7 @@ export function apply(ctx, config) {
         }
         // 前 5 条顺手拉一下高赞评论 —— 这是判断"好不好玩"最有力的证据
         if (i < 5 && Number(x.comment) > 0) {
-          const c = runPy('api-comments.py', [String(x.aweme_id)], { timeout: 200_000 })
+          const c = await runPy('api-comments.py', [String(x.aweme_id)], { timeout: 200_000 })
           const lines = String(c.stdout || '').split('\n').filter((l) => /^\s{2}cid=/.test(l))
           item.top_comments = lines.slice(0, 5).map((s) => s.replace(/^\s+/, '').replace(/^cid=\d+\s+/, '').slice(0, 160))
         }
@@ -3060,12 +3103,12 @@ export function apply(ctx, config) {
       ;(async () => {
         try {
           petSay('刷抖音喽！鱼先去把候选捞回来～')
-          const ev = buildEvidence(Math.max(1, Math.min(Number(cfg.maxPerRun) || 12, 30)))
+          const ev = await buildEvidence(Math.max(1, Math.min(Number(cfg.maxPerRun) || 12, 30)))
           log(ev.ok
             ? `证据包已备好：${ev.count} 条 → ${join(stateDir, 'round-evidence.json')}`
             : `证据包没备成（${ev.error}）—— 这一轮照样起，模型会读到空包并如实写进报告`)
           petSay(ev.ok ? `捞到 ${ev.count} 条候选，鱼在挨个看…` : '候选没捞着…鱼空着手也要把这轮跑完')
-          const dsh = resolveDsh()
+          const dsh = await resolveDsh()
           /**
            * ⭐ Issue #6②：桌面版用户机器上通常只有 `desktop`（Electron 独占，命令行用不了），
            *    而 `headless` 要手动建。profile 不存在时 dsh 只回一句
@@ -3161,6 +3204,9 @@ export function apply(ctx, config) {
       const st = readJson(dutyStateFile, {})
       const today = dayKey(now)
       if (countPickedToday(now) >= Number(cfg.perDay || 0)) return
+      // ⭐ 未登录不自动值班（2026-10-31，B 站「装了就卡死」）：没 Cookie 时这一轮
+      //    注定失败，白冻结宿主一次探测 —— 装完插件安安静静等用户先登录。手动跑不受影响。
+      if (!hasCredential(stateDir)) return
       if (String(cfg.reportLevel || 'full') === 'off' && roundsToday(now) >= 1) return
       // ⭐ 把所有生效的时段拼成一个列表：内置中午/晚上 + 用户自定义
       //    自定义的也按「每天一次」去重，key 用 `custom:<下标>`，改时段后旧 key 自然失效。
@@ -3246,7 +3292,7 @@ export function apply(ctx, config) {
       const pState = chatWatchPeers[key] || { lastSeenAt: '', primed: false }
       if (isGroup) {
         // 🔴 群消息走浏览器路径读（im-http 的身份铁闸只认 sec_uid，群过不去 —— 设计如此）
-        const r = runNodeTool('im-send.mjs', ['--read', '--to', nick], { timeout: 240_000 })
+        const r = await runNodeTool('im-send.mjs', ['--read', '--to', nick], { timeout: 240_000 })
         const j = pickJson(r.stdout)
         cwState.checks += 1
         if (!j || !j.ok) {
@@ -3289,7 +3335,7 @@ export function apply(ctx, config) {
         }
         continue
       }
-      const r = runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', '8'], { timeout: 30_000 })
+      const r = await runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', '8'], { timeout: 30_000 })
       const j = pickJson(r.stdout)
       cwState.checks += 1
       if (!j || !j.ok) {
@@ -3451,8 +3497,8 @@ export function apply(ctx, config) {
    * 「我既然点开了开关，就是想让你说话，强制我点开开关你说一句话给我，说什么要贴合场景」
    * ⇒ 开关被打开的那一刻（以及重启后发现它是开着的），小鱼**主动私信一句话**。
    * 防轰炸：每个触发点（开关刚开 / 重启接班）一天最多发一次（state.json.greet 逐点记日期）。
-   * ⚠️ 必须**异步**跑：im-send.mjs 走无头 Chrome 要几十秒，runNodeTool 是 spawnSync
-   *    会把整个宿主冻住（健康检查/HTTP/盯梢全停）——报号走下面的 spawn 异步版。
+   * ⚠️ 报号走下面的 spawn **异步**版（2026-10-31 起 runNodeTool 也已异步化 + 浏览器互斥；
+   *    这份独立实现保留不动 —— 报号的语义跟它绑着，别顺手合并）。
    */
   const runNodeToolAsync = (script, args = [], { timeout = 240_000 } = {}) => new Promise((resolve) => {
     const f = join(pluginDir, 'tools', script)
@@ -4490,7 +4536,7 @@ export function apply(ctx, config) {
         return sendJson(res, 200, { ok: true, logged_in: true, account: cached, cached: true })
       }
       try {
-        const g = runPy('session-guard.py', ['check'], { timeout: 90_000 })
+        const g = await runPy('session-guard.py', ['check'], { timeout: 90_000 })
         const j = pickJson(g.stdout)
         if (!j) return sendJson(res, 200, { ok: false, logged_in: true, account: cachedGood ? cached : null, error: '体检脚本没返回结果' })
         const acc = { nick: j.nick || '', uid: j.uid || '', alive: j.alive === true, at: new Date().toISOString() }
@@ -4806,7 +4852,7 @@ export function apply(ctx, config) {
 
       // ① 评论区 @ 我
       try {
-        const r = readAtMe({ limit: 20, include_seen: false })
+        const r = await readAtMe({ limit: 20, include_seen: false })
         if (r && r.ok) { out.at = r.list || []; out.at_n = r.at_n || 0 }
         else out.errors.push('评论区 @：' + ((r && (r.error || r.hint)) || '读不到'))
       } catch (e) { out.errors.push('评论区 @：' + String(e?.message ?? e)) }
@@ -4817,7 +4863,7 @@ export function apply(ctx, config) {
        *    所以这里如实说：列出最近跟我聊过的人 + 他最后说了什么 + 是不是他说的。
        */
       try {
-        const r = runNodeTool('im-send.mjs', ['--list'], { timeout: 180_000 })
+        const r = await runNodeTool('im-send.mjs', ['--list'], { timeout: 180_000 })
         const j = pickJson(r.stdout)
         if (j && j.ok) {
           const list = Array.isArray(j.people) ? j.people : []
@@ -4863,7 +4909,7 @@ export function apply(ctx, config) {
        */
       if (toId) {
         try {
-          const r0 = runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', '40'], { timeout: 30_000 })
+          const r0 = await runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', '40'], { timeout: 30_000 })
           const h = pickJson(r0.stdout)
           if (h && h.ok && h.matched) {
             const msgs = Array.isArray(h.matched.messages) ? h.matched.messages : []
@@ -4888,7 +4934,7 @@ export function apply(ctx, config) {
       const argv = ['--read']
       if (to) argv.push('--to', to)
       if (toId) argv.push('--to-id', toId)
-      const r = runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
+      const r = await runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
       const j = pickJson(r.stdout)
       if (!j) return sendJson(res, 200, { ok: false, error: '读不到会话', detail: String(r.stderr || r.stdout || '').slice(-400) })
       if (!j.ok) return sendJson(res, 200, j)
@@ -4929,7 +4975,7 @@ export function apply(ctx, config) {
       if (to) argv.push('--to', to)
       if (toId) argv.push('--to-id', toId)
       argv.push('--text', text)
-      const r = runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
+      const r = await runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
       const j = pickJson(r.stdout)
       if (!j) return sendJson(res, 200, { ok: false, error: '发送器没返回可解析结果', detail: String(r.stderr || r.stdout || '').slice(-400) })
       if (j.ok && j.sent) {
@@ -5028,7 +5074,7 @@ export function apply(ctx, config) {
 
     /* ── 环境体检（纯 Node，不需要 Python —— 用户第一次点它时还没有 venv） ── */
     if (req.method === 'POST' && path === '/api/douyin-duty/doctor') {
-      const r = runNodeTool('doctor.mjs', ['--json'], { timeout: 90_000 })
+      const r = await runNodeTool('doctor.mjs', ['--json'], { timeout: 90_000 })
       const j = pickJson(r.stdout)
       if (!j) {
         return sendJson(res, 200, {
@@ -5154,7 +5200,7 @@ export function apply(ctx, config) {
           return sendJson(res, 200, { ok: false, fixed, need_user: needUser, human })
         }
         // ④ 真读一次，看能不能读到
-        const r = runPy('im-http.py', ['--read', '--peer-sec-uid', fixPeer.sec_uid, '--limit', '3'], { timeout: 30_000 })
+        const r = await runPy('im-http.py', ['--read', '--peer-sec-uid', fixPeer.sec_uid, '--limit', '3'], { timeout: 30_000 })
         const j = pickJson(r.stdout)
         if (!j || !j.ok) {
           const err = String((j && j.error) || r.stderr || '没返回可解析结果')
@@ -5194,14 +5240,14 @@ export function apply(ctx, config) {
       if (!venvReadyNow()) { out.error = '环境还没装好 —— 点「装主依赖」'; return sendJson(res, 200, out) }
       if (!hasCredential(stateDir)) { out.error = '还没登录 —— 先扫码，或粘一条 Cookie'; return sendJson(res, 200, out) }
       try {
-        const r = runPy('session-guard.py', ['check'], { timeout: 90_000 })
+        const r = await runPy('session-guard.py', ['check'], { timeout: 90_000 })
         const j = pickJson(r.stdout) || {}
         out.session = { alive: j.alive === true, nick: j.nick || null, code: j.code ?? null }
         if (j.alive === true) out.steps.push(`登录有效${j.nick ? '（' + j.nick + '）' : ''}`)
         else { out.error = `会话不健康：code=${j.code ?? '?'} ${j.why || ''}`; return sendJson(res, 200, out) }
       } catch (e) { out.error = '体检失败：' + (e?.message ?? e); return sendJson(res, 200, out) }
       try {
-        runPy('forward-pick.py', [], { timeout: 300_000 })
+        await runPy('forward-pick.py', [], { timeout: 300_000 })
         let picked = {}
         try { picked = JSON.parse(readFileSync(join(stateDir, 'forward-pick.json'), 'utf8')) } catch { picked = {} }
         const rows = Array.isArray(picked.rows) ? picked.rows : []
@@ -5262,10 +5308,10 @@ export function apply(ctx, config) {
       const force = String((await readBody(req))?.force || '') === '1'
       // 先确保后台无头浏览器不占着 profile —— 它和扫码窗口共用一个 user-data-dir
       if (force) {
-        runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 })
+        await runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 })
         await new Promise((r) => setTimeout(r, 1200))
       }
-      const r = runNodeTool('qr-login.mjs', ['start'], { timeout: 120_000 })
+      const r = await runNodeTool('qr-login.mjs', ['start'], { timeout: 120_000 })
       const j = pickJson(r.stdout)
       if (!j) {
         log(`扫码登录：出码失败（exit=${r.status}）${String(r.stderr || '').slice(0, 160)}`)
@@ -5308,7 +5354,7 @@ export function apply(ctx, config) {
     if (req.method === 'POST' && path === '/api/douyin-duty/login/wait') {
       const body = await readBody(req)
       const sec = Math.max(2, Math.min(Number(body?.seconds) || 3, 8))
-      const r = runNodeTool('qr-login.mjs', ['watch', String(sec)], { timeout: (sec + 20) * 1000 })
+      const r = await runNodeTool('qr-login.mjs', ['watch', String(sec)], { timeout: (sec + 20) * 1000 })
       const lines = String(r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean)
       let last = null
       for (let i = lines.length - 1; i >= 0 && !last; i--) {
@@ -5321,7 +5367,7 @@ export function apply(ctx, config) {
         log(`扫码登录：成功，凭证已保存（${last.cookies || '?'} 条 Cookie）`)
         // ⭐ 记下"登录的是哪个号" —— 面板要显示昵称（用户要知道自己在给谁刷）
         try {
-          const g = runPy('session-guard.py', ['check'], { timeout: 90_000 })
+          const g = await runPy('session-guard.py', ['check'], { timeout: 90_000 })
           const j = pickJson(g.stdout)
           if (j && (j.nick || j.uid)) {
             writeJson(join(stateDir, 'account.json'), {
@@ -5332,7 +5378,7 @@ export function apply(ctx, config) {
           }
         } catch { /* 拿不到昵称不影响登录本身 */ }
         // 登完把有头浏览器收掉，别让它一直占着 profile（不然发私信会起不来）
-        try { runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 }) } catch { /* 关不掉也不致命 */ }
+        try { await runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 }) } catch { /* 关不掉也不致命 */ }
         refreshCfg()
       }
       return sendJson(res, 200, last)
@@ -5340,13 +5386,13 @@ export function apply(ctx, config) {
     // ⭐ 单次登录检查（面板「我扫完了」的轮询引擎：秒回，不堵宿主）
     //    直接复用 qr-login.mjs check（连 CDP 读 cookie，成功就地导出凭证）
     if (req.method === 'POST' && path === '/api/douyin-duty/login/check') {
-      const r = runNodeTool('qr-login.mjs', ['check'], { timeout: 30_000 })
+      const r = await runNodeTool('qr-login.mjs', ['check'], { timeout: 30_000 })
       const j = pickJson(r.stdout)
       if (!j) return sendJson(res, 200, { ok: false, pending: true, error: 'check 没返回结果', detail: String(r.stderr || '').slice(-300) })
       if (j.ok) {
         log(`扫码登录：check 命中，凭证已保存（${j.cookies || '?'} 条 Cookie）`)
         try {
-          const g = runPy('session-guard.py', ['check'], { timeout: 90_000 })
+          const g = await runPy('session-guard.py', ['check'], { timeout: 90_000 })
           const jj = pickJson(g.stdout)
           if (jj && (jj.nick || jj.uid)) {
             writeJson(join(stateDir, 'account.json'), {
@@ -5355,14 +5401,14 @@ export function apply(ctx, config) {
             })
           }
         } catch { /* 昵称拿不到不影响 */ }
-        try { runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 }) } catch { /* 关不掉也不致命 */ }
+        try { await runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 }) } catch { /* 关不掉也不致命 */ }
         refreshCfg()
       }
       return sendJson(res, 200, j)
     }
     // 关掉登录用的浏览器（用户嫌窗口碍事 / 出码失败要重来时）
     if (req.method === 'POST' && path === '/api/douyin-duty/login/close') {
-      const r = runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 })
+      const r = await runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 })
       return sendJson(res, 200, pickJson(r.stdout) || { ok: true })
     }
 
@@ -5371,7 +5417,7 @@ export function apply(ctx, config) {
     if (req.method === 'POST' && path === '/api/douyin-duty/dm/people') {
       if (!hasCredential(stateDir)) return sendJson(res, 200, { ok: false, error: '还没登录', hint: '先在上面扫码登录' })
       // 后台无头浏览器可能正在跑；先让它别占着（跟登录窗口同一个 profile）
-      const r = runNodeTool('im-send.mjs', ['--list'], { timeout: 180_000 })
+      const r = await runNodeTool('im-send.mjs', ['--list'], { timeout: 180_000 })
       const j = pickJson(r.stdout)
       if (!j) {
         return sendJson(res, 200, {

@@ -1563,6 +1563,30 @@ try {
   } else bad('关键词要么没接上，要么被做成硬筛了（Issue #3：硬筛会把意外惊喜筛没）')
 } catch (e) { bad(`排障质量检查失败：${e.message}`) }
 
+/* ── 4q. 宿主冻结防线（2026-10-31，B 站用户实测「装了插件整个 DSH 卡死」） ── */
+console.log('\n4q. 宿主冻结防线：请求/定时器路径上不许有同步 spawn')
+try {
+  const idx = readFileSync(join(here, 'index.js'), 'utf8')
+  const syncSpawns = (idx.match(/spawnSync\(/g) || []).length
+  // 只允许 nodeExe() 里的两个亚秒级探针（node --version / where node）—— 不在任何请求路径上
+  if (syncSpawns === 2 && /const probe = spawnSync\('node'/.test(idx) && /spawnSync\(process\.platform === 'win32' \? 'where'/.test(idx)) {
+    ok('宿主里只剩 nodeExe 的两个亚秒级探针，其余子进程全部异步')
+  } else bad(`index.js 里 spawnSync 出现 ${syncSpawns} 次 —— 请求/定时器路径上的同步 spawn 会冻住整个宿主`)
+  if (/const spawnCapture = /.test(idx) && /await spawnCapture\(/.test(idx)) {
+    ok('子进程统一走 spawnCapture（spawn + await，超时先 TERM 再 KILL）')
+  } else bad('spawnCapture 异步 runner 不见了 —— 又回到 spawnSync 冻宿主的老路')
+  if (/await runPy\(/.test(idx) && /await runNodeTool\(/.test(idx)) {
+    ok('runPy / runNodeTool 全部 await 化（调用方语义不变，宿主不再被摁住）')
+  } else bad('还有没 await 的 runPy / runNodeTool 调用 —— 那是一个没人等的 Promise，拿到的是旧结果')
+  if (/BROWSER_SCRIPTS/.test(idx) && /withScriptLock\(/.test(idx)) {
+    ok('走浏览器的脚本有互斥闸（异步后不再抢同一个 chrome-profile）')
+  } else bad('浏览器脚本互斥闸不见了 —— 异步并发会抢同一个无头浏览器')
+  // 未登录不自动值班：没 Cookie 时定时器一轮也白跑，还平白冻宿主一次探针
+  if (/未登录不自动值班/.test(idx) && /if \(!hasCredential\(stateDir\)\) return/.test(idx)) {
+    ok('未登录时定时器不自动值班（新装机不再「装上去就卡死」）')
+  } else bad('定时器没有未登录闸 —— 新装机到点就白跑一轮（还会冻宿主一次探针）')
+} catch (e) { bad(`宿主冻结防线检查失败：${e.message}`) }
+
 /* ── 4e. 采集门槛 / 跨天记账 ── */
 console.log('\n4e. 采集门槛 / 跨天')
 try {
