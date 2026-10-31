@@ -488,12 +488,41 @@ if (cmd === 'watch') {
 
 if (cmd === 'close') {
   try {
-    execFileSync('powershell.exe', ['-NoProfile', '-Command',
+    // 强制结束会丢掉尚未落盘的新 Cookie；只正常关闭当前插件 profile 的浏览器。
+    const profileLiteral = "'" + PROFILE.replace(/'/g, "''") + "'"
+    const raw = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+      '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' +
       `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ` +
-      `Where-Object { $_.CommandLine -like '*chrome-profile*' } | ` +
-      `ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
-      { encoding: 'utf8', timeout: 20000 })
+      `Where-Object { $_.CommandLine -and $_.CommandLine.Contains(${profileLiteral}) -and $_.CommandLine -notmatch ' --type=' } | ` +
+      `Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`],
+      { encoding: 'utf8', timeout: 20000 }).trim()
+    const parsed = raw ? JSON.parse(raw) : []
+    const escapedProfile = PROFILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const profileArg = new RegExp(`--user-data-dir=(?:"${escapedProfile}"|${escapedProfile})(?=["\\s]|$)`, 'i')
+    const browsers = (Array.isArray(parsed) ? parsed : [parsed]).filter((p) => profileArg.test(p.CommandLine || ''))
+    for (const browser of browsers) {
+      const port = /--remote-debugging-port=(\d+)/.exec(browser.CommandLine || '')?.[1]
+      if (!port) throw new Error('浏览器没有调试端口，未强制结束；请手动正常关闭登录窗口')
+      const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.timeout(5000),
+      })).json()
+      const c = await connect(version.webSocketDebuggerUrl)
+      let timer
+      try {
+        await Promise.race([
+          c.send('Browser.close'),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('浏览器正常关闭超时')), 5000) }),
+        ])
+      } finally { clearTimeout(timer); c.close() }
+      const alive = () => { try { process.kill(Number(browser.ProcessId), 0); return true } catch (e) { if (e.code === 'ESRCH') return false; throw e } }
+      const deadline = Date.now() + 8000
+      while (alive() && Date.now() < deadline) await sleep(100)
+      if (alive()) throw new Error('浏览器仍在保存登录态，未强制结束；请稍后重试')
+    }
     console.log(JSON.stringify({ ok: true, closed: true }, null, 2))
-  } catch (e) { console.log(JSON.stringify({ ok: false, error: String(e?.message ?? e) }, null, 2)) }
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, error: String(e?.message ?? e) }, null, 2))
+    process.exitCode = 1
+  }
 }
 
