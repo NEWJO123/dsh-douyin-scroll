@@ -5447,17 +5447,10 @@ export function apply(ctx, config) {
     return sendJson(res, 404, { ok: false, error: `unknown ${req.method} ${path}` })
   }
 
-  /**
-   * 🔴 webServer 是 optional（见文件头）：headless / CLI 模式没有它。
-   *    没挂上面板和 HTTP 路由只影响「设置页 / 外部接口」，不影响值班轮。
-   * ⚠️ 取法跟本文件其它 optional 服务一样（`ctx.get` + try）—— 直接点属性在服务缺席时会抛。
-   */
-  const ws = (() => { try { return ctx.get('webServer') } catch { return null } })()
-  if (!ws) {
-    log('没有 webServer（CLI / headless 模式）：设置页和 /api/douyin-duty 路由不挂，值班轮照常跑')
-  } else {
+  // 网页服务可能晚于插件启动。随服务就绪注册路由；headless 不提供该服务时继续正常工作。
+  ctx.inject(['webServer'], (webCtx) => {
     try {
-      ctx.effect(() => ws.register({
+      webCtx.effect(() => webCtx.get('webServer').register({
         kind: 'prefix',
         path: '/api/douyin-duty',
         handler: async (req, res) => {
@@ -5466,8 +5459,9 @@ export function apply(ctx, config) {
           }
         },
       }), 'douyin-duty: /api/douyin-duty 路由')
+      log('设置页接口已就绪')
     } catch (e) { log(`HTTP 路由没挂上：${e?.message ?? e}`) }
-  }
+  })
 
   ctx.effect(() => () => { try { mcp?.stop() } catch { /* 收摊 */ } }, 'douyin-duty: 收 MCP 子进程')
   log(`已挂载（家=${stateDir}，采集=推荐流只读接口，python=${cfg.pythonPath}，峰谷=${cfg.peakValley ? '开' : '关'}）`)
