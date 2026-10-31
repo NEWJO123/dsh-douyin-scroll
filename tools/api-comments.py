@@ -74,7 +74,16 @@ def page_fetch(rel):
             u = "https://www.douyin.com" + u
         h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*", "Referer": "https://www.douyin.com/",
              "Origin": "https://www.douyin.com", "Cookie": COOKIE, **(s.get("headers") or {})}
-        r = httpx.get(u, headers=h, timeout=30, follow_redirects=True)
+        # DSH 的 [::1] 绕过项需转换为 httpx 接受的格式，仅在本次请求期间生效。
+        proxy_env = {key: os.environ[key] for key in ("NO_PROXY", "no_proxy") if key in os.environ}
+        try:
+            for key, value in proxy_env.items():
+                normalized = ",".join("::1" if item.strip() == "[::1]" else item for item in value.split(","))
+                if normalized != value:
+                    os.environ[key] = normalized
+            r = httpx.get(u, headers=h, timeout=30, follow_redirects=True)
+        finally:
+            os.environ.update(proxy_env)
         return r.json(), "signed"
     # 兜底：页面上下文里 fetch（页面自己的签名 SDK 是活的，不用 a_bogus）
     sys.stderr.write("[api-comments] 签名不可用（%s）→ 走无头浏览器兜底\n" % (s.get("err") or "无输出"))
