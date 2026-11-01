@@ -32,6 +32,8 @@ import { findBrowser } from '../lib/chrome.mjs'
 
 const HOME = homeDir()
 const PROFILE = join(HOME, 'chrome-profile')
+/** profile 路径的 PowerShell 单引号字面量（Issue #11：进程检测按 profile 路径认，不认 exe 名） */
+const PROFILE_PS = "'" + PROFILE.replace(/'/g, "''") + "'"
 /**
  * ⭐ 端口不再写死 9333：那会和"别的东西恰好占了 9333"冲突，而且 9333 不在
  *    lib/chrome.mjs 的扫描范围（9334–9373）里，两个模块各扫各的，谁也不认识谁。
@@ -59,24 +61,29 @@ async function findFreePort() {
   throw new Error('9374–9413 全被占用了，找不到登录用的调试端口（可以用 QR_CDP_PORT 指定一个）')
 }
 
-/** 有没有别的 Chrome 正在用我们这个 profile？ */
+/** 有没有别的浏览器进程正在用我们这个 profile？
+ *  🔴 Issue #11：不认 exe 名（写死 chrome.exe 在只装 Edge 的机器上「看不见」占着 profile 的
+ *  msedge ⇒ 扫码登录必失败），改按命令行里的 profile 路径认；排除探测用的 powershell 自身
+ *  （它的 -Command 里就带着 profile 字面量）和 --type= 的子进程。 */
 function profileInUse() {
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ` +
-      `Where-Object { $_.CommandLine -like '*chrome-profile*' } | ` +
+      `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
+      `Get-CimInstance Win32_Process | ` +
+      `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${PROFILE_PS}) -and $_.CommandLine -notmatch ' --type=' } | ` +
       `Select-Object -ExpandProperty ProcessId`],
       { encoding: 'utf8', timeout: 15000 })
     return String(out || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
   } catch { return [] }
 }
 
-/** 关掉占着 profile 的 Chrome（只在用户明确要求时用） */
+/** 关掉占着 profile 的浏览器（只在用户明确要求时用；同 Issue #11，按 profile 路径认进程） */
 function closeProfileChrome() {
   try {
     execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ` +
-      `Where-Object { $_.CommandLine -like '*chrome-profile*' } | ` +
+      `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
+      `Get-CimInstance Win32_Process | ` +
+      `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${PROFILE_PS}) -and $_.CommandLine -notmatch ' --type=' } | ` +
       `ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
       { encoding: 'utf8', timeout: 20000 })
     return true
@@ -91,7 +98,7 @@ function closeProfileChrome() {
 function frontWindow() {
   try {
     return String(execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `$p = Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; ` +
+      `$p = Get-Process chrome,msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; ` +
       `if($p){ $ws = New-Object -ComObject WScript.Shell; [void]$ws.AppActivate($p.Id); Write-Output ('front ' + $p.Id) } else { Write-Output 'no-window' }`],
       { encoding: 'utf8', timeout: 20000 })).trim()
   } catch { return 'no-window' }
@@ -108,8 +115,13 @@ async function cdpTargets(waitMs = 30000) {
     await sleep(500)
   }
   // ⭐ 这里不是「出错了」，是「你还没开始登录」—— 别甩一个端口号给用户看
+  //    🔴 Issue #11：超时要把「进程起没起来 / 是不是秒退」带上 —— 别让真因藏在一句「浏览器还没开」里
+  const living = profileInUse()
+  const where = living.length
+    ? `登录浏览器在跑（pid ${living.join(', ')}），但调试端口连不上 —— 可能刚才秒退留了残进程，或端口被别的程序占了。`
+    : '登录用的浏览器还没开（没有进程占着插件 profile）。'
   throw new Error(
-    '登录用的浏览器还没开。\n'
+    where + '\n'
     + '  → 设置页点「扫码登录」，或命令行跑：node tools/qr-login.mjs start\n'
     + '  → 扫完码如果抖音还要验证（短信 / 滑块），在**那个弹出的浏览器窗口里**做完\n'
     + '  → 然后再点一次「我扫完了」（或跑 node tools/qr-login.mjs check）',
@@ -492,8 +504,8 @@ if (cmd === 'close') {
     const profileLiteral = "'" + PROFILE.replace(/'/g, "''") + "'"
     const raw = execFileSync('powershell.exe', ['-NoProfile', '-Command',
       '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' +
-      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ` +
-      `Where-Object { $_.CommandLine -and $_.CommandLine.Contains(${profileLiteral}) -and $_.CommandLine -notmatch ' --type=' } | ` +
+      `Get-CimInstance Win32_Process | ` +
+      `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${profileLiteral}) -and $_.CommandLine -notmatch ' --type=' } | ` +
       `Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`],
       { encoding: 'utf8', timeout: 20000 }).trim()
     const parsed = raw ? JSON.parse(raw) : []
