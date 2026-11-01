@@ -9,6 +9,20 @@
 
 ---
 
+## 0.5.9 — 2026-11-01（修复：只装 Edge 的机器扫码登录必失败 · Issue #11）
+
+- **qr-login.mjs 四处进程检测写死 chrome.exe**（占用检测 ×2 / frontWindow / close）：
+  只装 Edge 的机器上，后台无头 msedge 占着 chrome-profile 时检测「看不见」⇒
+  登录用的有头浏览器秒退 ⇒「出二维码失败」。
+  改成**按命令行里的 profile 路径认进程**（排除探测用的 powershell 自身与 --type= 子进程），
+  frontWindow 加 msedge，close 子命令同步修正。
+- **cdpTargets 超时把「进程起没起来 / 是不是秒退」带上**：真因不再藏在一句「浏览器还没开」里。
+- A/B 实测：占着 profile 的 msedge，旧检测 **0 命中（隐身）**、修复后 close 优雅关掉。
+- 报告：Issue #11 · superscc（证据 / 复现 / 修法 / 本地验证齐全 —— 感谢！）。
+- 验证：selfcheck 371/0 + 面板渲染检查 + MCP 13 工具。
+
+---
+
 ## 0.5.8 — 2026-10-31（三个 DSH 环境兼容修复 · 社区 PR #10 · yitacls）
 
 - **代理用户**：NO_PROXY 里带 `[::1]` 时 httpx 解析直接崩，挂系统代理的机器 python 侧请求全挂
