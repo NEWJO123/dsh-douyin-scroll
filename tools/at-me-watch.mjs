@@ -44,7 +44,9 @@ const REPLY_FALLBACK = process.env.DOUYIN_REPLY_FALLBACK || '收到～ 我记下
 const argv = process.argv.slice(2)
 const argOf = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? (argv[i + 1] ?? '') : d }
 const DRY = argv.includes('--dry')
-const AWEME = String(argOf('--aweme', '')).trim()
+const AWEME_INPUT = String(argOf('--aweme', '')).trim()
+const workMatch = /^https:\/\/(?:www\.)?douyin\.com\/(?:note|video)\/(\d+)(?:[/?#]|$)/.exec(AWEME_INPUT)
+const AWEME = workMatch ? workMatch[1] : AWEME_INPUT
 const OWNER_UID = String(
   argOf('--owner-uid', '') || process.env.DOUYIN_OWNER_UID || '',
 ).trim()
@@ -227,7 +229,11 @@ const main = async () => {
          *     · 拿得到 cid ⇒ 可回读、可删除
          *   ⚠️ 楼中楼满 20 条 ⇒ **跳过，不换通道**
          */
-        const m = runNode('comment-api.mjs', ['--aweme', AWEME, '--text', text, '--reply', cid], 200_000)
+        const sendArgs = ['--aweme', AWEME, '--text', text, '--reply', cid]
+        if (a.root_comment_id) sendArgs.push('--root', String(a.root_comment_id))
+        if (a.work_url || workMatch) sendArgs.push('--url', String(a.work_url || AWEME_INPUT))
+        if (a.aweme_type !== undefined && a.aweme_type !== null && a.aweme_type !== '') sendArgs.push('--aweme-type', String(a.aweme_type))
+        const m = runNode('comment-api.mjs', sendArgs, 200_000)
         const mj = pickJson(m.stdout)
 
         // 🔴 403 = 限流。**别重试**，直接收工（越重试封越久）

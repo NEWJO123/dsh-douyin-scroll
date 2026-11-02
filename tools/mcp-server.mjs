@@ -36,6 +36,14 @@ import { createInterface } from 'node:readline'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
+const workProperties = {
+  work_url: { type: 'string', description: '可选：通知返回的 https Douyin /note/ID 或 /video/ID 作品链接，原样传入' },
+  aweme_type: { type: 'integer', description: '可选：通知返回的作品类型整数；未知时省略' },
+}
+const workFlags = (args = {}) => [
+  ...(args.work_url ? ['--url', String(args.work_url)] : []),
+  ...(args.aweme_type !== undefined && args.aweme_type !== null && args.aweme_type !== '' ? ['--aweme-type', String(args.aweme_type)] : []),
+]
 const SERVER_NAME = 'douyin-scroll'
 const SERVER_VERSION = (() => {
   try { return String(JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version || '0') } catch { return '0' }
@@ -429,6 +437,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         aweme_id: { type: 'string', description: '作品/图文 id' },
+        ...workProperties,
         text: { type: 'string', description: '评论正文（≤500 字）' },
         comment_id: { type: 'string', description: '要回复的评论 cid；留空 = 发顶层评论。可以是顶层评论，也可以是楼中楼里的某条' },
         root_comment_id: {
@@ -454,6 +463,7 @@ const TOOLS = [
       if (args?.confirm !== true) {
         return {
           ok: true, sent: false, needsConfirm: true, aweme_id: aweme,
+          work_url: args?.work_url || undefined, aweme_type: args?.aweme_type,
           comment_id: replyTo || '(顶层评论)',
           root_comment_id: rootCid || '(自动判)',
           draft: text, len: text.length,
@@ -464,7 +474,7 @@ const TOOLS = [
           note: '没发送 —— 先把草稿给使用者看',
         }
       }
-      const argv = ['--aweme', aweme, '--text', text]
+      const argv = ['--aweme', aweme, '--text', text, ...workFlags(args)]
       if (replyTo) argv.push('--reply', replyTo)
       if (rootCid) argv.push('--root', rootCid)
       const r = runNode('comment-api.mjs', argv, 260_000)
@@ -552,9 +562,12 @@ const TOOLS = [
         list: ats.slice(0, limit).map((a) => ({
           nickname: a.nickname || '', content: String(a.content || '').slice(0, 300),
           aweme_id: a.aweme_id || undefined, comment_id: a.comment_id || undefined,
+          root_comment_id: a.root_comment_id || undefined,
+          work_url: a.work_url || undefined, aweme_type: a.aweme_type,
+          comment_url: a.comment_url || undefined,
           video_url: a.video_url || undefined,
         })),
-        hint: ats.length ? '要回：douyin_comment_reply { aweme_id, comment_id, text }，先给用户看草稿' : '最近没有新的 @',
+        hint: ats.length ? '要回：douyin_comment_reply { aweme_id, comment_id, root_comment_id, work_url, aweme_type, text }；通知有的字段原样传，先给用户看草稿' : '最近没有新的 @',
       }
     },
   },
@@ -579,6 +592,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         aweme_id: { type: 'string', description: '作品/图文 id' },
+        ...workProperties,
         name: { type: 'string', description: '要 @ 的人的抖音昵称（必须和对方昵称完全一致）' },
         text: { type: 'string', description: '评论正文（≤500 字；不用自己写 @昵称，工具会自动加）' },
         confirm: { type: 'boolean', description: '🔴 必须由使用者当场同意后传 true，否则只回草稿' },
@@ -600,11 +614,12 @@ const TOOLS = [
       if (args?.confirm !== true && args?.dry !== true) {
         return {
           ok: true, sent: false, needsConfirm: true, aweme_id: aweme, mention: name,
+          work_url: args?.work_url || undefined, aweme_type: args?.aweme_type,
           draft: `@${name} ${text}`, len: text.length,
           note: '没发送 —— 先把草稿给使用者看；想先验证昵称能不能 @ 到，可传 dry:true（只点选不发布）',
         }
       }
-      const argv = ['--aweme', aweme, '--name', name, '--text', text]
+      const argv = ['--aweme', aweme, '--name', name, '--text', text, ...workFlags(args)]
       if (args?.dry === true) argv.push('--dry')
       const r = runNode('comment-mention-ui.mjs', argv, 300_000)
       const j = pickJson(r.stdout)

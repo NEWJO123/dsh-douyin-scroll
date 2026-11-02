@@ -1026,7 +1026,7 @@ try {
     bad('comment-api.mjs 又把 reply_id 和 reply_to_reply_id 填成同一个值 —— 回复会变成一条冒出来的顶层评论')
   } else ok('comment-api.mjs 没再把 reply_id / reply_to_reply_id 混成一个值')
   // ② 必须支持 --root
-  if (/--root/.test(cm) && /body\.reply_id = ROOT/.test(cm)) ok('comment-api.mjs 支持 --root（楼根单独传）')
+  if (/--root/.test(cm) && /publishComment\(c,\s*\{[^\n]*root: plan\.root/.test(cm)) ok('comment-api.mjs 支持 --root（楼根单独传给原生发布校验）')
   else bad('comment-api.mjs 没有 --root —— 回楼中楼时楼根没地方传')
   // ③ 判不出楼根必须拒绝，不许瞎猜
   if (/need_root/.test(cm) && /不瞎猜|拒绝/.test(cm)) ok('comment-api.mjs 判不出楼根时明确拒绝（不瞎猜）')

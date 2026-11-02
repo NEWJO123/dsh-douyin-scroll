@@ -18,7 +18,9 @@ tools/notice-read.py —— 读抖音互动通知（@ 我的 / 评论 / 点赞 /
 """
 import json
 import os
+import re
 import sys
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _home import home_str, utf8_stdio  # noqa: E402
@@ -60,10 +62,46 @@ GROUPS = [700, 960, 401, 601]
 RAW = "--raw" in sys.argv
 
 
+def work_metadata(blk, aw, aweme_id):
+    """保留作品类型和可靠链接；未知类型不当作视频。"""
+    meta = {}
+    for source in (aw, blk):
+        value = source.get("aweme_type")
+        if value is not None and str(value).isdigit():
+            meta["aweme_type"] = int(value)
+            break
+    route = None
+    for source in (blk, aw, aw.get("share_info") or {}):
+        for key in ("work_url", "web_url", "share_url", "schema_url"):
+            value = source.get(key)
+            if not isinstance(value, str):
+                continue
+            parsed = urlparse(value)
+            if parsed.scheme not in ("http", "https") or parsed.hostname not in ("www.douyin.com", "douyin.com"):
+                continue
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 2 and parts[0] in ("note", "video") and parts[1] == aweme_id:
+                route = parts[0]
+                break
+        if route:
+            break
+    if not route:
+        if meta.get("aweme_type") in (68, 150) or any(source.get("images") or source.get("image_post_info") for source in (aw, blk)):
+            route = "note"
+        elif "aweme_type" in meta:
+            route = "video"
+    if route:
+        meta["work_url"] = "https://www.douyin.com/%s/%s" % (route, aweme_id)
+        meta["web_url"] = meta["work_url"]
+        # 兼容旧消费者，字段名虽旧，链接仍指向真实作品路由。
+        meta["video_url"] = meta["work_url"]
+    return meta
+
+
 def norm(it):
     """把一条通知压成人类可读的形状"""
     t = it.get("type")
-    rec = {"type": t, "type_name": TYPE_NAME.get(t, "type_%s" % t), "nid": it.get("nid"), "create_time": it.get("create_time")}
+    rec = {"type": t, "type_name": TYPE_NAME.get(t, "type_%s" % t), "nid": str(it["nid"]) if it.get("nid") is not None else None, "create_time": it.get("create_time")}
     for key in ("at", "comment", "digg", "follow", "fans", "im", "system"):
         blk = it.get(key)
         if not isinstance(blk, dict):
@@ -81,10 +119,16 @@ def norm(it):
             if inner.get("text"):
                 rec["content"] = str(inner["text"]).strip()
         rec["nickname"] = ui.get("nickname") or ""
-        rec["uid"] = ui.get("uid") or ""
+        rec["uid"] = str(ui.get("uid") or "")
         rec["content"] = (rec.get("content") or (blk.get("content") or "").strip())
         sch = blk.get("schema_url") or ""
         rec["schema_url"] = sch
+        schema_query = parse_qs(urlparse(sch).query)
+        for field in ("aweme_id", "item_id"):
+            value = (schema_query.get(field) or [None])[0]
+            if value and str(value).isdigit():
+                rec.setdefault("aweme_id", str(value))
+                break
         # aweme://aweme/detail/<aweme_id>?cid=<comment_id>
         if "aweme/detail/" in sch:
             try:
@@ -95,10 +139,24 @@ def norm(it):
                 rec.setdefault("comment_id", sch.split("cid=")[1].split("&")[0])
         if blk.get("aweme_id"):
             rec.setdefault("aweme_id", str(blk["aweme_id"]))
-        aw = blk.get("aweme") if isinstance(blk.get("aweme"), dict) else None
+        aw = blk.get("aweme") if isinstance(blk.get("aweme"), dict) else {}
         if aw and aw.get("aweme_id"):
             rec.setdefault("aweme_id", str(aw["aweme_id"]))
             rec["aweme_desc"] = (aw.get("desc") or "")[:80]
+        # 某些通知直接给网页版作品 URL，而不是 aweme/detail 深链。
+        for source in (blk, aw):
+            for field in ("work_url", "web_url", "share_url", "schema_url"):
+                value = source.get(field)
+                if not isinstance(value, str):
+                    continue
+                parsed = urlparse(value)
+                match = re.fullmatch(r"/(?:note|video)/(\d+)/?", parsed.path)
+                if parsed.scheme in ("http", "https") and parsed.hostname in ("www.douyin.com", "douyin.com") and match:
+                    rec.setdefault("aweme_id", match.group(1))
+                    query = parse_qs(parsed.query)
+                    cid = (query.get("comment_id") or query.get("cid") or [None])[0]
+                    if cid:
+                        rec.setdefault("comment_id", str(cid))
 
         # ⭐⭐ 楼根（2026-10-23 加的，这是"我该用什么方式回"的关键）：
         #    · 通知里的 `parent_id` = 那条回复所在楼的**顶层评论 cid**（实测：
@@ -125,9 +183,9 @@ def norm(it):
                 rec["reply_to_comment_id"] = str(rep["cid"])
 
         if rec.get("aweme_id"):
-            rec["video_url"] = "https://www.douyin.com/video/%s" % rec["aweme_id"]
-            if rec.get("comment_id"):
-                rec["comment_url"] = "https://www.douyin.com/video/%s?comment_id=%s" % (rec["aweme_id"], rec["comment_id"])
+            rec.update(work_metadata(blk, aw, rec["aweme_id"]))
+            if rec.get("comment_id") and rec.get("work_url"):
+                rec["comment_url"] = "%s?comment_id=%s" % (rec["work_url"], rec["comment_id"])
         break
     if RAW:
         rec["raw"] = it

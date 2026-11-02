@@ -69,7 +69,7 @@ node "<插件目录>/tools/mcp-server.mjs"
 | `douyin_doctor` | 环境体检（9 项） | 装完 / 换设备 / 报错时 |
 | `douyin_whoami` | 登录还在不在、当前是哪个号 | 任何操作前不确定登录态 |
 | `douyin_forward` | 拉推荐流候选 + 打分 + 官方分享链接 | **主入口**：要推荐视频就调它 |
-| `douyin_comments` | 读一个视频的评论（含楼中楼） | 判断「这视频好不好玩」 |
+| `douyin_comments` | 读一个视频或图文的评论（含楼中楼） | 读取作品评论 |
 | `douyin_notices` | 谁 @ 了你 / **谁回复了你的评论** / 谁评论点赞关注（每条带 `comment_id` + `root_comment_id`） | 回消息前先看 |
 | `douyin_at_me` | ⭐ **谁在跟我说话** —— @ 我 + **回复了我的评论**（带"回过没有"+ 我在这条视频下说过什么 + 楼根） | 回评论前调它 |
 | `douyin_im_read` | 读私信会话（带 from: me/them） | 看对方最近说了什么 |
@@ -84,6 +84,15 @@ node "<插件目录>/tools/mcp-server.mjs"
 | `douyin_comment_mention` | 同上，等价于 `mode:"ui"` 的便捷入口（真 @、UI 点选）—— 2026-10-23 新增 |
 
 ### ⭐⭐ 该用哪个：**有评论可回就回复，没评论可回才 @**（2026-10-23 定稿）
+
+视频和图文共用回复工具。通知里的 `work_url`、`aweme_type`、`root_comment_id` 有值就原样传入；
+`work_url` 可以是 `/note/<ID>`，`aweme_type` 使用整数。只有 ID 也可以调用，执行器会等待作品页和签名器就绪，识别真实路由。
+图文路由不等于固定的类型数字：有些 `/note/` 详情会返回类型 `0`。
+普通回复由无头页面里的抖音原生前端构造发布请求，放行前校验作品、正文和回复楼层；
+HTTP 200 空正文或没有 `cid` 表示结果未确认，不能报告成功或自动重发。
+
+只读验收可运行 `node tools/work-page-check.mjs <作品URL> <评论片段>`；
+发布脚本 `comment-api.mjs --aweme <ID或URL> --reply <评论CID> --text <草稿> --dry` 只解析作品和楼根，不发送。
 
 唯一判据 = **有没有「对话对象」**（对方留下过一条具体评论、你拿得到它的 cid）：
 

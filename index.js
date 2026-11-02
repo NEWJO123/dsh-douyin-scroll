@@ -17,6 +17,16 @@
  */
 import { loadHostDeps } from './lib/hostdeps.mjs'
 
+// 作品路由由执行脚本验证；此处只透传调用者提供的元数据，不把未知类型补成视频。
+const workParameters = {
+  work_url: { type: 'string', description: '可选：通知返回的作品链接（https://www.douyin.com/note/ID 或 /video/ID），原样传入' },
+  aweme_type: { type: 'integer', description: '可选：通知返回的作品类型整数；未知时省略' },
+}
+const workFlags = (args = {}) => [
+  ...(args.work_url ? ['--url', String(args.work_url)] : []),
+  ...(args.aweme_type !== undefined && args.aweme_type !== null && args.aweme_type !== '' ? ['--aweme-type', String(args.aweme_type)] : []),
+]
+
 // ⭐ 这两样从**宿主那棵树**里取（拿不到就退到自己的依赖；再拿不到，defineTool 用本地等价实现）。
 //    起因见 lib/hostdeps.mjs：它们是 optional peer，桌面版 profile 永远不装 ⇒ 裸 import 会整条不激活。
 const hostDeps = await loadHostDeps()
@@ -1098,7 +1108,7 @@ export function apply(ctx, config) {
    *   pending   —— 刷不到，但很可能只是审核/延迟（如实报，不谎报成功也不谎报失败）
    *   unknown   —— 回读本身失败了（工具挂了），更不能当成"没发出去"
    */
-  const readbackAfter = async (dir, aweme, { text = '', cid = '' } = {}) => {
+  const readbackAfter = async (dir, aweme, { text = '', cid = '', ...work } = {}) => {
     const tries = 3
     for (let i = 0; i < tries; i++) {
       await new Promise((done) => setTimeout(done, 2000))
@@ -1111,7 +1121,7 @@ export function apply(ctx, config) {
         }
         // ② 没 cid（UI 路径）或 cid 没查到 ⇒ 按正文片段查 DOM（页面默认按最新渲染）
         if (text) {
-          const dr = await runNodeTool('comment-read-dom.mjs', ['--aweme', aweme, '--mine', '--scroll', '6'], { timeout: 200_000 })
+          const dr = await runNodeTool('comment-read-dom.mjs', ['--aweme', aweme, '--mine', '--scroll', '6', ...workFlags(work)], { timeout: 200_000 })
           const j = pickJson(dr.stdout)
           const needle = String(text).slice(0, 12)
           const items = Array.isArray(j?.items) ? j.items : []
@@ -1564,10 +1574,13 @@ export function apply(ctx, config) {
           aweme_id: x.aweme_id,
           comment_id: x.comment_id,
           root_comment_id: x.root_comment_id,
+          work_url: x.work_url,
+          aweme_type: x.aweme_type,
+          comment_url: x.comment_url,
           reply_to_text: x.reply_to_text || undefined,
           created_at: x.create_time,
         }))
-        j.reply_hint = '要回他们：douyin_comment_reply { aweme_id, comment_id, root_comment_id, text, mode:"api" } —— '
+        j.reply_hint = '要回他们：douyin_comment_reply { aweme_id, comment_id, root_comment_id, work_url, aweme_type, text, mode:"api" }，通知有的字段原样传 —— '
           + '用**直接回复**，不要用 @（对方会收到「回复了我的评论」通知）。'
       }
       if (j.n) log(`notices: ${j.n} 条（@ 我 ${j.at_n}，回复类 ${j.reply_n}）`)
@@ -1628,6 +1641,7 @@ export function apply(ctx, config) {
       + 'root_comment_id 就是可以直接传的楼根。',
     parameters: {
       aweme_id: { type: 'string', description: '作品/图文 id（douyin_notices 返回的 aweme_id）' },
+      ...workParameters,
       text: { type: 'string', description: '评论正文（≤500 字）。mode=ui 时**不要自己写 @昵称**，工具会自动加' },
       mode: {
         type: 'string',
@@ -1705,6 +1719,7 @@ export function apply(ctx, config) {
         return {
           ok: true, sent: false, needsConfirm: true, mode,
           aweme_id: aweme, comment_id: replyTo || '(顶层评论)',
+          work_url: args.work_url || undefined, aweme_type: args.aweme_type,
           root_comment_id: rootCid || '(自动判)',
           mention: mentionName || undefined,
           draft: mode === 'ui' ? `@${mentionName} ${text}` : text, len: text.length,
@@ -1743,7 +1758,7 @@ export function apply(ctx, config) {
         if (mentionUid && selfUidCache && String(mentionUid) === selfUidCache) {
           return { ok: false, error: `mention_uid=${mentionUid} 是登录号自己的 uid —— 这是 @ 自己` }
         }
-        const mArgs = ['--aweme', aweme, '--name', mentionName, '--text', text]
+        const mArgs = ['--aweme', aweme, '--name', mentionName, '--text', text, ...workFlags(args)]
         const mr = await runNodeTool('comment-mention-ui.mjs', mArgs, { timeout: 300_000 })
         const mres = pickJson(mr.stdout)
         if (!mres) {
@@ -1757,7 +1772,7 @@ export function apply(ctx, config) {
             if (replyTo) markSeen(stateDir, aweme, [replyTo])
           } catch { /* 记不上不影响发 */ }
         }
-        const readback = await readbackAfter(stateDir, aweme, { text, cid: '' })
+        const readback = await readbackAfter(stateDir, aweme, { text, cid: '', work_url: mres.work_url || args.work_url, aweme_type: mres.aweme_type ?? args.aweme_type })
         return {
           ...mres, mode, mention_verified: Boolean(mres.ok), readback,
           note: mres.ok
@@ -1767,7 +1782,7 @@ export function apply(ctx, config) {
       }
 
       /* ── ③ mode=api：回复楼层 / 普通评论（快，@ 是文字） ── */
-      const argv = ['--aweme', aweme, '--text', text]
+      const argv = ['--aweme', aweme, '--text', text, ...workFlags(args)]
       if (replyTo) argv.push('--reply', replyTo)
       if (rootCid) argv.push('--root', rootCid)
       const r = await runNodeTool('comment-api.mjs', argv, { timeout: 260_000 })
@@ -1815,7 +1830,7 @@ export function apply(ctx, config) {
        *      placement.verified === false ⇒ 读不到（热度排序够不着）—— **不等于失败**
        */
       const placedRight = res.placement || undefined
-      const readback = res.ok ? await readbackAfter(stateDir, aweme, { text, cid: String(res.cid || '') }) : null
+      const readback = res.ok ? await readbackAfter(stateDir, aweme, { text, cid: String(res.cid || ''), work_url: res.work_url || args.work_url, aweme_type: res.aweme_type ?? args.aweme_type }) : null
       if (res.ok) {
         const pl = placedRight
         const plTag = !pl ? '?' : (pl.ok === true ? 'level=2 进楼' : (pl.ok === false ? '⚠️ 变成顶层了' : '未核实'))
@@ -1873,7 +1888,10 @@ export function apply(ctx, config) {
         root_comment_id: a.root_comment_id || undefined,
         /** 对方是在回我哪一句（type=31 才有） */
         replying_to: a.reply_to_text || undefined,
-        video_url: a.video_url || (aweme ? `https://www.douyin.com/video/${aweme}` : undefined),
+        work_url: a.work_url || undefined,
+        aweme_type: a.aweme_type,
+        video_url: a.video_url || a.work_url || undefined,
+        comment_url: a.comment_url || undefined,
         created_at: a.create_time || undefined,
         before: alreadyReplied ? '回过' : '没回过',
         /** ⭐ 我在这条视频下说过什么（有记忆才知道该不该重复） */
@@ -1911,7 +1929,7 @@ export function apply(ctx, config) {
        * 工具会自动判楼根；判不出来会拒绝发送，让你显式传 root_comment_id。
        */
       hint: out.length
-        ? '要回的话：douyin_comment_reply { aweme_id, comment_id, root_comment_id, text, mode:"api" }，先给用户看草稿。'
+        ? '要回的话：douyin_comment_reply { aweme_id, comment_id, root_comment_id, work_url, aweme_type, text, mode:"api" }，通知有的字段原样传，先给用户看草稿。'
           + '⭐ 一律 mode:"api"（直接回复）—— 对方收到「回复了我的评论」通知，比 @ 通知更强、1 秒发出、拿得到 cid。'
           + '**不要用 @ 去"回复"人**。'
           + '⭐ 如果返回里对了 root_comment_id，**原样传进去**（那是楼根，别自己猜）；'

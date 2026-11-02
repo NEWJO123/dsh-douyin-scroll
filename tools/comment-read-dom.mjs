@@ -21,6 +21,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { openPage, sleep } from '../lib/chrome.mjs'
+import { prepareWorkPage, openCommentsPanel } from '../lib/douyin-work.mjs'
 
 /**
   * ⭐ "我"的抖音昵称 —— **不能写死**（写死的话，别人装了永远匹配不上自己的号）。
@@ -43,6 +44,8 @@ const out = (o) => { console.log(JSON.stringify(o, null, 1)); process.exitCode =
 const argv = process.argv.slice(2)
 const argOf = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? (argv[i + 1] ?? '') : d }
 const AWEME = String(argOf('--aweme', '')).trim()
+const WORK_URL = String(argOf('--url', '')).trim()
+const AWEME_TYPE = String(argOf('--aweme-type', '')).trim()
 const MINE = argv.includes('--mine')
 const GREP = String(argOf('--grep', '')).trim()
 const SCROLLS = Math.max(0, Math.min(Number(argOf('--scroll', '3')) || 0, 20))
@@ -51,26 +54,23 @@ const LIMIT = Math.max(1, Math.min(Number(argOf('--limit', '40')) || 40, 200))
 if (!AWEME) { out({ ok: false, error: '缺 --aweme' }); process.exit(1) }
 
 async function main() {
-  const c = await openPage()
+  const c = await openPage({ isolated: true })
   const chromed = c.status
   const { send, ev } = c
 
   try {
-    await send('Page.navigate', { url: `https://www.douyin.com/video/${AWEME}` })
-    await sleep(6500)
-
-    // 点开评论面板（右侧栏那个「评论」）
-    await ev(`(function(){
-      var c=document.querySelector('[data-e2e="feed-comment-icon"]')||document.querySelector('[data-e2e="comment-icon"]');
-      if(!c){var all=[].slice.call(document.querySelectorAll('span,div')).filter(function(e){return (e.innerText||'').trim()==='评论'});c=all[0]}
-      if(c) c.click();
-      return !!c;
-    })()`)
-    await sleep(3500)
+    const work = await prepareWorkPage(c, { aweme: AWEME, work_url: WORK_URL, aweme_type: AWEME_TYPE })
+    await openCommentsPanel(c)
 
     // 往下滚，让更多评论渲染出来
     for (let i = 0; i < SCROLLS; i++) {
-      await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: 900, y: 700, deltaX: 0, deltaY: 800 })
+      const point = await ev(`(() => {
+        const list=[...document.querySelectorAll('[data-e2e="comment-list"], [class*="commentList"], [class*="comment-list"]')].find(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0});
+        if(!list)return null;
+        const r=list.getBoundingClientRect();return {x:Math.min(innerWidth-2,Math.max(1,r.x+r.width/2)),y:Math.min(innerHeight-100,Math.max(100,r.y+100))};
+      })()`)
+      if (!point) throw new Error('找不到可见评论列表，未滚动视频区域')
+      await send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...point, deltaX: 0, deltaY: 800 })
       await sleep(900)
     }
     await sleep(800)
@@ -79,35 +79,37 @@ async function main() {
      * 从 DOM 里抓评论条目。
      * 结构：每条评论是一个 [data-e2e="comment-item"]（旧版）或者
      * 「头像 + 昵称 + 正文 + 时间·地区 + 点赞/分享/回复」这一坨。
-     * 这里两种都试：先按 data-e2e 找，找不到就按昵称节点的父级兜。
+     * 只在评论列表内兜底，避免把页脚和侧栏误认成评论。
      */
     const raw = await ev(`(function(){
       var items=[];
-      var nodes=Array.prototype.slice.call(document.querySelectorAll('[data-e2e="comment-item"]'));
+      var visible=function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0};
+      var nodes=Array.prototype.slice.call(document.querySelectorAll('[data-e2e="comment-item"]')).filter(visible);
       if(!nodes.length){
-        // 兜底：找所有可能是"昵称"的短文本节点，往上找 3 层当一条评论
-        var cands=[].slice.call(document.querySelectorAll('div')).filter(function(e){
-          var t=(e.innerText||'').trim();
-          return t && t.indexOf('\\n')>0 && t.length>8 && t.length<600;
+        var list=[].slice.call(document.querySelectorAll('[data-e2e="comment-list"], [class*="commentList"], [class*="comment-list"]')).find(visible);
+        if(list) nodes=[].slice.call(list.children).filter(function(e){
+          return visible(e) && [].some.call(e.querySelectorAll('a[href*="/user/"]'),visible) && /回复/.test(e.innerText||'');
         });
-        nodes = cands.slice(0,400);
       }
       nodes.forEach(function(n){
         var t=(n.innerText||'').replace(/\\r/g,'');
-        if(!t || t.length<6) return;
+        if(!t) return;
         var lines=t.split('\\n').map(function(s){return s.trim()}).filter(Boolean);
         if(!lines.length) return;
-        var nick=lines[0];
-        if(nick.length>24) return;
+        var nickNode=[].slice.call(n.querySelectorAll('[data-e2e="comment-user-name"], a[href*="/user/"]')).find(visible);
+        var nick=((nickNode && nickNode.innerText)||lines[0]||'').trim();
+        if(!nick || nick.length>60) return;
+        var bodyNode=[].slice.call(n.querySelectorAll('[data-e2e="comment-content"], [data-e2e="comment-level-1"]')).find(visible);
         // 正文 = 昵称后面、时间行前面那段
         var body=[];
-        for(var i=1;i<lines.length;i++){
+        var start=lines.indexOf(nick)+1;
+        for(var i=Math.max(1,start);i<lines.length;i++){
           if(/^(\\d+[秒分时天周月年]前|刚刚|昨天|前天)/.test(lines[i])) break;
-          if(/^\\d+$/.test(lines[i])) break;
           if(lines[i]==='分享'||lines[i]==='回复') break;
           body.push(lines[i]);
         }
-        if(!body.length) return;
+        if(bodyNode) body=[(bodyNode.innerText||bodyNode.textContent||'').trim()];
+        if(!body.join('').trim()) return;
         items.push({ nick: nick, text: body.join(' ').slice(0,300) });
       });
       // 去重（同昵称+同正文）
@@ -129,7 +131,9 @@ async function main() {
 
     return out({
       ok: true,
-      aweme_id: AWEME,
+      aweme_id: work.aweme_id,
+      work_url: work.work_url,
+      aweme_type: work.aweme_type,
       chrome: chromed,
       me_nick: ME || '(不知道 —— 先扫码登录，或设 DOUYIN_ME_NICK)',
       total_scraped: items.length,
@@ -141,8 +145,7 @@ async function main() {
       items: sel.slice(0, LIMIT),
     })
   } finally {
-    c.close()
-    await sleep(200)
+    await c.close()
   }
 }
 

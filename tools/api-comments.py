@@ -63,12 +63,32 @@ def sign(rel):
 CDP_FETCH = os.path.join(PLUGIN, "tools", "cdp-fetch.mjs")
 
 
+def validate_comment_page(data):
+    """错误响应不能当作空评论；status=0 的合法空页仍然可用。"""
+    if not isinstance(data, dict):
+        raise ValueError("评论响应不是 JSON 对象")
+    if data.get("status_code") not in (0, "0"):
+        raise ValueError("评论 API status_code=%s" % data.get("status_code"))
+    if "comments" not in data:
+        raise ValueError("评论响应缺少 comments")
+    comments = data["comments"]
+    if comments is None:
+        if data.get("total") not in (None, 0, "0") or data.get("has_more"):
+            raise ValueError("评论响应 comments=null 但不是空页")
+    elif not isinstance(comments, list) or any(not isinstance(c, dict) for c in comments):
+        raise ValueError("评论响应 comments 不是评论列表")
+    return data
+
+
 def page_fetch(rel):
     """拉一页评论：签名路优先，签名不可用自动退「无头页面里 fetch」兜底（Issue #2 思路）。
     返回 (json, mode)；两条路都死就抛 RuntimeError。"""
-    s = sign(rel)
-    # 兼容「node 没输出任何 JSON」的情况：err 可能是空串，得连 signedUrl 一起判（Issue #2）
-    if not s.get("err") and s.get("signedUrl"):
+    signed_error = "签名无输出"
+    try:
+        s = sign(rel)
+        # 兼容「node 没输出任何 JSON」的情况：err 可能是空串。
+        if not isinstance(s, dict) or s.get("err") or not s.get("signedUrl"):
+            raise ValueError("签名未返回可用地址")
         u = s["signedUrl"]
         if not u.startswith("http"):
             u = "https://www.douyin.com" + u
@@ -84,17 +104,24 @@ def page_fetch(rel):
             r = httpx.get(u, headers=h, timeout=30, follow_redirects=True)
         finally:
             os.environ.update(proxy_env)
-        return r.json(), "signed"
+        if not 200 <= r.status_code < 300:
+            raise ValueError("签名请求 HTTP %s" % r.status_code)
+        return validate_comment_page(r.json()), "signed"
+    except Exception as e:
+        # 签名成功也可能被风控返回空体/status=5，仍需尝试现有只读兜底。
+        signed_error = str(e)[:160] if isinstance(e, ValueError) else type(e).__name__
     # 兜底：页面上下文里 fetch（页面自己的签名 SDK 是活的，不用 a_bogus）
-    sys.stderr.write("[api-comments] 签名不可用（%s）→ 走无头浏览器兜底\n" % (s.get("err") or "无输出"))
-    p = subprocess.run([NODE, CDP_FETCH, "--path", rel], capture_output=True, cwd=PLUGIN,
-                       timeout=180, env=dict(os.environ, DOUYIN_HOME=HOME))
-    body = p.stdout.decode("utf-8", "replace")
+    sys.stderr.write("[api-comments] 签名读取失败（%s）→ 走无头浏览器兜底\n" % signed_error)
     try:
-        return json.loads(body), "cdp"
-    except Exception:
-        tail = (body or p.stderr.decode("utf-8", "replace"))[:150].replace("\n", " ")
-        raise RuntimeError("签名和兜底都不通：" + (tail or "无输出"))
+        p = subprocess.run([NODE, CDP_FETCH, "--path", rel], capture_output=True, cwd=PLUGIN,
+                           timeout=180, env=dict(os.environ, DOUYIN_HOME=HOME))
+        if p.returncode != 0:
+            raise ValueError("CDP 读取进程 exit=%s（HTTP/页面请求失败）" % p.returncode)
+        body = p.stdout.decode("utf-8", "replace")
+        return validate_comment_page(json.loads(body)), "cdp"
+    except Exception as e:
+        reason = str(e)[:160] if isinstance(e, ValueError) else type(e).__name__
+        raise RuntimeError("评论读取失败：签名=%s；兜底=%s" % (signed_error, reason)) from None
 
 
 def main():

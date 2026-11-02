@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 /**
- * tools/comment-api.mjs —— 在抖音评论区发评论/回复某条评论（**一条 fetch，不点 UI**）
+ * tools/comment-api.mjs —— 视频/图文评论回复：原生前端构造请求，校验目标后放行一次。
  * ============================================================================
- * 为什么是"页面里 fetch"这一条路（三种都实测过）：
- *   ① 点评论区 UI      → 能发，但抖音会弹**短信验证**（要使用者给码）
- *   ② Python 自己签名 POST → **HTTP 403**（写接口要强签名 getBdTicketGuardHeader，外部补不齐）
- *   ③ ⭐ 在无头页面的上下文里 fetch → **HTTP 200，不弹验证**（页面自己把签名补齐）
+ * 写接口的 ticket-guard 等凭据由抖音自己的前端生成；仅在页面里 fetch/XHR 不够。
+ * 找到回复目标后检查真实请求中的作品/正文/楼根/回复 ID，一致才发送；响应必须有 cid。
+ * 若站点要求短信/滑块，报告未确认并停止，不绕过验证，不自动重发。
  *
  * ── 🔴 2026-10-23 修的 bug：reply_id 和 reply_to_reply_id 不是一回事 ──────────
  *   旧代码：
@@ -33,11 +32,14 @@
  */
 import { readFileSync } from 'node:fs'
 import { openPage, sleep } from '../lib/chrome.mjs'
+import { parseWork, prepareWorkPage, pageRequestSource, publishReceipt } from '../lib/douyin-work.mjs'
+import { publishComment } from '../lib/comment-publish-ui.mjs'
 
 const argv = process.argv.slice(2)
 const argOf = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? (argv[i + 1] ?? d) : d }
 const DRY = argv.includes('--dry')
-const AWEME = String(argOf('--aweme', '')).trim()
+const WORK = parseWork(argOf('--aweme', ''), argOf('--url', ''), argOf('--aweme-type', ''))
+const AWEME = WORK.aweme_id
 const REPLY = String(argOf('--reply', '')).trim()
 const ROOT = String(argOf('--root', '')).trim()
 const FILE = String(argOf('--file', '')).trim()
@@ -75,16 +77,12 @@ if (wantsMention) {
   process.exit(1)
 }
 
+let c
 try {
-  const c = await openPage()
+  c = await openPage({ isolated: true })
+  await c.send('Network.enable')
   const chromed = c.status
-
-  // 必须站在 douyin.com 上，相对路径 fetch 才带得上 cookie / 页面签名器
-  const cur = String(await c.ev('location.href'))
-  if (!cur.includes('douyin.com')) {
-    await c.send('Page.navigate', { url: 'https://www.douyin.com/' })
-    await sleep(6000)
-  }
+  const work = await prepareWorkPage(c, { aweme: AWEME, work_url: WORK.route ? WORK.work_url : '', aweme_type: WORK.aweme_type, comment_id:REPLY })
 
   /**
    * ⭐ 解析「楼根」和「具体回哪条」。
@@ -92,6 +90,7 @@ try {
    *   判不出来就返回 need_root，**不猜**。
    */
   const resolveJs = `(async function(){
+    var request = ${pageRequestSource};
     var AWEME = ${JSON.stringify(AWEME)};
     var TARGET = ${JSON.stringify(REPLY)};
     var ROOTIN = ${JSON.stringify(ROOT)};
@@ -106,8 +105,8 @@ try {
     };
     function qs(d){ return Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&'); }
     async function get(rel){
-      var r = await fetch(rel, { credentials:'include', headers:{ accept:'application/json' } });
-      var t = await r.text();
+      var r = await request('GET', rel);
+      var t = r.body;
       try { return JSON.parse(t) } catch(e) { return null }
     }
     // 不给 --reply = 发顶层评论，不需要判楼
@@ -165,7 +164,7 @@ try {
   try { plan = JSON.parse(await c.ev(resolveJs)) } catch { plan = { ok: false, hint: '楼根解析没返回可解析结果' } }
 
   if (!plan.ok) {
-    c.close()
+    await c.close(); c = null
     await sleep(200)
     out({
       ok: false,
@@ -179,19 +178,22 @@ try {
   }
 
   if (DRY) {
-    c.close()
+    await c.close(); c = null
     await sleep(200)
     out({
       ok: true, dry: true, aweme_id: AWEME,
-      reply_to: plan.reply_to || '(顶层评论)',
+      reply_to: REPLY || '(顶层评论)',
       root: plan.root || '(无 — 发顶层)',
       resolved_by: plan.how,
+      work_url: work.work_url, aweme_type: work.aweme_type, transport: 'page-frontend',
       len: TEXT.length, chrome: chromed,
     })
     process.exit(0)
   }
 
+  const published = await publishComment(c, { aweme_id: AWEME, root: plan.root || '', reply_to: plan.reply_to || '', text: TEXT })
   const js = `(async function(){
+    var request = ${pageRequestSource};
     var AWEME = ${JSON.stringify(AWEME)};
     var ROOT = ${JSON.stringify(plan.root || '')};
     var REPLYTO = ${JSON.stringify(plan.reply_to || '')};
@@ -206,42 +208,7 @@ try {
       os_name:'Windows', os_version:'10', platform:'PC'
     };
     function qs(d){ return Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&'); }
-    var url = '/aweme/v1/web/comment/publish/?' + qs(Object.assign({}, COMMON, { app_name:'aweme' }));
-    var body = Object.assign({}, COMMON, {
-      aweme_id: AWEME, text: TEXT, text_extra: '[]',
-      aweme_type: '0', channel_id: '0', city: '', sticker_id: '', is_fold: '0'
-    });
-    // ⭐ 只有回复场景才带这两个字段；而且**分工不同**
-    //    reply_id       = 楼根（level1 的 cid）—— 决定落进哪栋楼
-    //    reply_to_reply_id = 具体回哪条（楼中楼才需要）—— 决定"回复 @谁"、通知谁
-    if (ROOT) {
-      body.reply_id = ROOT;
-      if (REPLYTO) body.reply_to_reply_id = REPLYTO;
-    }
-    var o = { http: 0, cid: '', status_code: null, head: '' };
-    try {
-      var r = await fetch(url, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': 'https://www.douyin.com/' },
-        body: new URLSearchParams(body).toString()
-      });
-      var txt = await r.text();
-      o.http = r.status;
-      o.head = txt.slice(0, 240);
-      // ⚠️ 必须在页面里就解析：整包可能好几 KB，截断后 Node 那边 JSON.parse 会失败（踩过）
-      try {
-        var j = JSON.parse(txt);
-        o.status_code = (j.status_code === undefined ? null : j.status_code);
-        o.cid = (j.comment && j.comment.cid) ? String(j.comment.cid) : '';
-        // 服务端有时会给这条自己认的位置……**有时不给**（2026-10-23 实测：
-        // 同一台机器、同一个视频，前 5 条返回了 level，后 7 条 level 全是 undefined）
-        // ⇒ 不能只靠这里，下面还会重读一次楼来核实。
-        o.rt = j.comment ? String(j.comment.reply_id || '') : '';
-        o.rtt = j.comment ? String(j.comment.reply_to_reply_id || '') : '';
-        o.lv = (j.comment && j.comment.level !== undefined && j.comment.level !== null) ? j.comment.level : null;
-        o.has_lv = Boolean(j.comment && j.comment.level !== undefined && j.comment.level !== null);
-      } catch (e2) { o.parse_error = String(e2 && e2.message || e2); }
-    } catch (e) { o.error = String((e && e.message) || e); }
+    var o = ${JSON.stringify(published)};
 
     /**
      * ⭐⭐ 发完**重读那一楼**核实落位（2026-10-23 加的，这是唯一可靠的判据）。
@@ -252,9 +219,9 @@ try {
     if (o.cid && ROOT) {
       for (var attempt = 1; attempt <= 3; attempt++) {
         await new Promise(function(z){ setTimeout(z, attempt === 1 ? 1200 : 1800) });
-        var rj = await fetch('/aweme/v1/web/comment/list/reply/?' + qs(Object.assign({}, COMMON, {
+        var rj = await request('GET', '/aweme/v1/web/comment/list/reply/?' + qs(Object.assign({}, COMMON, {
           item_id: AWEME, comment_id: ROOT, cursor: '0', count: '20', item_type: '0'
-        })), { credentials: 'include', headers: { accept: 'application/json' } }).then(function(x){ return x.text() }).catch(function(){ return '' });
+        }))).then(function(x){ return x.body }).catch(function(){ return '' });
         var rjj = null; try { rjj = JSON.parse(rj) } catch(e) {}
         if (rjj && rjj.comments) {
           for (var i2 = 0; i2 < rjj.comments.length; i2++) {
@@ -271,9 +238,9 @@ try {
       }
       if (!o.verified) {
         // 楼里没有 ⇒ 去看看它是不是跑到顶层列表去了
-        var tl = await fetch('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
+        var tl = await request('GET', '/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
           aweme_id: AWEME, count: '20', cursor: '0', item_type: '0'
-        })), { credentials: 'include', headers: { accept: 'application/json' } }).then(function(x){ return x.text() }).catch(function(){ return '' });
+        }))).then(function(x){ return x.body }).catch(function(){ return '' });
         var tjj = null; try { tjj = JSON.parse(tl) } catch(e) {}
         if (tjj && tjj.comments) {
           for (var k2 = 0; k2 < tjj.comments.length; k2++) {
@@ -286,14 +253,15 @@ try {
   })()`
 
   const raw = await c.ev(js)
-  c.close()
+  await c.close(); c = null
   await sleep(200)   // 等 WebSocket 真正关掉再退出，否则 libuv 会断言
 
   let res
   try { res = JSON.parse(raw) } catch { out({ ok: false, error: '页面没返回可解析结果', raw: String(raw).slice(0, 400), chrome: chromed }); process.exit(1) }
 
   const cid = String(res.cid || '')
-  const ok = res.http === 200 && !!cid
+  const receipt = publishReceipt({ status: res.http, body: JSON.stringify({ status_code: res.status_code, comment: { cid } }) })
+  const ok = receipt.ok
 
   /**
    * ⭐⭐ 落位判据（2026-10-23 定稿）：
@@ -302,7 +270,7 @@ try {
    *   ③ 两边都读不到 ⇒ unknown（评论列表按热度排，0 赞的可能够不着）**不许当成失败**
    */
   let placement = null
-  if (plan.root) {
+  if (plan.root && cid) {
     if (res.verified) {
       const lv = Number(res.verified_level)
       placement = {
@@ -332,7 +300,7 @@ try {
     ok,
     http: res.http,
     cid: cid || undefined,
-    reply_to: plan.reply_to || '(顶层评论)',
+    reply_to: REPLY || '(顶层评论)',
     root: plan.root || undefined,
     resolved_by: plan.how,
     /** ⭐ publish 响应里的位置（有时是 null —— 别只靠它） */
@@ -342,12 +310,17 @@ try {
     /** ⭐⭐ 真正的核实结果（重读楼拿到的） */
     placement,
     aweme_id: AWEME,
+    work_url: work.work_url, aweme_type: work.aweme_type, transport: 'page-frontend',
     len: TEXT.length,
     chrome: chromed,
     status_code: res.status_code === null ? undefined : res.status_code,
-    error: ok ? undefined : (res.error || `没拿到 cid（status_code=${res.status_code}）`),
+    attempted: Boolean(res.attempted),
+    outcome_unknown: ok ? undefined : Boolean(res.attempted && receipt.outcome_unknown),
+    error: ok ? undefined : (res.error || receipt.error),
     head: ok ? undefined : String(res.head || '').slice(0, 300),
   })
 } catch (e) {
   out({ ok: false, error: String(e?.message ?? e) })
+} finally {
+  if (c) { await c.close(); await sleep(200) }
 }
