@@ -330,8 +330,17 @@ export function apply(ctx, config) {
       atLineStart = String(s).endsWith('\n')
     } catch { /* 日志写不进去也不致命 */ }
   }
+  /** 日志时间戳用本地时区（Issue #14：UTC 的 Z 与 Toast 的本地日期跨日对不上，排查容易看岔） */
+  const localStamp = () => {
+    const d = new Date()
+    const off = -d.getTimezoneOffset()
+    const sign = off >= 0 ? '+' : '-'
+    const abs = Math.abs(off)
+    const pad = (n, w = 2) => String(n).padStart(w, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+  }
   const log = (msg) => {
-    rawWrite((atLineStart ? '' : '\n') + `${new Date().toISOString()}  ${msg}\n`)
+    rawWrite((atLineStart ? '' : '\n') + `${localStamp()}  ${msg}\n`)
     try { ctx.logger?.info?.(`[douyin-duty] ${msg}`) } catch { /* 没有 logger 就算了 */ }
   }
 
