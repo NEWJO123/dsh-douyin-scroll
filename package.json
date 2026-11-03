@@ -44,6 +44,7 @@
     "CHANGELOG.md",
     "AGENTS.md",
     "PUBLISH.md",
+    "RELEASE-*.md",
     "selfcheck.mjs",
     "check-client.mjs",
     "LICENSE"
