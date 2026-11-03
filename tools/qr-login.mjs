@@ -25,7 +25,7 @@
  * ============================================================================
  */
 import { spawn, execFileSync } from 'node:child_process'
-import { writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homeDir } from '../lib/paths.mjs'
 import { findBrowser } from '../lib/chrome.mjs'
@@ -61,41 +61,97 @@ async function findFreePort() {
   throw new Error('9374–9413 全被占用了，找不到登录用的调试端口（可以用 QR_CDP_PORT 指定一个）')
 }
 
-/** 有没有别的浏览器进程正在用我们这个 profile？
- *  🔴 Issue #11：不认 exe 名（写死 chrome.exe 在只装 Edge 的机器上「看不见」占着 profile 的
- *  msedge ⇒ 扫码登录必失败），改按命令行里的 profile 路径认；排除探测用的 powershell 自身
- *  （它的 -Command 里就带着 profile 字面量）和 --type= 的子进程。 */
-function profileInUse() {
+/**
+ * ⭐ 跨平台枚举「命令行里带着我们 profile 路径」的**主进程**（排除 --type= 子进程）。
+ *    返回 `[{ pid, command }]`。
+ * 🔴 Issue #15（macOS / Linux）：原来只有 Windows 一条路（powershell.exe），
+ *    mac/Linux 上 `execFileSync('powershell.exe')` 必抛 ⇒ 恒返回 []，
+ *    明明登录窗口开着却判成「没开」：start 另挑端口起第二个 Chrome
+ *    （同 profile 被拒、秒退），在错误端口上等满 30 秒超时，
+ *    再报一句「浏览器还没开」—— 用户明明扫上了码。
+ *    Windows 保持原探测不变（Issue #11 的语义：按 profile 路径认，不认 exe 名）。
+ */
+function profileCommandLines() {
+  if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+        `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
+        `Get-CimInstance Win32_Process | ` +
+        `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${PROFILE_PS}) -and $_.CommandLine -notmatch ' --type=' } | ` +
+        `Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`],
+        { encoding: 'utf8', timeout: 20000 }).trim()
+      const parsed = out ? JSON.parse(out) : []
+      return (Array.isArray(parsed) ? parsed : [parsed])
+        .filter((p) => p && p.CommandLine)
+        .map((p) => ({ pid: Number(p.ProcessId), command: String(p.CommandLine) }))
+    } catch { return [] }
+  }
+  // macOS / Linux：ps 的 command 列就是完整 argv，profile 路径按字面匹配
   try {
-    const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
-      `Get-CimInstance Win32_Process | ` +
-      `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${PROFILE_PS}) -and $_.CommandLine -notmatch ' --type=' } | ` +
-      `Select-Object -ExpandProperty ProcessId`],
-      { encoding: 'utf8', timeout: 15000 })
-    return String(out || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+    const out = execFileSync('ps', ['-axo', 'pid=,command='],
+      { encoding: 'utf8', timeout: 15000, maxBuffer: 16 * 1024 * 1024 })
+    return String(out || '').split(/\r?\n/).map((line) => {
+      const m = /^\s*(\d+)\s+(.+)$/.exec(line)
+      return m ? { pid: Number(m[1]), command: m[2] } : null
+    }).filter((p) => p
+      && p.pid !== process.pid
+      && p.command.includes('--user-data-dir')
+      && p.command.includes(PROFILE)
+      && !p.command.includes(' --type='))
   } catch { return [] }
 }
 
-/** 关掉占着 profile 的浏览器（只在用户明确要求时用；同 Issue #11，按 profile 路径认进程） */
+/** 有没有别的浏览器进程正在用我们这个 profile？（返回 pid 列表）
+ *  🔴 Issue #11：不认 exe 名，按命令行里的 profile 路径认 —— 现在跨平台（见 profileCommandLines）。 */
+function profileInUse() {
+  return profileCommandLines().map((p) => p.pid)
+}
+
+/** 登录浏览器（有头）真正在听的 CDP 端口：从活进程的命令行里读
+ *  `--remote-debugging-port`，并各验一次 `/json/version`。
+ *  只认 ≥9374 —— 避开无头值班浏览器那段（9334–9373）。
+ *  🔴 Issue #15：`check` / `watch` / `shot` 靠它才找得到「跨了 DSH 重启还活着」的登录窗口。 */
+async function liveQrPorts() {
+  const ports = []
+  for (const { command } of profileCommandLines()) {
+    const m = /--remote-debugging-port=(\d+)/.exec(command)
+    if (!m) continue
+    const p = Number(m[1])
+    if (p >= 9374 && !ports.includes(p)) ports.push(p)
+  }
+  const alive = []
+  for (const p of ports) {
+    try { if ((await fetch(`http://127.0.0.1:${p}/json/version`)).ok) alive.push(p) } catch { /* 没在听 */ }
+  }
+  return alive
+}
+
+/** 关掉占着 profile 的浏览器（只在用户明确要求时用；同 Issue #11，按 profile 路径认进程）。
+ *  先 SIGTERM 让 Chrome 自己收尾（不丢没落盘的 Cookie），不 -9。 */
 function closeProfileChrome() {
-  try {
-    execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
-      `Get-CimInstance Win32_Process | ` +
-      `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${PROFILE_PS}) -and $_.CommandLine -notmatch ' --type=' } | ` +
-      `ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
-      { encoding: 'utf8', timeout: 20000 })
-    return true
-  } catch { return false }
+  const pids = profileInUse()
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM') } catch { /* 已经退了 */ }
+  }
+  return pids.length > 0
 }
 
 /**
  * 把登录窗口顶到最前面。
  * ⭐ 用户可能正开着别的窗口（甚至全屏），不置顶的话他不知道去哪儿扫码。
  *    返回 'front <pid>' 或 'no-window'（不抛）。
+ *    Windows 走 PowerShell；macOS 用 osascript 激活浏览器 App（App 名从安装路径反推，
+ *    Chrome / Edge / Chromium 都认）；Linux 没有统一置顶办法，安静跳过。
  */
 function frontWindow() {
+  if (process.platform === 'darwin') {
+    try {
+      const app = /\/([^/]+)\.app\//.exec(CHROME || '')?.[1] || 'Google Chrome'
+      execFileSync('osascript', ['-e', `tell application "${app}" to activate`], { timeout: 10000 })
+      return 'front (osascript)'
+    } catch { return 'no-window' }
+  }
+  if (process.platform !== 'win32') return 'no-window'
   try {
     return String(execFileSync('powershell.exe', ['-NoProfile', '-Command',
       `$p = Get-Process chrome,msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; ` +
@@ -118,7 +174,7 @@ async function cdpTargets(waitMs = 30000) {
   //    🔴 Issue #11：超时要把「进程起没起来 / 是不是秒退」带上 —— 别让真因藏在一句「浏览器还没开」里
   const living = profileInUse()
   const where = living.length
-    ? `登录浏览器在跑（pid ${living.join(', ')}），但调试端口连不上 —— 可能刚才秒退留了残进程，或端口被别的程序占了。`
+    ? `登录浏览器在跑（pid ${living.join(', ')}），但调试端口${PORT ? `（试的是 ${PORT}）` : ''}连不上 —— 可能刚才秒退留了残进程，或端口被别的程序占了。`
     : '登录用的浏览器还没开（没有进程占着插件 profile）。'
   throw new Error(
     where + '\n'
@@ -182,13 +238,15 @@ async function runStart() {
     return
   }
 
-  // ⭐ 先看看这个 profile 是不是已经被后台无头浏览器占着
+  // ⭐ 先看看这个 profile 是不是已经被别的浏览器占着（后台无头，或之前没关的登录窗口）
   const busy = profileInUse()
   if (busy.length) {
-    // 已经有登录窗口开着（端口能连上）⇒ 直接复用，把窗口顶到前面
-    let alive = false
-    try { alive = (await fetch(`${cdpUrl()}/json/version`)).ok } catch { alive = false }
-    if (alive) {
+    // 🔴 Issue #15：这是个新进程，PORT 多半还是 0 —— 先从活进程的命令行里找回真端口，
+    //    再判断「占着的是登录窗口（能连上 ⇒ 直接复用）还是后台无头（⇒ 让用户选）」。
+    //    原来拿 cdpUrl()（端口 0）去探，永远探不上：登录窗口被误判成无头冲突。
+    const live = await liveQrPorts()
+    if (live.length) {
+      PORT = live[0]
       frontWindow()
       console.log(JSON.stringify({ ok: true, reused: true, port: PORT, pids: busy,
         hint: '登录窗口已经开着了 —— 直接在那个 Chrome 窗口里扫码就行' }, null, 2))
@@ -357,6 +415,8 @@ function loadQrPort() {
  *    这样 `check` / `shot` / `watch` 都不用用户传端口。
  */
 async function discoverQrPort() {
+  // ⭐ 先从活进程的命令行里找（跨了 DSH 重启 / 换了端口都能找回）—— Issue #15
+  for (const p of await liveQrPorts()) return p
   const remembered = loadQrPort()
   if (remembered) {
     try { if ((await fetch(`http://127.0.0.1:${remembered}/json/version`)).ok) return remembered } catch { /* 继续扫 */ }
@@ -501,19 +561,12 @@ if (cmd === 'watch') {
 if (cmd === 'close') {
   try {
     // 强制结束会丢掉尚未落盘的新 Cookie；只正常关闭当前插件 profile 的浏览器。
-    const profileLiteral = "'" + PROFILE.replace(/'/g, "''") + "'"
-    const raw = execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' +
-      `Get-CimInstance Win32_Process | ` +
-      `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${profileLiteral}) -and $_.CommandLine -notmatch ' --type=' } | ` +
-      `Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`],
-      { encoding: 'utf8', timeout: 20000 }).trim()
-    const parsed = raw ? JSON.parse(raw) : []
+    // 🔴 Issue #15：进程枚举改走跨平台的 profileCommandLines()（原来写死 powershell.exe，mac/Linux 必失败）
     const escapedProfile = PROFILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const profileArg = new RegExp(`--user-data-dir=(?:"${escapedProfile}"|${escapedProfile})(?=["\\s]|$)`, 'i')
-    const browsers = (Array.isArray(parsed) ? parsed : [parsed]).filter((p) => profileArg.test(p.CommandLine || ''))
+    const browsers = profileCommandLines().filter((p) => profileArg.test(p.command))
     for (const browser of browsers) {
-      const port = /--remote-debugging-port=(\d+)/.exec(browser.CommandLine || '')?.[1]
+      const port = /--remote-debugging-port=(\d+)/.exec(browser.command || '')?.[1]
       if (!port) throw new Error('浏览器没有调试端口，未强制结束；请手动正常关闭登录窗口')
       const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, {
         signal: AbortSignal.timeout(5000),
@@ -526,12 +579,12 @@ if (cmd === 'close') {
           new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('浏览器正常关闭超时')), 5000) }),
         ])
       } finally { clearTimeout(timer); c.close() }
-      const alive = () => { try { process.kill(Number(browser.ProcessId), 0); return true } catch (e) { if (e.code === 'ESRCH') return false; throw e } }
+      const alive = () => { try { process.kill(browser.pid, 0); return true } catch (e) { if (e.code === 'ESRCH') return false; throw e } }
       const deadline = Date.now() + 8000
       while (alive() && Date.now() < deadline) await sleep(100)
       if (alive()) throw new Error('浏览器仍在保存登录态，未强制结束；请稍后重试')
     }
-    console.log(JSON.stringify({ ok: true, closed: true }, null, 2))
+    console.log(JSON.stringify({ ok: true, closed: browsers.length > 0 }, null, 2))
   } catch (e) {
     console.log(JSON.stringify({ ok: false, error: String(e?.message ?? e) }, null, 2))
     process.exitCode = 1
