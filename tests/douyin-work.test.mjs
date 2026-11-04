@@ -49,46 +49,39 @@ test('footer-only page refuses preparation before any request', async () => {
   assert.equal(requests, 0)
 })
 
-function fakeNode({ x = 0, y = 0, width = 50, height = 25, text = '', cid = '' } = {}) {
-  return {
+function fakeNode({ x = 0, y = 0, width = 50, height = 25, text = '', cid = '', replyId = '', replyTotal = 0, conflictCid = '' } = {}) {
+  const node = {
     innerText: text, children: [], parentElement: null,
     getBoundingClientRect: () => ({ x, y, width, height, bottom: y + height, right: x + width }),
     getAttribute: key => key === 'data-cid' ? cid : null,
     scrollIntoView() {}, contains(other) { return this.children.includes(other) },
     querySelectorAll: () => [],
   }
+  // 🔴 2026-11-05：发布器从行上的 React props 就地读楼层关系（replyId："0"=顶层），fixture 同步带 fiber
+  node.__reactFiber$fixture = {
+    memoizedProps: { commentInfo: { cid: conflictCid || cid, replyId, replyTotal } },
+    stateNode: node, return: null,
+  }
+  return node
 }
 
-function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId = '', replyTo = '', cloneRoot = false, unknownClones = false } = {}) {
+function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId = '', replyTo = '', cloneRoot = false, conflictRow = false } = {}) {
   const calls = []
   const listeners = new Map()
-  const state = { inserted: '', selected: '', intercepted: false, nativeRequests: 0, reads: [], uiBegan: false }
-  class ReadXHR {
-    open(method, url) { this.method = method; this.url = new URL(url, 'https://www.douyin.com') }
-    send() {
-      assert.equal(this.method, 'GET', 'Text discovery must remain read-only')
-      assert.equal(state.uiBegan, false, 'Text reads must complete before native panel queries/pagination')
-      const nested = this.url.pathname.includes('/list/reply/')
-      const comments = nested ? [{ cid: target, text: 'nested text' }] : [{ cid: root, text: 'root text' }]
-      this.status = 200
-      this.responseText = JSON.stringify({ status_code: 0, comments, has_more: 0 })
-      state.reads.push(this.url.pathname)
-      this.onload()
-    }
-  }
+  const state = { inserted: '', selected: '', intercepted: false, nativeRequests: 0, uiBegan: false }
   const list = fakeNode({ x: 0, y: 40, width: 600, height: 300 })
-  const rootItem = fakeNode({ x: 10, y: 50, width: 500, height: 150, text: 'root text', cid: root })
-  const nestedItem = fakeNode({ x: 20, y: 110, width: 400, height: 70, text: 'nested text', cid: target })
+  const rootItem = fakeNode({ x: 10, y: 50, width: 500, height: 150, text: 'root text', cid: root, replyId: '0', replyTotal: 1 })
+  const nestedItem = fakeNode({ x: 20, y: 110, width: 400, height: 70, text: 'nested text', cid: target, replyId: root })
   const rootButton = fakeNode({ x: 30, y: 80, text: '回复' })
   const nestedButton = fakeNode({ x: 40, y: 140, text: '回复' })
   const hiddenLegacy = fakeNode({ width: 0, height: 0, text: 'root text', cid: root })
-  const rootClone = fakeNode({ x: 10, y: 250, width: 500, height: 100, text: 'root text', cid: unknownClones ? '' : root })
+  const rootClone = fakeNode({ x: 10, y: 250, width: 500, height: 100, text: 'root text', cid: root, replyId: '0' })
+  const conflictItem = fakeNode({ x: 25, y: 180, width: 400, height: 70, text: 'conflicting row', cid: root, conflictCid: '7000000000000000009' })
   rootItem.children = [rootButton, nestedItem]
   nestedItem.children = [nestedButton]
   rootItem.querySelectorAll = () => [rootButton, nestedButton]
   nestedItem.querySelectorAll = () => [nestedButton]
   rootClone.querySelectorAll = () => [rootButton]
-  if (unknownClones) rootItem.getAttribute = () => null
   const editor = fakeNode({ x: 10, y: 400, width: 500, height: 60 })
   const scope = fakeNode({ x: 0, y: 390, width: 600, height: 100 })
   const arrow = fakeNode({ x: 480, y: 450, width: 30, height: 30 })
@@ -99,11 +92,9 @@ function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId
   const document = {
     querySelectorAll(selector) {
       state.uiBegan = true
-      const expectedReads = replyTo ? 2 : rootId ? 1 : 0
-      assert.equal(state.reads.length, expectedReads, 'All target/root text reads must precede native UI work')
       if (selector === '.public-DraftEditor-content') return [editor]
       if (selector.includes('comment-list') && selector.includes('comment-item')) return [list, hiddenLegacy, rootItem, nestedItem]
-      if (selector === '[data-e2e="comment-item"]') return [hiddenLegacy, rootItem, nestedItem, ...(cloneRoot ? [rootClone] : [])]
+      if (selector === '[data-e2e="comment-item"]') return [hiddenLegacy, rootItem, nestedItem, ...(cloneRoot ? [rootClone] : []), ...(conflictRow ? [conflictItem] : [])]
       if (selector.includes('comment-list')) return [list]
       throw new Error('Unexpected DOM query: ' + selector)
     },
@@ -116,7 +107,7 @@ function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId
     return p.x === r.x + r.width / 2 && p.y === r.y + r.height / 2
   }
   const c = {
-    ev: async expression => vm.runInNewContext(expression, { document, XMLHttpRequest: ReadXHR, innerWidth: 900, innerHeight: 800 }),
+    ev: async expression => vm.runInNewContext(expression, { document, innerWidth: 900, innerHeight: 800 }),
     on(name, callback) {
       const handlers = listeners.get(name) || new Set()
       handlers.add(callback); listeners.set(name, handlers)
@@ -193,16 +184,40 @@ test('dry native publishing inspects matching IDs and blocks the request', async
   assert.equal(countCalls(page, 'Fetch.failRequest'), 1)
 })
 
-test('same-ID visible clones select the original once; text-only duplicates stop before editor input', async () => {
+test('same-ID visible clones select the original once; conflicting identity stops before editor input', async () => {
   const page = nativePage({ rootId: root, cloneRoot: true, responseBody: success })
   assert.equal((await publishComment(page.c, { aweme_id: id, root, text })).attempted, true)
   assert.equal(countCalls(page, 'Fetch.continueRequest'), 1)
-  const ambiguous = nativePage({ rootId: root, cloneRoot: true, unknownClones: true })
+  const ambiguous = nativePage({ rootId: root, conflictRow: true })
   const result = await publishComment(ambiguous.c, { aweme_id: id, root, text })
   assert.equal(result.attempted, false)
-  assert.match(result.error, /匹配多条/)
+  assert.match(result.error, /身份记录不一致/)
   assert.equal(countCalls(ambiguous, 'Input.insertText'), 0)
   assert.equal(countCalls(ambiguous, 'Fetch.continueRequest'), 0)
+})
+
+test('derive mode reads the floor relationship from the row itself, never from list requests', async () => {
+  // ① 目标是顶层行：就地判定 root=它自己
+  const top = nativePage({ rootId: root, responseBody: success })
+  const topResult = await publishComment(top.c, { aweme_id: id, root: root, reply_to: '', derive: true, text })
+  assert.equal(topResult.attempted, true)
+  assert.equal(topResult.root, root)
+  assert.equal(topResult.reply_to, '')
+  assert.equal(['found-level1', 'has-replies'].includes(topResult.how), true)
+  // ② 目标是楼中楼行：就地判定 root=行上的 replyId，不用调用方传
+  const nested = nativePage({ rootId: root, replyTo: target, responseBody: success })
+  const nestedResult = await publishComment(nested.c, { aweme_id: id, root: target, reply_to: '', derive: true, text })
+  assert.equal(nestedResult.attempted, true)
+  assert.equal(nestedResult.root, root)
+  assert.equal(nestedResult.reply_to, target)
+  assert.equal(nestedResult.how, 'found-in-thread')
+  // ③ 页面上根本找不到目标 ⇒ need_root 拒绝，绝不瞎猜
+  const missing = nativePage({ rootId: root, replyTo: target, responseBody: success })
+  const ghost = '7000000000000000099'
+  const missingResult = await publishComment(missing.c, { aweme_id: id, root: ghost, reply_to: '', derive: true, text })
+  assert.equal(missingResult.attempted, false)
+  assert.match(missingResult.error, /没有找到目标评论/)
+  assert.equal(countCalls(missing, 'Input.insertText'), 0)
 })
 
 test('wrong work, text, root or nested target never releases a request', async () => {

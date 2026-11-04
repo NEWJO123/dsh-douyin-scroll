@@ -85,96 +85,22 @@ try {
   const work = await prepareWorkPage(c, { aweme: AWEME, work_url: WORK.route ? WORK.work_url : '', aweme_type: WORK.aweme_type, comment_id:REPLY })
 
   /**
-   * ⭐ 解析「楼根」和「具体回哪条」。
-   *   判据来源只有权威数据：翻 `/comment/list/`（顶层）找这条 cid 到底在哪、`reply_id` 是什么。
-   *   判不出来就返回 need_root，**不猜**。
+   * ⭐ 楼根判定**不再发任何列表请求**（2026-11-05）。
+   *   原来先在页面里翻 /comment/list/ 解析楼根 —— A/B 实测这会把站点自己的评论分页打毒
+   *   （发过查询后怎么滚都不再加载新楼层，0.6.0 / 0.6.1 / 0.7.0 全中，2026-11-03 起必挂）。
+   *   现在楼层关系由发布器在目标行上就地读（replyId："0"=顶层，非 0 = 楼根），三种页面结论：
+   *   found-level1（顶层）/ found-in-thread（楼中楼里）/ has-replies（顶层且有人回过）。
+   *   · --root 给了 ⇒ 原样信（通知里的 root_comment_id 与它同源），发布器会拿目标行核对
+   *   · 没给 ⇒ 就地推导；推不出来就 need_root 拒绝，**不瞎猜**
    */
-  const resolveJs = `(async function(){
-    var request = ${pageRequestSource};
-    var AWEME = ${JSON.stringify(AWEME)};
-    var TARGET = ${JSON.stringify(REPLY)};
-    var ROOTIN = ${JSON.stringify(ROOT)};
-    var COMMON = {
-      device_platform:'webapp', aid:'6383', channel:'channel_pc_web',
-      pc_client_type:'1', version_code:'190500', version_name:'19.5.0',
-      cookie_enabled:'true', screen_width:'1920', screen_height:'1080',
-      browser_language:'zh-CN', browser_platform:'Win32',
-      browser_name:'Chrome', browser_version:'141.0.0.0',
-      engine_name:'Blink', engine_version:'141.0.0.0',
-      os_name:'Windows', os_version:'10', platform:'PC'
-    };
-    function qs(d){ return Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&'); }
-    async function get(rel){
-      var r = await request('GET', rel);
-      var t = r.body;
-      try { return JSON.parse(t) } catch(e) { return null }
-    }
-    // 不给 --reply = 发顶层评论，不需要判楼
-    if (!TARGET) return JSON.stringify({ ok:true, root:'', reply_to:'', how:'top-level' });
-
-    // ① 调用方明确给了楼根 ⇒ 直接信
-    if (ROOTIN) {
-      var rp = (TARGET === ROOTIN) ? '' : TARGET;
-      return JSON.stringify({ ok:true, root:ROOTIN, reply_to:rp, how:'explicit' });
-    }
-
-    // ② 翻顶层列表找 TARGET：确定它是 level1 还是 level2
-    var cursor = 0, pages = 0;
-    while (pages < 8) {
-      var j = await get('/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
-        aweme_id: AWEME, count: '20', cursor: String(cursor), item_type: '0'
-      })));
-      if (!j) break;
-      var cs = j.comments || [];
-      for (var i = 0; i < cs.length; i++) {
-        var x = cs[i];
-        if (String(x.cid) === TARGET) {
-          // 找到了，它是一条顶层评论 ⇒ root = 它自己
-          return JSON.stringify({ ok:true, root:String(x.cid), reply_to:'', how:'found-level1' });
-        }
-        // 也在它的楼中楼里找（接口会带前几条）
-        var rs = x.reply_comment || [];
-        for (var k = 0; k < rs.length; k++) {
-          if (String(rs[k].cid) === TARGET) {
-            return JSON.stringify({ ok:true, root:String(x.cid), reply_to:TARGET, how:'found-in-thread' });
-          }
-        }
-      }
-      if (!j.has_more) break;
-      var next = Number(j.cursor || 0);
-      if (!next || next === cursor) break;
-      cursor = next; pages++;
-      await new Promise(function(r){ setTimeout(r, 700) });
-    }
-
-    // ③ 顶层翻不到 ⇒ 直接问接口"这条底下有没有楼中楼"：有 ⇒ 它自己就是楼根
-    var rj = await get('/aweme/v1/web/comment/list/reply/?' + qs(Object.assign({}, COMMON, {
-      item_id: AWEME, comment_id: TARGET, cursor: '0', count: '1', item_type: '0'
-    })));
-    if (rj && Number(rj.total || 0) > 0) {
-      return JSON.stringify({ ok:true, root:TARGET, reply_to:'', how:'has-replies' });
-    }
-
-    // ④ 判不出来 ⇒ 拒绝（不许瞎猜，猜错就变成一条悄悄冒出来的顶层评论）
-    return JSON.stringify({ ok:false, need_root:true,
-      hint:'判不出这条 cid 的楼根。请传 --root <顶层评论cid>（= 这条回复所在那栋楼的第一条）' });
-  })()`
-
-  let plan = null
-  try { plan = JSON.parse(await c.ev(resolveJs)) } catch { plan = { ok: false, hint: '楼根解析没返回可解析结果' } }
-
-  if (!plan.ok) {
-    await c.close(); c = null
-    await sleep(200)
-    out({
-      ok: false,
-      error: plan.hint || '判不出楼根，已中止（不瞎猜）',
-      aweme_id: AWEME,
-      reply_to: REPLY,
-      why: 'reply_id 必须是"楼根"。给错了会变成一条冒出来的顶层评论，位置全错还看起来成功。',
-      how_to: '传 --root <顶层评论 cid>；或先跑 tools/comment-read-dom.mjs 看这条属于哪栋楼',
-    })
-    process.exit(1)
+  const KNOWN_HOW = new Set(['found-level1', 'found-in-thread', 'has-replies'])
+  const plan = {
+    ok: true,
+    // derive 模式（没给 --root）先把目标行本身当 root 传下去，发布器在行上就地判定真实楼根
+    root: ROOT || REPLY || '',
+    reply_to: ROOT && REPLY && ROOT !== REPLY ? REPLY : '',
+    how: ROOT ? 'explicit' : (REPLY ? 'derive-in-dom' : 'top-level'),
+    derive: !ROOT && Boolean(REPLY),
   }
 
   if (DRY) {
@@ -183,7 +109,7 @@ try {
     out({
       ok: true, dry: true, aweme_id: AWEME,
       reply_to: REPLY || '(顶层评论)',
-      root: plan.root || '(无 — 发顶层)',
+      root: plan.root || '(无 — 发布器在页面上就地判定)',
       resolved_by: plan.how,
       work_url: work.work_url, aweme_type: work.aweme_type, transport: 'page-frontend',
       len: TEXT.length, chrome: chromed,
@@ -191,12 +117,33 @@ try {
     process.exit(0)
   }
 
-  const published = await publishComment(c, { aweme_id: AWEME, root: plan.root || '', reply_to: plan.reply_to || '', text: TEXT })
+  const published = await publishComment(c, { aweme_id: AWEME, root: plan.root || '', reply_to: plan.reply_to || '', derive: Boolean(plan.derive), text: TEXT })
+
+  // 🔴 判不出楼根 ⇒ 明确拒绝（不瞎猜）：derive 模式下发布器在页面上没找到/没判定出目标行
+  if (plan.derive && !published.attempted && /没有找到目标评论|判不出/.test(String(published.error || ''))) {
+    await c.close(); c = null
+    await sleep(200)
+    out({
+      ok: false, need_root: true,
+      error: '判不出这条 cid 的楼根（页面上没滚到它），已中止 —— 不瞎猜',
+      aweme_id: AWEME, reply_to: REPLY,
+      detail: String(published.error || ''),
+      why: 'reply_id 必须是"楼根"。给错了会变成一条冒出来的顶层评论，位置全错还看起来成功。',
+      how_to: '传 --root <顶层评论 cid>（= 这条回复所在那栋楼的第一条）；通知里的 root_comment_id 就是它',
+      resolved_by: plan.how, work_url: work.work_url, aweme_type: work.aweme_type, transport: 'page-frontend', chrome: chromed,
+      len: TEXT.length,
+    })
+    process.exit(1)
+  }
+
+  // 发布器可能在页面上就地判定出楼根（没传 --root 时）；核实与落位判断都用最终值
+  const usedRoot = String(published.root || plan.root || '')
+  const usedReplyTo = String(published.reply_to || plan.reply_to || '')
   const js = `(async function(){
     var request = ${pageRequestSource};
     var AWEME = ${JSON.stringify(AWEME)};
-    var ROOT = ${JSON.stringify(plan.root || '')};
-    var REPLYTO = ${JSON.stringify(plan.reply_to || '')};
+    var ROOT = ${JSON.stringify(usedRoot)};
+    var REPLYTO = ${JSON.stringify(usedReplyTo)};
     var TEXT = ${JSON.stringify(TEXT)};
     var COMMON = {
       device_platform:'webapp', aid:'6383', channel:'channel_pc_web',
@@ -270,7 +217,7 @@ try {
    *   ③ 两边都读不到 ⇒ unknown（评论列表按热度排，0 赞的可能够不着）**不许当成失败**
    */
   let placement = null
-  if (plan.root && cid) {
+  if (usedRoot && cid) {
     if (res.verified) {
       const lv = Number(res.verified_level)
       placement = {
@@ -301,8 +248,8 @@ try {
     http: res.http,
     cid: cid || undefined,
     reply_to: REPLY || '(顶层评论)',
-    root: plan.root || undefined,
-    resolved_by: plan.how,
+    root: usedRoot || undefined,
+    resolved_by: KNOWN_HOW.has(published.how) ? published.how : plan.how,
     /** ⭐ publish 响应里的位置（有时是 null —— 别只靠它） */
     server_level: res.has_lv ? res.lv : undefined,
     server_reply_id: res.rt || undefined,
