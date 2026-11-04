@@ -23,6 +23,28 @@
 
 ---
 
+## 0.6.1 — 2026-11-04（修复：macOS / Linux 扫码登录误报「浏览器还没开」· Issue #15）
+
+> 修复来自社区 PR #16（icatw）—— 根因是 0.5.9 修 Issue #11 时只覆盖了 Windows。
+
+- **`tools/qr-login.mjs` 进程检测原来写死 `powershell.exe`**：mac/Linux 上 `execFileSync` 必抛、被 `catch` 吞掉，
+  `profileInUse()` 恒返回空 ⇒ `start` 以为没浏览器占着 profile ⇒ 另挑端口、用同一个 `--user-data-dir`
+  起第二个 Chrome（被拒秒退）⇒ 在错端口等满 30 秒 ⇒ 报「登录用的浏览器还没开」。
+  **用户明明已经扫上码，Cookie 却永远导不出来。**
+  改成跨平台 `profileCommandLines()`：Windows 保持原 PowerShell 探测（Issue #11 语义不变），
+  macOS / Linux 走 `ps -axo pid=,command=` 按 profile 路径字面匹配，排除 `--type=` 子进程与自身。
+- **`start` 的复用分支拿 `PORT=0` 探活**：新进程里端口只有 `QR_CDP_PORT` 环境变量才有值，
+  `fetch('http://127.0.0.1:0/json/version')` 必失败 ⇒「登录窗口开着就复用」这条路径**在任何平台都走不到**。
+  新增 `liveQrPorts()`：从活进程命令行读 `--remote-debugging-port`（只认 ≥9374，避开无头值班的 9334–9373）并逐个验活。
+- **`loadQrPort()` 用了未导入的 `readFileSync`** ⇒ 每次抛 `ReferenceError` 被吞掉，「记住上次端口」从未生效（静默失败）。已补导入。
+- **`discoverQrPort()` 优先用活进程端口**：跨 DSH 重启也能找回登录窗口（`check` / `shot` / `watch` 都不用再传端口）。
+- **`frontWindow()` 跨平台**：macOS 用 `osascript` 激活浏览器 App（App 名从安装路径反推，Chrome / Edge / Chromium 都认）；Linux 安静跳过。
+- **`closeProfileChrome()` 改 SIGTERM 优雅关闭**（不丢尚未落盘的新 Cookie）；`close` 子命令的进程枚举同步改走 `profileCommandLines()`。
+- 报告与修复：Issue #15 / PR #16 · icatw（macOS 15 + Chrome 156 真机验证齐全 —— 感谢！）。
+- 验证：selfcheck **374/0** + Windows 真机 `start` / `close` 实测无残留。
+
+---
+
 ## 0.6.0 — 2026-11-03（图文评论回复 + 日志时区修复）
 
 > 功能部分来自社区贡献（yitacls），日志时区修复来自 Issue #14（404notfoundzzy）。

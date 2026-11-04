@@ -97,18 +97,19 @@ test('targeted repair installs missing packages and signer, and reports signer f
   assert.match(failure.state().install.error, /签名器/)
 })
 
-async function qr({ headless = false, owners = true, qrBox = true, alreadyLoggedIn = false } = {}) {
+async function qr({ headless = false, owners = true, qrBox = true, alreadyLoggedIn = false, platform = 'win32' } = {}) {
   const outputs = [], files = new Map(), commands = [], launches = []
   const HOME = 'C:\\fixture', PROFILE = join(HOME, 'chrome-profile')
   files.set(join(HOME, 'runtime.json'), JSON.stringify({ cdpPort: 9334, custom: 'preserve' }))
   const context = {
-    process: { argv: ['node', 'qr-login', '__test__'], env: {} }, join, Buffer, homeDir: () => HOME,
+    process: { argv: ['node', 'qr-login', '__test__'], env: {}, platform, pid: 999 }, join, Buffer, homeDir: () => HOME,
     findBrowser: () => '/mock-browser', existsSync: () => true, mkdirSync() {},
     readFileSync: (file) => { if (!files.has(file)) throw new Error('missing'); return files.get(file) },
     writeFileSync: (file, value) => files.set(file, String(value)),
     execFileSync: (cmd, args) => {
       const script = args.at(-1); commands.push(script)
       if (script.includes('Get-Process -Id')) return 'front 123'
+      if (cmd === 'ps') return owners ? `123 browser --remote-debugging-port=9374 --user-data-dir="${PROFILE}"${headless ? ' --headless=new' : ''}\n` : ''
       return owners ? JSON.stringify([{ ProcessId: 123, CommandLine: `browser --remote-debugging-port=9374 --user-data-dir="${PROFILE}"${headless ? ' --headless=new' : ''}` }]) : ''
     },
     spawn: owners ? noEffect : (cmd, args, options) => {
@@ -151,6 +152,19 @@ test('headless profile conflict is explicit and no QR is fabricated', async () =
   const mock = await qr({ headless: true })
   assert.equal(mock.result.ok, false); assert.equal(mock.result.conflict, 'profile_in_use')
   assert.equal(mock.result.browser_open, false); assert.equal(mock.result.qr, undefined)
+})
+
+test('macOS and Linux keep upstream process discovery and reuse only headed login windows', async () => {
+  for (const platform of ['darwin', 'linux']) {
+    const mock = await qr({ platform })
+    assert.equal(mock.result.ok, true); assert.equal(mock.result.reused, true)
+    assert.equal(mock.result.port, 9374); assert.ok(mock.result.qr)
+    assert.ok(mock.commands.includes('pid=,command='))
+    assert.ok(!mock.commands.some((script) => script.includes('Get-CimInstance')))
+    const headless = await qr({ platform, headless: true })
+    assert.equal(headless.result.conflict, 'profile_in_use')
+    assert.equal(headless.launches.length, 0)
+  }
 })
 test('visible window without QR remains checkable and existing login has no fake image', async () => {
   const noQr = (await qr({ qrBox: false })).result

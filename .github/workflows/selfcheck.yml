@@ -1,0 +1,93 @@
+name: selfcheck
+
+# 别人提 PR 时自动验一遍，不用等号主本地跑。
+#
+# 分两个 job，因为 selfcheck 里有**只对 Windows 成立**的断言
+# （toast / PetHost.exe / PowerShell 相关），直接扔到 Linux runner 上会假红：
+#   - selfcheck（windows-latest）：语法 + 全量 selfcheck + 设置页渲染  ← 权威
+#   - linux-smoke（ubuntu-latest）：语法 + 设置页渲染 + qr-login 跨平台结构断言
+#     （PR #16 加进来的 mac/Linux 路径，至少要保证在 Linux 上结构没坏）
+#
+# ⚠️ 不跑需要 Cookie / 抖音登录 / 真浏览器的检查 —— CI 里没有登录态，跑了必然红。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  selfcheck:
+    name: 全量预检（Windows）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 语法检查（全部 .mjs / .js / .cjs）
+        shell: pwsh
+        run: |
+          $fail = 0
+          foreach ($f in (git ls-files '*.mjs' '*.js' '*.cjs')) {
+            node --check $f 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error file=$f::语法错误"; $fail++ }
+          }
+          if ($fail -gt 0) { exit 1 }
+
+      - name: 全量预检
+        run: node selfcheck.mjs
+
+      - name: 设置页渲染检查
+        run: node tools/panel-render-check.mjs
+
+  linux-smoke:
+    name: 跨平台冒烟（Linux）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 语法检查（全部 .mjs / .js / .cjs）
+        run: |
+          fail=0
+          for f in $(git ls-files '*.mjs' '*.js' '*.cjs'); do
+            node --check "$f" 2>/dev/null || { echo "::error file=$f::语法错误"; fail=1; }
+          done
+          exit $fail
+
+      - name: 设置页渲染检查（纯 Node，不依赖平台）
+        run: node tools/panel-render-check.mjs
+
+      # Issue #15 / PR #16 的回归闸：qr-login 必须真的跨平台。
+      # 用 node 做结构断言（不按行号猜位置，改代码顺序不会假红）。
+      - name: qr-login 跨平台结构断言
+        run: |
+          node --input-type=module -e "
+          import { readFileSync } from 'node:fs';
+          const src = readFileSync('tools/qr-login.mjs', 'utf8');
+          const fail = (m) => { console.error('::error file=tools/qr-login.mjs::' + m); process.exitCode = 1; };
+          // ① 必须真的导入了 readFileSync（Issue #15 的静默失败就是这个）
+          if (!/writeFileSync,\s*readFileSync/.test(src)) fail('readFileSync 未导入（loadQrPort 会静默抛 ReferenceError）');
+          // ② 必须有跨平台进程枚举函数
+          if (!/function profileCommandLines\(/.test(src)) fail('缺少 profileCommandLines() 跨平台进程枚举');
+          // ③ 里面必须有 win32 分支 + ps -axo 分支
+          const fn = src.slice(src.indexOf('function profileCommandLines('));
+          const body = fn.slice(0, fn.indexOf('\nfunction '));
+          if (!/win32/.test(body)) fail('profileCommandLines 缺 win32 分支（Windows 探测被拆了）');
+          if (!/'-axo'/.test(body)) fail('profileCommandLines 缺 ps -axo 分支（mac/Linux 又走不通了）');
+          // ④ 登录端口下限必须是 9374（避开无头值班的 9334–9373）
+          if (!/p >= 9374/.test(src)) fail('缺少 >=9374 端口下限（会跟无头值班浏览器抢端口）');
+          // ⑤ start 复用分支不许再拿 PORT=0 探活
+          if (/alive = \(await fetch\(\`\$\{cdpUrl\(\)\}/.test(src)) fail('start 复用分支又拿 cdpUrl()（PORT=0）探活了');
+          // ⑥ close 必须走 profileCommandLines，不许回退到写死 powershell
+          if (!/profileCommandLines\(\)\.filter/.test(src)) fail('close 子命令没走 profileCommandLines()');
+          if (process.exitCode) process.exit(1);
+          console.log('qr-login 跨平台结构断言全过');
+          "
