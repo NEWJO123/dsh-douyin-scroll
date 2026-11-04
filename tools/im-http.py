@@ -28,7 +28,10 @@ tools/im-http.py —— 纯 HTTP 读私信（不碰浏览器，只读）
    （这个接口在看请求模式，密集探测会回 "too many requests"）。
 
 用法:
-  python tools/im-http.py --read --peer-sec-uid <sec_uid> [--limit 30]
+  python tools/im-http.py --read --peer-sec-uid <sec_uid> [--limit 30] [--include-nontext]
+
+  --include-nontext 为无可读文字的消息保留空正文标记，供一次回复判断真正的最新消息；
+  默认仍只返回有文字的消息，保持已有聊天巡检的行为。
 
 输出：一行 JSON
   { ok, via:'http', ms, my_uid, conversation_count, conversations:[...],
@@ -81,6 +84,7 @@ def arg_of(k, d=""):
 
 
 READ = "--read" in argv
+INCLUDE_NONTEXT = "--include-nontext" in argv
 PEER_SEC = arg_of("--peer-sec-uid", "")
 try:
     LIMIT = max(1, min(int(arg_of("--limit", "30") or 30), 60))
@@ -239,6 +243,20 @@ def iso(ms):
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".%03dZ" % (ms % 1000)
 
 
+def message_content(content_raw, include_nontext=False):
+    """Preserve unsupported-message position only for consumers that explicitly request it."""
+    text, kind = "", "text"
+    try:
+        content = json.loads(content_raw)
+        text = str(content.get("text") or content.get("content_title") or "").strip()
+        kind = "card" if int(content.get("aweType") or 0) == 800 else "text"
+    except Exception:
+        text = content_raw[:120]
+    if not text:
+        return {"text": "", "kind": "unsupported"} if include_nontext else None
+    return {"text": text[:200], "kind": kind}
+
+
 def peer_uid_of(conv_id, my_uid):
     """从会话 id（"0:<type>:<uidA>:<uidB>"）里解出对端数字 uid（去掉自己那个）。"""
     parts = str(conv_id or "").split(":")
@@ -322,22 +340,15 @@ def main():
                 sender = as_str(g1(f, 7))            # field7 = 发送者 uid
                 content_raw = as_str(g1(f, 8))       # field8 = 正文 JSON
                 at_ms = int(g1(f, 10) or 0)          # field10 = 毫秒时间戳
-                text, kind = "", "text"
-                try:
-                    j = json.loads(content_raw)
-                    text = str(j.get("text") or j.get("content_title") or "").strip()
-                    kind = "card" if int(j.get("aweType") or 0) == 800 else "text"
-                except Exception:
-                    text = content_raw[:120]
-                if not text:
+                content = message_content(content_raw, INCLUDE_NONTEXT)
+                if content is None:
                     continue
                 # ⭐ 排序不信线序（协议顺序实测过不稳定），直接按时间戳排旧→新
                 messages.append({
                     "_ts": at_ms,
                     "from": "me" if sender == my_uid else "them",
-                    "text": text[:200],
+                    **content,
                     "at": iso(at_ms),
-                    "kind": kind,
                 })
             messages.sort(key=lambda x: x["_ts"] or 0)
             for m in messages:

@@ -33,6 +33,8 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
+import { recommendationCounts, observeToolStart, observeToolResult } from '../lib/run-record.mjs'
+import { createCommentSender } from '../lib/comment-send.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
@@ -175,13 +177,17 @@ const TOOLS = [
       const cfg = config()
       const st = readJson(join(HOME, 'state.json'), {}) || {}
       const report = join(HOME, 'out', `${dayKey()}.md`)
+      const counts = recommendationCounts(HOME, dayKey(), existsSync(report) ? readFileSync(report, 'utf8') : '')
       return {
         ok: true,
         home: HOME,
         loggedIn: cookieOk(),
         venvReady: hasVenv(),
         perDay: Number(cfg.perDay ?? 5),
-        pickedToday: countPicks(report),
+        pickedToday: counts.total,
+        counts,
+        manualPerRun: Number(cfg.manualPerRun || 3),
+        autoQuotaLeft: Math.max(0, Number(cfg.perDay ?? 5) - counts.auto),
         lastRunAt: st.lastRunAt || null,
         lastWhy: st.lastWhy || null,
         report,
@@ -378,7 +384,8 @@ const TOOLS = [
       return {
         ok: okN === ids.length && (!reason || reason.ok),
         sent: okN, total: ids.length, to,
-        results: sent.map(({ j, r }) => ({ aweme_id: j.aweme_id, ok: !!j.ok, sent: !!j.sent, ...explain(j, r) })),
+        results: sent.map(({ j, r }) => ({ aweme_id: j.aweme_id, ok: !!j.ok, sent: !!j.sent,
+          outcome_unknown: Boolean(j.outcome_unknown || j.sent === undefined || j.sent && j.after?.toast !== true), ...explain(j, r) })),
         // ⭐ 失败原因同时提到顶层：调用方（人）不会挨个翻 results
         ...(failed[0]?.error ? { error: failed[0].error } : {}),
         ...(failed[0]?.hint ? { hint: failed[0].hint } : {}),
@@ -642,6 +649,12 @@ const TOOLS = [
   },
 ]
 
+// Keep preview handlers synchronous; only confirmed writes acquire the shared send guard.
+const nativeReply = TOOLS.find((tool) => tool.name === 'douyin_comment_reply')
+const nativeReplyHandler = nativeReply.handler
+const guardedReply = createCommentSender({ home: HOME, execute: nativeReplyHandler })
+nativeReply.handler = (args) => args?.confirm === true ? guardedReply(args) : nativeReplyHandler(args)
+
 /* ─────────────────────────── JSON-RPC / MCP 传输 ─────────────────────────── */
 
 const SUPPORTED_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05']
@@ -704,7 +717,10 @@ const handleRequest = async (msg) => {
       const tool = TOOLS.find((t) => t.name === name)
       if (!tool) return fail(id, -32602, `Unknown tool: ${name}`)
       try {
+        const attemptId = observeToolStart(HOME, process.env.DOUYIN_ROUND_ID, name, params?.arguments || {})
         const value = await tool.handler(params?.arguments || {})
+        try { observeToolResult(HOME, process.env.DOUYIN_ROUND_ID, name, params?.arguments || {}, value, attemptId) }
+        catch (e) { process.stderr.write(`[douyin-mcp] 本轮发送回执未能记录：${String(e?.message || e)}\n`) }
         return reply(id, asContent(value))
       } catch (e) {
         return reply(id, asContent({ ok: false, error: String(e?.message ?? e) }))

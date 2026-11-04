@@ -25,7 +25,7 @@
  * ============================================================================
  */
 import { spawn, execFileSync } from 'node:child_process'
-import { writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homeDir } from '../lib/paths.mjs'
 import { findBrowser } from '../lib/chrome.mjs'
@@ -65,17 +65,24 @@ async function findFreePort() {
  *  🔴 Issue #11：不认 exe 名（写死 chrome.exe 在只装 Edge 的机器上「看不见」占着 profile 的
  *  msedge ⇒ 扫码登录必失败），改按命令行里的 profile 路径认；排除探测用的 powershell 自身
  *  （它的 -Command 里就带着 profile 字面量）和 --type= 的子进程。 */
-function profileInUse() {
+function profileOwners() {
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
       `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
       `Get-CimInstance Win32_Process | ` +
       `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${PROFILE_PS}) -and $_.CommandLine -notmatch ' --type=' } | ` +
-      `Select-Object -ExpandProperty ProcessId`],
-      { encoding: 'utf8', timeout: 15000 })
-    return String(out || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+      `Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true })
+    const parsed = String(out || '').trim() ? JSON.parse(out) : []
+    const escaped = PROFILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const profileArg = new RegExp(`--user-data-dir=(?:"${escaped}"|${escaped})(?=["\\s]|$)`, 'i')
+    return (Array.isArray(parsed) ? parsed : [parsed]).filter((p) => profileArg.test(p.CommandLine || '')).map((p) => ({
+      pid: Number(p.ProcessId), headless: /--headless(?:[=\s]|$)/.test(p.CommandLine || ''),
+      port: Number(/--remote-debugging-port=(\d+)/.exec(p.CommandLine || '')?.[1]) || 0,
+    }))
   } catch { return [] }
 }
+const profileInUse = () => profileOwners().map((owner) => owner.pid)
 
 /** 关掉占着 profile 的浏览器（只在用户明确要求时用；同 Issue #11，按 profile 路径认进程） */
 function closeProfileChrome() {
@@ -85,7 +92,7 @@ function closeProfileChrome() {
       `Get-CimInstance Win32_Process | ` +
       `Where-Object { $_.Name -notmatch '^(powershell|pwsh|cmd|conhost)\\.exe$' -and $_.CommandLine -and $_.CommandLine.Contains(${PROFILE_PS}) -and $_.CommandLine -notmatch ' --type=' } | ` +
       `ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
-      { encoding: 'utf8', timeout: 20000 })
+      { encoding: 'utf8', timeout: 20000, windowsHide: true })
     return true
   } catch { return false }
 }
@@ -95,12 +102,13 @@ function closeProfileChrome() {
  * ⭐ 用户可能正开着别的窗口（甚至全屏），不置顶的话他不知道去哪儿扫码。
  *    返回 'front <pid>' 或 'no-window'（不抛）。
  */
-function frontWindow() {
+function frontWindow(pids = []) {
+  if (!pids.length) return 'no-window'
   try {
     return String(execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `$p = Get-Process chrome,msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; ` +
+      `$p = Get-Process -Id ${pids.map(Number).filter((n) => n > 0).join(',')} -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; ` +
       `if($p){ $ws = New-Object -ComObject WScript.Shell; [void]$ws.AppActivate($p.Id); Write-Output ('front ' + $p.Id) } else { Write-Output 'no-window' }`],
-      { encoding: 'utf8', timeout: 20000 })).trim()
+      { encoding: 'utf8', timeout: 20000, windowsHide: true })).trim()
   } catch { return 'no-window' }
 }
 
@@ -109,7 +117,7 @@ async function cdpTargets(waitMs = 30000) {
   for (let i = 0; i < tries; i++) {
     if (!PORT) { await sleep(500); continue }
     try {
-      const r = await fetch(`${cdpUrl()}/json/list`)
+      const r = await fetch(`${cdpUrl()}/json/list`, { signal: AbortSignal.timeout(1500) })
       if (r.ok) return await r.json()
     } catch { /* 还没起来 */ }
     await sleep(500)
@@ -140,13 +148,17 @@ function connect(wsUrl) {
         m.error ? rej(new Error(JSON.stringify(m.error))) : res(m.result)
       }
     })
-    ws.addEventListener('open', () => resolve({
-      send: (method, params = {}) => new Promise((res, rej) => {
+    ws.addEventListener('open', () => {
+      const send = (method, params = {}) => new Promise((res, rej) => {
         const mid = ++id; pending.set(mid, { res, rej })
         ws.send(JSON.stringify({ id: mid, method, params }))
-      }),
-      close: () => ws.close(),
-    }))
+      })
+      resolve({ send, ev: async (expression) => {
+        const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true })
+        if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || '页面执行失败')
+        return result.result?.value
+      }, close: () => ws.close() })
+    })
     ws.addEventListener('error', reject)
   })
 }
@@ -183,21 +195,22 @@ async function runStart() {
   }
 
   // ⭐ 先看看这个 profile 是不是已经被后台无头浏览器占着
-  const busy = profileInUse()
-  if (busy.length) {
-    // 已经有登录窗口开着（端口能连上）⇒ 直接复用，把窗口顶到前面
-    let alive = false
-    try { alive = (await fetch(`${cdpUrl()}/json/version`)).ok } catch { alive = false }
-    if (alive) {
-      frontWindow()
-      console.log(JSON.stringify({ ok: true, reused: true, port: PORT, pids: busy,
-        hint: '登录窗口已经开着了 —— 直接在那个 Chrome 窗口里扫码就行' }, null, 2))
-      return
-    }
+  const owners = profileOwners()
+  const busy = owners.map((owner) => owner.pid)
+  let reused = false
+  for (const owner of owners.filter((p) => !p.headless && p.port)) {
+    try {
+      if ((await fetch(`http://127.0.0.1:${owner.port}/json/version`, { signal: AbortSignal.timeout(1500) })).ok) {
+        PORT = owner.port; reused = true; break
+      }
+    } catch { /* the owned process is not ready */ }
+  }
+  if (busy.length && !reused) {
     // 占着的是**后台无头**那个 ⇒ 让用户选：关掉它扫码，还是先不扫
     console.log(JSON.stringify({
       ok: false,
       conflict: 'profile_in_use',
+      browser_open: false,
       pids: busy,
       error: '后台的无头浏览器占着这个 Chrome 配置，扫码窗口开不起来（Chrome 不允许同一个配置开两个）',
       hint: '点「先关掉后台浏览器，再出二维码」——关掉的是插件自己在后台跑的那个，不影响你平时用的 Chrome',
@@ -206,9 +219,11 @@ async function runStart() {
     return
   }
 
-  PORT = PORT || await findFreePort()
-  mkdirSync(PROFILE, { recursive: true })
-  const args = [
+  let browserPid = 0
+  if (!reused) {
+    PORT = PORT || await findFreePort()
+    mkdirSync(PROFILE, { recursive: true })
+    const args = [
     `--remote-debugging-port=${PORT}`,
     `--user-data-dir=${PROFILE}`,
     '--no-first-run',
@@ -218,11 +233,13 @@ async function runStart() {
     '--window-position=120,60',
     'https://www.douyin.com/',
   ]
-  const p = spawn(CHROME, args, { detached: true, stdio: 'ignore' })
-  p.unref()
-  console.log('chrome pid =', p.pid, '\nprofile =', PROFILE)
+    const p = spawn(CHROME, args, { detached: true, stdio: 'ignore' })
+    await new Promise((resolve, reject) => { p.once('spawn', resolve); p.once('error', reject) })
+    p.unref(); browserPid = p.pid || 0
+  }
 
   const c = await pageConn()
+  saveQrPort()
   await sleep(3500)
 
   /**
@@ -234,7 +251,7 @@ async function runStart() {
   let alreadyLoggedIn = false
   try {
     const { cookies } = await c.send('Network.getAllCookies')
-    const names = cookies.map((x) => x.name)
+    const names = cookies.filter((x) => /(^|\.)douyin\.com$/.test(String(x.domain || '').replace(/^\./, ''))).map((x) => x.name)
     alreadyLoggedIn = names.includes('sessionid') || names.includes('sessionid_ss')
   } catch { alreadyLoggedIn = false }
 
@@ -267,10 +284,12 @@ async function runStart() {
     saveQrPort()
     console.log(JSON.stringify({
       ok: true,
-      already_logged_in: true,
+      already_logged_in: out.ok === true,
+      browser_open: true,
+      reused,
       qr: '',
       ...out,
-      hint: '这个浏览器里**已经登录过了**，不用扫码 —— 我直接把登录凭证导出来了，你现在就能用',
+      hint: out.ok ? '这个浏览器里已经登录过了，现有登录凭证已保存，可以直接使用' : out.hint,
     }, null, 2))
     return
   }
@@ -307,16 +326,36 @@ async function runStart() {
       }
     } catch { /* 读不到页面就继续等 */ }
   }
-  c.close()
-
   // 把登录窗口顶到最前面（用户可能在别的窗口里）
-  const front = frontWindow()
+  const front = frontWindow(reused ? busy : [browserPid])
+  let qr = ''
+  if (layerOk) {
+    try {
+      const box = await c.ev(`(function(){
+        var nodes = Array.prototype.slice.call(document.querySelectorAll('canvas,[class*="qrcode"] img,[class*="qr-code"] img,img[alt*="二维码"]'));
+        var hit = nodes.find(function(e){var r=e.getBoundingClientRect(); return e.offsetParent !== null && r.width >= 80 && r.height >= 80 && r.width < 600 && r.height < 600});
+        if(!hit) return null;
+        var r=hit.getBoundingClientRect();return {x:Math.max(0,r.x),y:Math.max(0,r.y),width:r.width,height:r.height,scale:1};
+      })()`)
+      if (box) {
+        const shot = await c.send('Page.captureScreenshot', { format: 'png', clip: box, captureBeyondViewport: false })
+        if (shot.data) { qr = join(HOME, 'login-qr.png'); writeFileSync(qr, Buffer.from(shot.data, 'base64')) }
+      }
+    } catch { /* visible browser remains available for manual completion */ }
+  }
+  c.close()
 
   // ⭐ 把端口记进 runtime.json —— 否则下一步 check 不知道去哪连（两个是独立进程）
   saveQrPort()
 
   console.log(JSON.stringify({
-    ok: true,
+    ok: Boolean(qr),
+    browser_open: true,
+    can_check: true,
+    reused,
+    qr: qr || undefined,
+    no_qr_element: !qr,
+    error: qr ? undefined : '登录窗口已打开，但尚未识别到二维码，请在该窗口继续登录',
     port: PORT,
     window: front,
     login_button: loginState,
@@ -379,7 +418,7 @@ async function doCheck() {
   const c = await pageConn()
   try {
     const { cookies } = await c.send('Network.getAllCookies')
-    const names = cookies.map((x) => x.name)
+    const names = cookies.filter((x) => /(^|\.)douyin\.com$/.test(String(x.domain || '').replace(/^\./, ''))).map((x) => x.name)
     const key = ['sessionid', 'sessionid_ss', 'sid_tt', 'sid_guard', 'uid_tt', 'passport_csrf_token', 'ttwid', 'msToken', 's_v_web_id']
     const hasSession = names.includes('sessionid') || names.includes('sessionid_ss')
 
@@ -439,7 +478,10 @@ async function doCheck() {
 }
 
 
-if (cmd === 'start') await runStart()
+if (cmd === 'start') {
+  try { await runStart() }
+  catch (e) { console.log(JSON.stringify({ ok: false, error: String(e?.message || e), hint: '登录浏览器未能准备好，请查看错误后重试' }, null, 2)); process.exitCode = 1 }
+}
 if (cmd === 'shot') {
   PORT = PORT || await discoverQrPort()
   if (!(await loginBrowserUp())) { console.log(NOT_UP_MSG); process.exitCode = 2 }

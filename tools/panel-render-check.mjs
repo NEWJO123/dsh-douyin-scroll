@@ -1,892 +1,805 @@
 /**
- * tools/panel-render-check.mjs —— 在 Node 里把 client.js 真**渲染**一遍（不装 DSH）
- * ============================================================================
- * 为什么要有它：
- *   面板整块的消失，过去全是"某个组件在渲染时抛错"引起的（TDZ / undefined / 拼错字段）。
- *   `node --check` 只能查语法，查不出这类运行时错误 —— 2026-10-22 那次「重启多少次都看不见面板」
- *   就是 import 阶段炸的，语法检查照样通过。
- *   这里用一套**极小的 React 替身**（createElement / useState / useEffect / class）
- *   把 Panel 真的执行一遍，然后走一遍元素树，确认每块卡片都在。
- *
- * 用法：node tools/panel-render-check.mjs      （selfcheck 4j 段会调它）
- * 退出码 0 = 渲染通过。
- * ============================================================================
+ * Render the real non-ESM client with a small React/HTTP host. No network, config
+ * writes, browsers or messages leave this process. Effects track dependencies
+ * and timers are controlled so polling and duplicate clicks can be exercised.
  */
-import { existsSync, readFileSync } from 'node:fs'
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const ROOT = join(HERE, '..')
-
-/* ── 极简 React 替身 ── */
-let hooks = []
-let hookIdx = 0
-let rerender = null
-
-const React = {
-  createElement(type, props, ...children) {
-    return { type, props: { ...(props || {}), children: children.length ? (children.length === 1 ? children[0] : children) : undefined } }
-  },
-  useState(init) {
-    const i = hookIdx++
-    if (!(i in hooks)) hooks[i] = typeof init === 'function' ? init() : init
-    const set = (v) => {
-      const next = typeof v === 'function' ? v(hooks[i]) : v
-      if (JSON.stringify(next) !== JSON.stringify(hooks[i])) { hooks[i] = next; rerender?.() }
-    }
-    return [hooks[i], set]
-  },
-  useEffect(fn) {
-    const i = hookIdx++
-    if (!(i in hooks)) { hooks[i] = true; fn() }
-  },
-  useRef(init) {
-    const i = hookIdx++
-    if (!(i in hooks)) hooks[i] = { current: init }
-    return hooks[i]
-  },
-  Component: class { constructor(props) { this.props = props; this.state = {} } setState(p) { Object.assign(this.state, p); rerender?.() } },
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
+const source = readFileSync(join(ROOT, 'client.js'), 'utf8')
+const EPOCH = Date.parse('2026-11-03T12:20:00Z')
+const clone = (value) => structuredClone(value)
+const emptySends = () => Object.fromEntries(['dm', 'card', 'comment'].map((key) => [key, { succeeded: 0, failed: 0, unknown: 0 }]))
+const round = (phase = 'completed', extra = {}) => ({
+  id: 'round-one', phase, startedAt: EPOCH, endedAt: phase === 'completed' ? EPOCH + 60_000 : null,
+  activityAt: EPOCH + 55_000, source: 'manual', budget: 3,
+  events: [
+    { at: EPOCH, stage: 'start', level: 'info', message: '开始获取候选' },
+    { at: EPOCH + 15_000, stage: 'comments', level: 'warning', message: '部分评论未读到' },
+    { at: EPOCH + 60_000, stage: 'end', level: 'info', message: '本轮已完成' },
+  ],
+  warnings: ['部分评论未读到'], result: { recommendations: 1, reportUpdated: true, sends: emptySends() }, ...extra,
+})
+const fixtureConfig = () => ({
+  perDay: 5, manualPerRun: 3, autoEnabled: true, maxPerRun: 12, noon: true, night: true,
+  scheduleDays: [0, 1, 2, 3, 4, 5, 6], windows: [{ start: '09:00', end: '11:00', label: '上午' }],
+  keywords: ['猫', '搞笑'], autoSend: true, commentAtMe: false, dmPeers: [], atPeers: [], chatWatch: false,
+})
+const fixturePersona = () => ({ ok: true, custom: false, text: '', effective: '# 插件口吻\n自然、简短。', effective_label: '插件自带的那份', default_text: '# 中性默认\n简洁。' })
+const fixtureDoctor = (state) => {
+  const dependency = { id: 'dependencies', category: 'environment', required: true,
+    item: state.venvReady ? '运行环境' : '主依赖', state: state.venvReady ? 'ok' : 'bad',
+    detail: state.venvReady ? '可以使用' : '未安装',
+    ...(state.venvReady ? {} : { fix: '点击「修复环境」补齐依赖。', action: { id: 'repair_environment', label: '修复运行环境', endpoint: '/api/douyin-duty/environment/repair' } }) }
+  const cookie = { id: 'cookie', category: 'account', required: true, item: 'Cookie', state: state.loggedIn ? 'ok' : 'bad',
+    detail: state.loggedIn ? '已保存' : '未登录', ...(state.loggedIn ? {} : { fix: '扫码登录抖音。', action: { id: 'login', label: '扫码登录' } }) }
+  return { ok: state.venvReady && state.loggedIn, items: [dependency, cookie], must_fix: [dependency, cookie].filter((item) => item.state !== 'ok').map((item) => item.item), warns: [],
+    environment: { ready: state.venvReady, items: [dependency], repairable: !state.venvReady, actions: dependency.action ? [dependency.action] : [] },
+    account: { ready: state.loggedIn, items: [cookie], actions: cookie.action ? [cookie.action] : [] } }
 }
+const inboxItem = (extra = {}) => ({
+  nickname: '测试好友', content: '出来一下', before: '没回过', aweme_id: '7693806860863802662',
+  comment_id: '7699090731688952613', root_comment_id: '7699090731688952600', aweme_type: 68,
+  work_url: 'https://www.douyin.com/note/7693806860863802662',
+  my_comments_here: [{ text: '我之前在这说过一句' }], ...extra,
+})
 
-/* ── DOM 替身 ── */
-const made = []
-globalThis.document = {
-  createElement: (tag) => { const el = { tag, style: {}, setAttribute() {}, appendChild() {}, remove() {} }; made.push(el); return el },
-  head: { appendChild() {} },
-  body: { appendChild() {}, removeChild() {} },
-  querySelector: () => null,
-  execCommand: () => true,
-}
-
-/* ── fetch 替身：接口返回写死 ──
- * ⭐ 登录状态做成**可切换**的：先按"没登录"渲染一遍（这是新手的真实起点），
- *    再切成"已登录"渲染一遍 —— 两条路都得能画出来。
- */
-const state = { loggedIn: false, venvReady: false }
-// 🆕 可写的配置（模拟真实宿主：POST /config 写进磁盘，GET 读回来）
-const mockCfg = {
-  perDay: 5, maxPerRun: 12, noon: true, night: true, keywords: ['猫', '搞笑'],
-  windows: [{ start: '09:00', end: '11:00', label: '上午' }],
-  autoSend: true, commentAtMe: false, commentSelfName: '',
-  dmPeers: [], atPeers: [],
-}
-// 桌宠状态 mock（【桌宠】段里会改它再重渲染）
-const petState = { ok: true, state: 'watch', round_active: false, asset_ok: true, pet_on: true, chat: { on: true, result: 'ok', new_text: '', checked_ago: 5 } }
-const MOCK = {
-  '/api/douyin-duty/status': () => ({
-    ok: true, version: '9.9.9', home: 'H:/dy', loggedIn: state.loggedIn, venvReady: state.venvReady,
-    pickedToday: 2, report: 'H:/dy/out/2026-10-22.md', installing: false,
-  }),
-  '/api/douyin-duty/config': () => ({
-    ok: true,
-    config: { ...mockCfg },
-  }),
-  '/api/douyin-duty/update': () => ({
-    ok: true, current: '9.9.9', latest: '9.9.9', checked: true, hasUpdate: false, source: 'npm registry', tried: [],
-  }),
-  '/api/douyin-duty/ai-usage': () => ({
-    ok: true, doc: '# 使用说明',
-    mcp: { server: 'H:/dy/tools/mcp-server.mjs', exists: true, selfTest: 'node ".../mcp-server.mjs" --selftest', configText: '{\n  "mcpServers": {}\n}' },
-  }),
-  '/api/douyin-duty/report': () => ({ ok: true, text: '# 报告\n### 7401234567890123401' }),
-  '/api/douyin-duty/guide': () => ({ ok: true, text: '# 新手流程\n\n① 装环境\n② 扫码登录\n③ 用' }),
-  '/api/douyin-duty/account': () => ({
-    ok: true, logged_in: state.loggedIn,
-    account: state.loggedIn ? { nick: '测试账号昵称', uid: '9999000011112222', alive: true, at: new Date().toISOString() } : null,
-  }),
-  '/api/douyin-duty/persona': () => ({
-    ok: true, custom: false, text: '', default_text: '# 默认人设\n\n中性、不扮演任何人。', hint: '还没写自己的 —— 现在用的是默认人设',
-  }),
-  '/api/douyin-duty/memory': () => ({
-    ok: true, stats: { dir: 'H:/dy/memory', dm: 2, comment: 1, bytes: 4096 },
-  }),
-  '/api/douyin-duty/inbox': () => ({
-    ok: true,
-    at_n: 2,
-    dm_n: 1,
-    at: [
-      { nickname: '测试好友', content: '@测试账号昵称 出来一下', before: '没回过',
-        aweme_id: '7693806860863802662', comment_id: '7699090731688952613',
-        video_url: 'https://www.douyin.com/video/7693806860863802662',
-        my_comments_here: [{ at: '2026-10-22', text: '我之前在这说过一句', mention: '' }] },
-      { nickname: '另一个朋友', content: '@测试账号昵称 出来见人', before: '回过',
-        aweme_id: '7694192415963368730', comment_id: '7699009624113152825',
-        video_url: 'https://www.douyin.com/video/7694192415963368730', my_comments_here: [] },
-    ],
-    dm: [
-      { nick: '测试好友', sec_uid: 'MS4wLjABAAAA_test1', preview: '我也爱你', duplicate: false,
-        remembered: 11, their_last: { text: '我也爱你', at: '2026-10-22' }, last_from: 'them', needs_reply: true },
-    ],
-    errors: [],
-  }),
-  '/api/douyin-duty/chat/read': () => ({
-    ok: true, to: '测试好友', to_sec_uid: 'MS4wLjABAAAA_test1',
-    count: 3, mine: 2, them: 1, unknown: 0,
-    messages: [
-      { from: 'me', text: '爱你哟。', awe: 700 },
-      { from: 'them', text: '我也爱你', awe: 700 },
-      { from: 'me', text: '这条想让你看看', awe: 800 },
-    ],
-    context: { who: { nick: '测试好友' }, facts: ['喜欢猫', '在杭州'], recent: [], total_remembered: 11 },
-  }),
-  '/api/douyin-duty/chat/send': () => ({ ok: true, sent: true, to: '测试好友', len: 5 }),
-  '/api/douyin-duty/pet/state': () => petState,
-  '/api/douyin-duty/log': () => ({
-    ok: true, tail: '[示例日志]\n证据包已备好：12 条\n刷抖音开跑（manual）…',
-    lastRunAt: '2026-10-22T09:27:07.645Z', lastWhy: 'manual',
-    roundActive: false, canRun: true, pickedToday: 0, perDay: 5,
-  }),
-  // 扫码登录：默认成功给出 qr_url
-  '/api/douyin-duty/login/qr': () => ({ ok: true, qr_url: '/api/douyin-duty/login/qr.png?v=1', port: 9374 }),
-  // 登录成功会真的把登录态翻过来 —— 面板随后 refresh() 必须看到 true
-  '/api/douyin-duty/login/wait': () => { state.loggedIn = true; return { ok: true, logged_in: true, cookies: 9, hint: '登录成功' } },
-  '/api/douyin-duty/login/close': () => ({ ok: true, closed: true }),
-  '/api/douyin-duty/login/clear': () => { state.loggedIn = false; return { ok: true } },
-  '/api/douyin-duty/dm/people': () => ({
-    ok: true, count: 3,
-    people: [
-      { nick: '测试好友', sec_uid: 'MS4wLjABAAAA_test1', preview: '30分钟内在线', has_id: true, duplicate: false },
-      { nick: '另一个朋友', sec_uid: 'MS4wLjABAAAA_test2', preview: '好的', has_id: true, duplicate: true },
-      // 🔴 群聊：没有 sec_uid（抖音结构如此）—— 面板必须认得出它是群并写明限制
-      { nick: '测试群聊', sec_uid: '', preview: '群里在说话', has_id: false, duplicate: false, is_group: true },
-    ],
-    no_id_count: 1,
-    hint: '有同名的人 —— 选的时候看「最近一条消息」区分，别选错',
-  }),
-}
-globalThis.fetch = async (url, opts = {}) => {
-  const path = String(url).split('?')[0]
-  const method = String(opts?.method || 'GET').toUpperCase()
-  // 🆕 POST /config = 写配置（模拟真实宿主：写进磁盘，GET 能读回来）
-  if (method === 'POST' && path === '/api/douyin-duty/config') {
-    let body = {}
-    try { body = JSON.parse(String(opts?.body || '{}')) } catch { body = {} }
-    for (const [k, v] of Object.entries(body)) {
-      if (k === '__clearKeys') continue
-      mockCfg[k] = v
-    }
-    return { ok: true, status: 200, json: async () => ({ ok: true, config: { ...mockCfg } }) }
-  }
-  const make = MOCK[path]
-  if (!make) return { ok: false, status: 404, json: async () => ({}) }
-  return { ok: true, status: 200, json: async () => make() }
-}
-const fakeNavigator = { clipboard: { writeText: async () => {} } }
-globalThis.window = { __ModuleLoader__: {}, navigator: fakeNavigator }
-
-/* ── 加载 client.js（它是给浏览器写的自注册脚本）── */
-let mod = null
-globalThis.window.__ModuleLoader__.load = (def) => {
-  mod = def.factory((name) => {
-    if (name === 'react') return React
-    throw new Error('未知依赖：' + name)
-  })
-}
-const src = readFileSync(join(ROOT, 'client.js'), 'utf8')
-// eslint-disable-next-line no-new-func
-new Function('window', 'document', 'navigator', 'fetch', src)(
-  globalThis.window, globalThis.document, fakeNavigator, globalThis.fetch,
-)
-if (!mod) throw new Error('client.js 没有调用 __ModuleLoader__.load')
-
-/* ── 把注册到 settings.section 的组件抓出来 ──
- *    （2026-10-24 v2：桌宠搬进桌面级置顶窗口（独立的桌面窗进程）—— 主人要「悬浮所有窗口上」。
- *    GUI 内浮层必须撤掉，不然同时出现两只她。这里守住：不许再注册 shell.overlay。） */
-let Registered = null
-let Overlay = null
-const ctx = {
-  effect: (fn) => { try { fn() } catch { /* 清理函数 */ } },
-  get: (k) => (k === 'slots' ? {
-    inject: (slot, fn) => fn(),
-    register: (meta, comp) => {
-      if (meta?.name === 'settings.section') Registered = comp
-      else if (meta?.name === 'shell.overlay') Overlay = comp
-      return () => {}
+function harness(options = {}) {
+  let config = { ...fixtureConfig(), ...options.config }
+  const state = { loggedIn: true, venvReady: true, installing: false, install: { phase: 'idle' }, ...options.state }
+  const calls = [], copies = [], instances = new Map(), intervals = new Map(), timeouts = new Map()
+  let cursor = null, current = null, dirty = true, tree = null, effects = [], nextTimer = 1, disposed = false
+  const data = {
+    round: round(), counts: { auto: 5, manual: 1, unknown: 2, total: 8 }, persona: fixturePersona(),
+    inbox: { ok: true, at_n: 1, dm_n: 1, at: [inboxItem()], dm: [{ nick: '测试好友', sec_uid: 'MS4wLjABAAAA_test1', preview: '你好', remembered: 11, needs_reply: true, their_last: { text: '我也爱你' } }], errors: [] },
+    reports: {
+      recent: { ok: true, scope: 'recent', exists: true, text: '### 7401234567890123401\n**最近的理由**', roundId: 'round-one', picks: [{ id: '7401234567890123401', title: '最近的作品', text: '**值得看**，这是理由。', url: 'https://www.douyin.com/note/7401234567890123401' }] },
+      today: { ok: true, scope: 'today', exists: true, text: '# 今日报告\n\n**加粗理由**\n- 一条推荐\n[打开作品](https://www.douyin.com/note/7401234567890123401)\n<script>malicious()</script>\n[危险](javascript:alert(1))', picks: [{ id: '7401234567890123401', title: '今日的作品', text: '今日理由。', url: 'https://www.douyin.com/note/7401234567890123401' }] },
     },
-  } : undefined),
-}
-mod.apply(ctx)
-if (!Registered) throw new Error('apply() 没有往 settings.section 注册组件')
-if (Overlay) { console.log('  ❌ 还在往 shell.overlay 注册 —— v2 起桌宠是桌面窗口，GUI 浮层必须撤（不然两只）'); fail++ }
-
-/* ── 迷你渲染器 ── */
-const isClass = (t) => typeof t === 'function' && t.prototype && typeof t.prototype.render === 'function'
-
-function render(el) {
-  if (el === null || el === undefined || el === false || el === true) return null
-  if (typeof el === 'string' || typeof el === 'number') return String(el)
-  if (Array.isArray(el)) return el.map(render)
-  const { type, props } = el
-  if (typeof type === 'function') {
-    if (isClass(type)) {
-      const inst = new type(props || {})
-      const out = inst.render()
-      return render(out)
-    }
-    return render(type(props || {}))
+    reportStamp: 'stamp-one', progressError: false, reportError: false, configError: false, statusError: false,
+    tail: '旧轮次日志\nCookie: sessionid=SECRET_COOKIE\nwebhook=https://secret.example/hook/SECRET_HOOK\n证据包已备好\nhttps://www.douyin.com/note/7401234567890123401',
+    reply: { ok: true, sent: true, cid: '7699090731688952699' }, run: { ok: true },
+    doctor: () => fixtureDoctor(state), qr: { ok: true, qr_url: '/api/douyin-duty/login/qr.png' },
+    installStart: { ok: true, started: true, install: { phase: 'running', stage: 'dependencies', startedAt: EPOCH } },
+    install404: false, ...options.data,
   }
-  const kids = props?.children
-  return { tag: String(type), props: props || {}, children: kids === undefined ? [] : [].concat(render(kids)).flat(Infinity).filter((x) => x !== null) }
-}
-
-/** 把元素树拍平成 [tag, text] 便于检查 */
-function walk(node, out = []) {
-  if (node === null || node === undefined) return out
-  if (Array.isArray(node)) { for (const n of node) walk(n, out); return out }
-  if (typeof node === 'string') { out.push({ tag: '#text', text: node }); return out }
-  out.push({ tag: node.tag, text: '', props: node.props })
-  for (const c of node.children || []) walk(c, out)
-  return out
-}
-
-const flush = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0)) }
-
-/** 取某个节点**子树**里的全部文字（按钮里的名字常在子 span 里，findBtn 只看按钮自己的 children 会漏） */
-function textOf(node, flatList) {
-  const list = flatList || flat
-  const i = list.findIndex((n) => n === node)
-  if (i < 0) return ''
-  let depth = 0
-  let out = ''
-  for (let k = i; k < list.length; k++) {
-    const n = list[k]
-    if (k > i && n.tag === 'button') break          // 到下一个按钮就收
-    if (n.tag === '#text') out += n.text
-  }
-  return out
-}
-
-let tree = null
-let renders = 0
-rerender = () => { renders++ }
-
-/**
- * 渲染一遍并取元素树。
- * ⚠️ hook 游标（hookIdx）必须在**每次渲染开始时**归零，让 useState 按调用顺序重新对齐；
- *    hooks 数组本身**不能清**（那是状态存储）。
- *    之前的 bug：renderNow() 里清了 hooks，导致点按钮 setState 写进去的值，
- *    下一次渲染读到的是初始值（聊天界面就是这么"测不出来"的）。
- */
-const renderNow = async () => {
-  hookIdx = 0
-  const t = render(React.createElement(Registered, {}))
-  await flush()
-  return t
-}
-
-// 第一遍：会显示"读设置中…"
-hooks = []
-tree = render(React.createElement(Registered, {}))
-await flush()
-
-/**
- * ⭐ 关键：先按**新手真实起点**渲染 —— 没登录。
- *    以前这里只测"已登录"那条路，结果登录 UI 崩了也发现不了。
- */
-state.loggedIn = false
-tree = await renderNow()
-await renderNow()
-let flat = walk(tree)
-let allText = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-
-let fail = 0
-
-/* ══════════════════════════════════════════════════════════════════════════
- * ⭐ 面板三组（2026-10-25 重排）：20+ 张卡压成 7 张 —— 组 ①永远是三张卡（不折叠），
- *    组 ②「出问题才看」/ 组 ③「一次配好」**默认收起**。
- *    折叠是设计的一部分，不是"渲染丢了" ⇒ 这里先验「默认确实收着」，
- *    再**点开折叠组**，后面所有老断言照旧在展开后的树上跑（一条都不删、不弱化）。
- *
- *    ⚠️ 为什么必须点开：组 ②③ 里的按钮（检查更新 / 看接入方式 / 看今天的报告 /
- *       检查环境 / 从我的会话里选 / 看记忆 / 看看谁找我…）收起来时根本不在 DOM 里，
- *       不点开就找不到 —— 那是设计如此，不是缺功能。
- * ══════════════════════════════════════════════════════════════════════════ */
-
-/** 组标题：[{ name, btn }]，btn 非空 = 这一组能折叠（组 ① 是纯标题 div，没有按钮）
- *  ⚠️ 结构是 h('div', {'data-dy-group':''}, h('button', {'data-dy-groupbtn':''}, …))，
- *     所以「能折叠」的标志是组里有 data-dy-groupbtn 的按钮，不是容器自己是不是 button。 */
-const groupInfo = (f) => {
-  const out = []
-  f.forEach((n, i) => {
-    if (!(n.props && 'data-dy-groupname' in n.props)) return
-    // 紧跟其后的第一个文本节点就是组名
-    let j = i + 1
-    while (j < f.length && f[j].tag !== '#text') j++
-    const name = j < f.length ? f[j].text : ''
-    // 在整棵树里找带 data-dy-groupbtn 的按钮，用它的 toggle 闭包区分子组
-    // （该按钮的 onClick 是这一组自己的；面板只有两个折叠组，按出现顺序配给
-    //   「出问题才看」「一次配好」）
-    out.push({ name })
-  })
-  const btns = f.filter((n) => n.tag === 'button' && n.props && 'data-dy-groupbtn' in n.props)
-  // 折叠组按钮按文档顺序出现，且只属于可折叠的两组
-  let bi = 0
-  for (const g of out) {
-    if (g.name === '出问题才看' || g.name === '一次配好') g.btn = btns[bi++] || null
-    else g.btn = null
-  }
-  return out
-}
-
-/** 把还没展开的折叠组点开（幂等；最多 4 轮，防手滑写出死循环） */
-const openAllGroups = async (why) => {
-  for (let round = 0; round < 4; round++) {
-    hookIdx = 0
-    const t = render(React.createElement(Registered, {}))
-    await flush()
-    const f = walk(t)
-    const closed = groupInfo(f).filter((g) => g.btn && g.btn.props['data-open'] === undefined)
-    if (!closed.length) return t
-    try {
-      closed[0].btn.props.onClick({ target: { value: '' } })
-    } catch (e) {
-      console.log(`  ❌ 点开组「${closed[0].name}」抛错：${e?.message ?? e}`); fail++
-      return t
-    }
-    await flush()
-  }
-  console.log(`  ❌ 折叠组点不开（${why}）`); fail++
-  return render(React.createElement(Registered, {}))
-}
-
-/** 展开后重新取树 / 拍平 / 拼全文 */
-const expandAndFlatten = async (why) => {
-  const t = await openAllGroups(why)
-  const f = walk(t)
-  return { tree: t, flat: f, text: f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ') }
-}
-
-/* ── ① 默认状态：三个组标题都在，组 ②③ 收着 ── */
-console.log('【折叠组 · 默认收起】')
-{
-  const gi = groupInfo(flat)
-  const names = gi.map((g) => g.name)
-  for (const want of ['常开必看', '出问题才看', '一次配好']) {
-    if (names.includes(want)) console.log(`  ✅ 有组标题「${want}」`)
-    else { console.log(`  ❌ 缺组标题「${want}」（实际：${JSON.stringify(names)}）`); fail++ }
-  }
-  const folds = gi.filter((g) => g.btn)
-  if (folds.length === 2) console.log('  ✅ 「出问题才看」「一次配好」两个组可折叠')
-  else { console.log(`  ❌ 可折叠组应为 2 个，实际 ${folds.length}`); fail++ }
-  const opened = folds.filter((g) => g.btn.props['data-open'] !== undefined)
-  if (!opened.length) console.log('  ✅ 两个折叠组默认都是收起的')
-  else { console.log(`  ❌ 这些组默认就展开了：${opened.map((g) => g.name).join('、')}`); fail++ }
-  // 收起时：组 ①的三张卡在，组 ②③ 的内容不在（这才是"收起来了"）
-  const cardsNow = flat.filter((n) => n.props && 'data-dy-card' in n.props).length
-  if (cardsNow === 3) console.log('  ✅ 收起时只有「常开必看」那 3 张卡')
-  else { console.log(`  ❌ 收起时卡片数应为 3，实际 ${cardsNow}`); fail++ }
-  for (const hidden of ['检查环境', '刷什么', '看看谁找我']) {
-    if (!allText.includes(hidden)) console.log(`  ✅ 收起时看不到「${hidden}」（在折叠组里）`)
-    else { console.log(`  ❌ 收起时仍然显示了「${hidden}」—— 折叠没生效`); fail++ }
-  }
-}
-
-/* ── ② 点开两个折叠组 → 全展开，后面所有断言都在这个状态上跑 ── */
-console.log('\n【折叠组 · 点开之后】')
-{
-  const r = await expandAndFlatten('默认收起状态')
-  tree = r.tree; flat = r.flat; allText = r.text
-  const cards = flat.filter((n) => n.props && 'data-dy-card' in n.props)
-  if (cards.length === 7) console.log('  ✅ 展开后正好 7 张 data-dy-card（顶层卡片）')
-  else { console.log(`  ❌ 展开后顶层卡片应为 7 张，实际 ${cards.length}`); fail++ }
-  const groups = flat.filter((n) => n.props && 'data-dy-group' in n.props)
-  if (groups.length === 3) console.log('  ✅ 3 个组标题（常开必看 / 出问题才看 / 一次配好）')
-  else { console.log(`  ❌ 组标题应为 3 个，实际 ${groups.length}`); fail++ }
-  // 组标题自己不是卡（卡片计数才是 7）
-  const groupAsCard = flat.filter((n) => n.props && 'data-dy-group' in n.props && 'data-dy-card' in n.props)
-  if (!groupAsCard.length) console.log('  ✅ 组标题不算卡片（用的是 data-dy-group，不是 data-dy-card）')
-  else { console.log('  ❌ 组标题被标成了卡片 —— 卡片数会不准'); fail++ }
-  // 七张卡的关键文案：一个功能都不许丢
-  for (const [label, re] of [
-    ['卡①开始使用', /开始使用/],
-    ['卡②刷抖音', /现在跑一轮/],
-    ['卡③自动发送（含私信对象 / 评论区@你 / 聊天模式）', /自动发送[\s\S]*私信发给谁|私信发给谁/],
-    ['卡④出问题了？', /出问题了？/],
-    ['卡⑤刷抖音的策略', /刷抖音的策略/],
-    /* 🔴 2026-10-26 主人：「补充人设那一栏只要一个标题就行了，就叫做人设」
-     *    ⇒ 卡片标题 = 「人设」；里面**不再重复**一个「补充人设」小标题
-     *      （主人明确说"不要有两个"），所以这里断言卡片标题是「人设」，
-     *      并反向断言旧的那个重复标题不许回来。 */
-    ['卡⑥人设（联动桌宠开关已隐藏）', /人设/],
-    ['卡⑦消息与记忆', /消息与记忆/],
-  ]) {
-    if (re.test(allText)) console.log(`  ✅ ${label}`)
-    else { console.log(`  ❌ ${label} 不在展开后的面板里`); fail++ }
-  }
-  // 反向断言：被主人点掉的那个开关不许重新冒出来
-  if (/联动桌宠/.test(allText)) { console.log('  ❌ 「联动桌宠」开关又出现在面板上了 —— 主人 2026-10-26 要求暂时不要出现'); fail++ }
-  else console.log('  ✅ 「联动桌宠」开关按主人要求暂时隐藏（HIDE_PET_LINK）')
-}
-
-console.log('\n【没登录时】—— 新手看到的第一屏')
-const firstRunMust = [
-  ['开始使用', /开始使用/],
-  ['进度：还差两步', /还差\s*两步/],
-  ['第①步：装环境', /装运行环境/],
-  ['第②步：扫码登录按钮', /扫码登录/],
-  ['扫码提示（手机抖音 → 扫一扫）', /扫一扫|扫码/],
-  ['出问题？体检入口', /出问题了？/],
-]
-for (const [label, re] of firstRunMust) {
-  if (re.test(allText)) console.log(`  ✅ ${label}`)
-  else { console.log(`  ❌ ${label} —— 找不到 ${re}`); fail++ }
-}
-if (/node tools\/qr-login\.mjs/.test(allText)) {
-  console.log('  ❌ 面板里还在让用户敲命令行 —— 新手走不到')
-  fail++
-} else console.log('  ✅ 面板里没有"自己去敲命令行"的登录指引')
-
-/* ── 点「扫码登录」：应该出二维码 ── */
-const findBtnIn = (f, label) => f.find((n) => n.tag === 'button' &&
-  String([].concat(n.props?.children ?? []).flat(Infinity).join('')).includes(label))
-
-const clickIn = async (f, label) => {
-  const btn = findBtnIn(f, label)
-  if (!btn) { console.log(`  ❌ 找不到按钮「${label}」`); fail++; return null }
-  try {
-    await btn.props.onClick({ target: { value: '' } })
-  } catch (e) { console.log(`  ❌ 点「${label}」抛错：${e?.message ?? e}`); fail++; return null }
-  await flush()
-  const t = await renderNow()
-  return walk(t)
-}
-
-console.log('\n【点「扫码登录」】')
-flat = await clickIn(flat, '扫码登录')
-if (flat) {
-  const txt = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-  const img = flat.find((n) => n.tag === 'img' && n.props && n.props['data-dy-qr'] !== undefined)
-  if (img) console.log('  ✅ 二维码图片出来了')
-  else { console.log('  ❌ 点完没有二维码图片'); fail++ }
-  if (/我扫完了/.test(txt)) console.log('  ✅ 有「我扫完了」按钮')
-  else { console.log('  ❌ 没有「我扫完了」'); fail++ }
-  if (/重新出码/.test(txt)) console.log('  ✅ 有「重新出码」')
-  else { console.log('  ❌ 没有「重新出码」'); fail++ }
-  if (/短信验证码/.test(txt) && /滑块/.test(txt)) console.log('  ✅ 提前说明了可能要过短信/滑块')
-  else { console.log('  ❌ 没提短信/滑块验证 —— 新手会以为扫失败'); fail++ }
-}
-
-/* ── 点「我扫完了」：登录成功 → 面板切成已登录 ── */
-console.log('\n【点「我扫完了」】')
-flat = await clickIn(flat, '我扫完了')
-if (flat) {
-  const txt = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-  if (/登录成功/.test(txt)) console.log('  ✅ 提示登录成功')
-  else { console.log('  ❌ 没说登录成功'); fail++ }
-}
-
-/* ── 已登录状态：确认另一条路也画得出来 ── */
-state.loggedIn = true
-state.venvReady = true
-/**
- * ⭐ 这里必须**重新挂载**（清空 hooks）而不是只重渲染：
- *    面板的 st/cfg 是 useState 里的状态，只换 mock 数据不会自己变。
- *    清空 hooks ⇒ 重新跑 useEffect ⇒ 重新 fetch ⇒ 拿到新状态。
- *    （真实场景里对应"关掉设置页再打开"或 login 成功后的 refresh()）
- */
-hooks = []
-tree = render(React.createElement(Registered, {}))
-// useEffect 里的 fetch 是异步的：多冲几次让 Promise 链走完，否则只看到"读设置中…"
-for (let i = 0; i < 6; i++) {
-  await new Promise((r) => setTimeout(r, 0))
-  tree = await renderNow()
-}
-// ⭐ 重新挂载会把折叠状态重置成"收起"（这正是真实用户重新打开设置页的样子）——
-//    后面要验的按钮都在折叠组里，所以先点开（openAllGroups 是幂等的）。
-{
-  const opened = await expandAndFlatten('已登录重新挂载后')
-  tree = opened.tree
-}
-flat = walk(tree)
-allText = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-
-console.log('\n【已登录时】')
-if (/已登录，可以刷了/.test(allText)) console.log('  ✅ 显示"已登录，可以刷了"')
-else { console.log('  ❌ 已登录状态没显示'); fail++ }
-if (/都装好了/.test(allText)) console.log('  ✅ 显示"都装好了"')
-else { console.log('  ❌ 没显示就绪'); fail++ }
-if (flat.find((n) => n.tag === 'img' && n.props && n.props['data-dy-qr'] !== undefined)) {
-  console.log('  ❌ 已登录了还在显示二维码'); fail++
-} else console.log('  ✅ 已登录时不显示二维码')
-
-const must = [
-  ['状态卡：刷抖音标题', /刷抖音/],
-  ['现在跑一轮按钮', /现在跑一轮/],
-  ['刷什么（关键词）', /刷什么/],
-  ['什么时候自己跑', /什么时候自己跑/],
-  ['中午谷时', /中午谷时/],
-  ['晚上谷时', /晚上谷时/],
-  ['自定义时段', /自定义时段/],
-  ['自定义时段里的时间输入框', /09:00/],
-  ['+ 加一个时段', /\+ 加一个时段/],
-  ['保存时段', /保存时段/],
-  ['给别的 AI 用', /给别的 AI 用/],
-  ['MCP 配置说明', /MCP server/],
-  ['关于 / 检查更新', /检查更新/],
-  ['版本号', /v9\.9\.9/],
-]
-
-console.log(`\n渲染了 ${renders} 次状态更新，元素树 ${flat.length} 个节点\n`)
-for (const [label, re] of must) {
-  if (re.test(allText)) console.log(`  ✅ ${label}`)
-  else { console.log(`  ❌ ${label} —— 渲染结果里找不到 ${re}`); fail++ }
-}
-
-// 结构检查：卡片数量、时间输入框数量
-const cards = flat.filter((n) => n.props && 'data-dy-card' in n.props)
-const timeInputs = flat.filter((n) => n.tag === 'input' && n.props && n.props.type === 'time')
-console.log(`\n卡片 ${cards.length} 个 / 时间输入框 ${timeInputs.length} 个`)
-if (cards.length < 6) { console.log('  ❌ 卡片少于 6 块，可能有一块没渲染出来'); fail++ }
-else console.log('  ✅ 卡片齐全')
-if (timeInputs.length !== 2) { console.log(`  ❌ 时间输入框应为 2 个（一个时段），实际 ${timeInputs.length}`); fail++ }
-else console.log('  ✅ 一个自定义时段 = 两个时间输入框')
-
-// 事件处理器检查：所有 onClick 必须是函数（写错成 onClick: foo() 会立刻执行）
-const badHandlers = flat.filter((n) => n.props && 'onClick' in n.props && typeof n.props.onClick !== 'function')
-if (badHandlers.length) { console.log(`  ❌ ${badHandlers.length} 个 onClick 不是函数`); fail++ }
-else console.log('  ✅ 所有 onClick 都是函数')
-
-/* ── 点一遍按钮：光"能显示"不够，按钮真跑起来也得不出错 ──
- * 这一段把三个异步动作真的 await 一遍：
- *   ① 检查更新  ② 看接入方式（MCP）  ③ 看报告
- * 每个按钮的 onClick 直接调，不用模拟事件 —— 我们要验的是**数据回来之后能不能渲染**。
- */
-const findBtn = (label) => flat.find((n) => n.tag === 'button' &&
-  String(([].concat(n.props?.children ?? []).flat(Infinity).join(''))).includes(label))
-
-const clickAndRender = async (label) => {
-  const btn = findBtn(label)
-  if (!btn) { console.log(`  ❌ 找不到按钮「${label}」`); fail++; return }  try {
-    await btn.props.onClick({ target: { value: '' } })
-  } catch (e) {
-    console.log(`  ❌ 点「${label}」抛错：${e?.message ?? e}`); fail++; return
-  }
-  await flush()
-  hookIdx = 0
-  const t = render(React.createElement(Registered, {}))
-  await flush()
-  const f = walk(t)
-  const txt = f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-  console.log(`  ✅ 点「${label}」没抛错，渲染 ${f.length} 节点`)
-  return { tree: t, flat: f, text: txt }
-}
-
-console.log('\n点按钮实测：')
-const rUpdate = await clickAndRender('检查更新')
-if (rUpdate) {
-  if (/已是最新版|有新版本|查不到最新版本/.test(rUpdate.text)) console.log('  ✅ 检查更新结果渲染出来了')
-  else { console.log('  ❌ 检查更新后没有结果文案'); fail++ }
-}
-const rAi = await clickAndRender('看接入方式')
-if (rAi) {
-  if (/mcpServers/.test(rAi.text)) console.log('  ✅ MCP 配置渲染出来了')
-  else { console.log('  ❌ 看接入方式后没有 MCP 配置'); fail++ }
-  if (/复制 MCP 配置/.test(rAi.text)) console.log('  ✅ 有复制按钮')
-  else { console.log('  ❌ 没有复制按钮'); fail++ }
-}
-const rRep = await clickAndRender('看今天的报告')
-if (rRep) {
-  if (/7401234567890123401/.test(rRep.text)) console.log('  ✅ 报告内容渲染出来了')
-  else { console.log('  ❌ 报告没渲染出来'); fail++ }
-}
-const rDoc = await clickAndRender('检查环境')
-if (rDoc) {
-  if (/检查完|环境/.test(rDoc.text)) console.log('  ✅ 环境体检结果渲染出来了')
-  else { console.log('  ❌ 体检结果没渲染'); fail++ }
-}
-
-/* ── 私信对象：点「从我的会话里选」应该列出人，点人能选中 ── */
-console.log('\n【私信发给谁】')
-const rPeople = await clickAndRender('从我的会话里选')
-if (rPeople) {
-  if (/测试好友/.test(rPeople.text)) console.log('  ✅ 列出会话里的人')
-  else { console.log('  ❌ 没列出会话里的人'); fail++ }
-  if (/重名/.test(rPeople.text)) console.log('  ✅ 同名的人标了「重名」')
-  else { console.log('  ❌ 同名没标出来'); fail++ }
-  // ⚠️ 人的名字在**子节点**里（不是按钮自己的 children 文本），要查整棵子树
-  const personBtn = rPeople.flat.find((n) => n.tag === 'button' && n.props && n.props['data-dy-person'] !== undefined)
-  if (personBtn) {
-    try {
-      await personBtn.props.onClick()
-      await flush()
-      const f = walk(await renderNow())
-      const txt = f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-      // 0.5.5：点人 = 加进 dmPeers 列表（不再是"已选"单选）
-      if (/已在列表|加进私信对象|已把/.test(txt)) console.log('  ✅ 点人能加进私信对象列表（0.5.5 多人）')
-      else { console.log('  ❌ 点人没加进列表'); fail++ }
-    } catch (e) { console.log(`  ❌ 点人抛错：${e?.message ?? e}`); fail++ }
-  } else { console.log('  ❌ 找不到可点的人'); fail++ }
-}
-
-/* ── 「怎么用？」应该能展开新手流程 ── */
-console.log('\n【怎么用？】')
-const rGuide = await clickAndRender('怎么用？')
-if (rGuide) {
-  if (/新手流程/.test(rGuide.text) && /扫码登录/.test(rGuide.text)) console.log('  ✅ 展开了新手流程说明')
-  else { console.log('  ❌ 没展开说明'); fail++ }
-}
-
-/* ── 登录后要显示账号 ── */
-console.log('\n【登录后显示账号】')
-if (/测试账号昵称/.test(allText)) console.log('  ✅ 显示了登录的账号昵称')
-else { console.log('  ❌ 没显示账号昵称 —— 用户不知道在给谁刷'); fail++ }
-if (/9999000011112222/.test(allText)) { console.log('  ❌ 还显示了账号 ID —— 用户说只要昵称就行'); fail++ }
-else console.log('  ✅ 只显示昵称，不显示 ID')
-
-/* ── 私信对象：手动加人（0.5.5 按钮改名「手动加一个」） ── */
-console.log('\n【私信对象：手动加】')
-const rManual = await clickAndRender('手动加一个')
-if (rManual) {
-  const nickInput = rManual.flat.find((n) => n.tag === 'input' && n.props && String(n.props.placeholder || '').includes('示例好友'))
-  const idInput = rManual.flat.find((n) => n.tag === 'input' && n.props && String(n.props.placeholder || '').includes('MS4wLjABAAAA'))
-  if (nickInput) console.log('  ✅ 有昵称输入框')
-  else { console.log('  ❌ 没有昵称输入框'); fail++ }
-  if (idInput) console.log('  ✅ 有稳定 ID 输入框（可留空）')
-  else { console.log('  ❌ 没有稳定 ID 输入框'); fail++ }
-}
-
-/* ── 补回来的功能：每天几条 / 日报多细 / 通知方式 ── */
-console.log('\n【每天挑几条 / 日报 / 通知】')
-const r10 = await renderNow()
-const flatAll = walk(r10)
-const txtAll = flatAll.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-for (const [label, re] of [
-  ['每天挑几条', /每天挑几条/],
-  ['日报详细程度', /日报写多细/],
-  ['通知方式', /通知：/],
-]) {
-  if (re.test(txtAll)) console.log(`  ✅ ${label}`)
-  else { console.log(`  ❌ 缺「${label}」`); fail++ }
-}
-const selects = flatAll.filter((n) => n.tag === 'select')
-if (selects.length >= 2) console.log(`  ✅ ${selects.length} 个下拉框`)
-else { console.log(`  ❌ 下拉框只有 ${selects.length} 个`); fail++ }
-
-/* ── 我的人设：能写、能存，而且**要说清现在用的是哪一份** ──
-   历程（别改回去）：
-     · 2026-10-25 主人说「插件面板人设跟人格重合了」→ 曾改名「补充人设（可选）」
-     · 2026-10-26 主人说「只要一个标题，就叫做人设」→ 去掉重复小标题
-     · 2026-10-26 主人说「人设是不是该改成我的人设」+「默认的是不是有问题」
-       ⇒ 标题定型为「我的人设」；并且后端开始返回 effective/effective_label，
-         面板必须**明确说出当前生效的是哪一份**（自己写 / 插件自带 / 中性默认）。
-       原因：以前只读自己那份，没写就空框 + 提示"用的是默认"，
-       而实际生效的是插件自带那份 16970 字节的完整人设 —— 面板在说谎。 */
-console.log('\n【我的人设】')
-const rPersona = await clickAndRender('展开')
-if (rPersona) {
-  const ta = rPersona.flat.find((n) => n.tag === 'textarea')
-  if (ta) console.log('  ✅ 人设文本框出来了')
-  else { console.log('  ❌ 人设文本框没出来'); fail++ }
-  // 三种来源说法都要被识别（后端 effective_label 给的就是这些词）
-  if (/正在用你写的|插件自带的那份|中性默认/.test(rPersona.text)) console.log('  ✅ 说明了当前用的是哪一份（自己写/插件自带/中性默认）')
-  else { console.log('  ❌ 没说当前用哪份'); fail++ }
-}
-
-/* ── 对话记忆 ── */
-console.log('\n【对话记忆】')
-const rMem = await clickAndRender('看记忆')
-if (rMem) {
-  if (/私信记忆 2 个人/.test(rMem.text) && /评论区记忆 1 条视频/.test(rMem.text)) {
-    console.log('  ✅ 显示了记忆统计')
-  } else { console.log('  ❌ 记忆统计没显示'); fail++ }
-  if (/清空全部记忆/.test(rMem.text)) console.log('  ✅ 有「清空全部记忆」按钮')
-  else { console.log('  ❌ 没有清空按钮'); fail++ }
-}
-
-/* ── 消息：评论区 @ 我 + 谁私信我 ── */
-console.log('\n【消息（收件箱）】')
-const rInbox = await clickAndRender('看看谁找我')
-if (rInbox) {
-  if (/评论区 @ 我：2 条/.test(rInbox.text)) console.log('  ✅ 显示评论区 @ 的数量')
-  else { console.log('  ❌ 没显示 @ 数量'); fail++ }
-  if (/出来一下/.test(rInbox.text)) console.log('  ✅ 列出 @ 我的内容')
-  else { console.log('  ❌ 没列出 @ 内容'); fail++ }
-  if (/我之前在这说过一句/.test(rInbox.text)) console.log('  ✅ 带上了"我在这条视频下说过什么"（记忆）')
-  else { console.log('  ❌ 没带"我说过什么"'); fail++ }
-  if (/该回了/.test(rInbox.text)) console.log('  ✅ 私信标了「该回了」')
-  else { console.log('  ❌ 私信没标该不该回'); fail++ }
-  if (/记 11/.test(rInbox.text)) console.log('  ✅ 显示跟这个人记得多少条')
-  else { console.log('  ❌ 没显示记忆条数'); fail++ }
-}
-
-/* ── 聊天模式（带记忆） ── */
-console.log('\n【聊天模式】')
-/**
- * ⚠️ 这里不能复用 clickAndRender：它内部用的 `flat` 是**初次渲染**那棵树，
- *    收件箱是后面点出来的，节点在 rInbox.flat 里。
- *    ⚠️ 而且 rInbox.flat 里**也包含**「私信发给谁」那张卡的人（也带 data-dy-person），
- *       点那个只会"选中收件人"，不会打开聊天 ⇒ 用 `data-dy-inbox-dm` 精确区分。
- */
-const chatPersonBtn = (rInbox ? rInbox.flat : []).find((n) =>
-  n.tag === 'button' && n.props && n.props['data-dy-inbox-dm'] !== undefined)
-let rChat = null
-if (chatPersonBtn) {
-  try {
-    await chatPersonBtn.props.onClick()
-  } catch (e) { console.log(`  ❌ 点人抛错：${e?.message ?? e}`); fail++ }
-  await flush()
-  // 连渲染几次，让 openChat 里的 await jpost → setChat 走完
-  for (let i = 0; i < 4; i++) {
-    await new Promise((r) => setTimeout(r, 0))
-    hookIdx = 0
-    const t = render(React.createElement(Registered, {}))
-    await flush()
-    const f = walk(t)
-    const txt = f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-    if (/跟 .+ 聊/.test(txt)) { rChat = { flat: f, text: txt }; break }
-  }
-  if (rChat) console.log('  ✅ 点人能打开聊天')
-  else { console.log('  ❌ 点了人但聊天界面没出来'); fail++ }
-} else { console.log('  ❌ 找不到可点的私信人'); fail++ }
-if (rChat) {
-  if (/跟 测试好友 聊/.test(rChat.text)) console.log('  ✅ 打开了聊天界面')
-  else { console.log('  ❌ 没打开聊天界面'); fail++ }
-  if (/记得关于他的：喜欢猫、在杭州/.test(rChat.text)) console.log('  ✅ 显示了记忆里的长期事实')
-  else { console.log('  ❌ 没显示记忆事实'); fail++ }
-  const bubbles = rChat.flat.filter((n) => n.props && n.props['data-dy-bubble'] !== undefined)
-  if (bubbles.length >= 3) console.log(`  ✅ 渲染了 ${bubbles.length} 条消息气泡`)
-  else { console.log(`  ❌ 消息气泡只有 ${bubbles.length} 条`); fail++ }
-  const mineB = rChat.flat.find((n) => n.props && n.props['data-dy-bubble'] !== undefined && n.props['data-mine'] !== undefined)
-  const themB = rChat.flat.find((n) => n.props && n.props['data-dy-bubble'] !== undefined && n.props['data-them'] !== undefined)
-  if (mineB && themB) console.log('  ✅ 我的和他的气泡分开了')
-  else { console.log('  ❌ 气泡没区分谁发的'); fail++ }
-  const input = rChat.flat.find((n) => n.tag === 'input' && n.props && String(n.props.placeholder || '').includes('说点什么'))
-  if (input) console.log('  ✅ 有输入框')
-  else { console.log('  ❌ 没有输入框'); fail++ }
-  if (/分享卡片/.test(rChat.text)) console.log('  ✅ 分享卡片有标记')
-  else { console.log('  ❌ 卡片没标记'); fail++ }
-}
-
-/* ── 自动发送开关 ── */
-console.log('\n【自动发送开关】')
-if (/自动发送/.test(allText) && /会自动发|只写报告/.test(allText)) console.log('  ✅ 有自动发送开关卡片')
-else { console.log('  ❌ 没有自动发送开关'); fail++ }
-// ⭐ 2026-10-22 用户明确要求：默认就是发。所以已登录状态下应该显示"会自动发"
-if (/会自动发/.test(allText)) console.log('  ✅ 默认显示"会自动发"')
-else { console.log('  ❌ 默认状态不对（应该是"会自动发"）'); fail++ }
-if (/只管「插件自己在后台跑的轮次」/.test(allText)) console.log('  ✅ 说清了适用范围（只管后台轮次）')
-else { console.log('  ❌ 没说清适用范围'); fail++ }
-// 卡片位置（🔴 2026-10-24 主人令新顺序：开始使用置顶 → 刷抖音 → 自动发送 → 评论区@我）
-{
-  const iStart = allText.indexOf('开始使用')
-  const iAuto = allText.indexOf('自动发送')
-  // iStart=-1 才算"没有开始使用卡"；=0 正是置顶成功
-  if (iStart >= 0 && iAuto > iStart) console.log('  ✅ 「开始使用」置顶、自动发送在其后（新顺序）')
-  else { console.log(`  ❌ 卡片顺序不对（开始使用@${iStart} 自动发送@${iAuto}）—— 开始使用应置顶`); fail++ }
-}
-
-/* ── 「评论区 @ 提醒」（0.5.8：没有开关，选人即开、清掉即关） ── */
-console.log('\n【评论区 @ 提醒】')
-if (/评论区 @ 提醒/.test(allText)) console.log('  ✅ 有「评论区 @ 提醒」区块（0.5.8 无开关设计）')
-else { console.log('  ❌ 没有「评论区 @ 提醒」'); fail++ }
-if (/总闸关着 —— 选了人也不 @/.test(allText)) console.log('  ✅ 开关关闭态说明清楚了（0.5.9 总闸+多选）')
-else { console.log('  ❌ 开关关闭态没说明'); fail++ }
-// 位置：必须在「自动发送」之后
-{
-  const iSend = allText.indexOf('自动发送')
-  const iAtMe = allText.indexOf('评论区 @ 提醒')
-  if (iSend >= 0 && iAtMe > iSend) console.log('  ✅ 位置正确（自动发送下面）')
-  else { console.log(`  ❌ 位置不对（自动发送@${iSend} 评论区@提醒@${iAtMe}）`); fail++ }
-}
-
-/* ── 🔴 群聊限制必须写在明面上（主人 2026-10-26：「不在选项上说清吗」） ──
- *    以前只藏在 hover 的 title 小字里 ⇒ 选了群也不知道发不出去。
- *    现在：① 群标签写「只能看不能发」② 选了群就出现一条黄条说明。 */
-console.log('\n【群聊限制（明写，不藏 hover）】')
-{
-  // ① 源码里必须有那条黄条（渲染检查读的是源码文案）
-  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
-  if (/可能发不出/.test(src)) console.log('  ✅ 群标签写明「可能发不出」（不把一次观察说成铁律）')
-  else { console.log('  ❌ 群标签没写「可能发不出」'); fail++ }
-  // ⚠️ 措辞要求：大白话、短句 —— 主人 2026-10-26 令「你这么说谁看得懂，简单点」
-  if (/群里可能发不出消息/.test(src) && /手机端正常/.test(src)) {
-    console.log('  ✅ 面板用大白话说清「群里可能发不出消息，手机端正常」')
-  } else { console.log('  ❌ 面板没用大白话（要写「群里可能发不出消息」「手机端正常」）'); fail++ }
-  // ⚠️ 主人 2026-10-26 令：「不要说这么绝对，要说可能，你又没用别的号试过」
-  if (/在我这个号上试的|别的号不一定/.test(src)) {
-    console.log('  ✅ 面板注明「只在一个号上试过，别的号不一定」')
-  } else { console.log('  ❌ 面板没注明测试范围（别把一次观察说成铁律）'); fail++ }
-  if (/7523|服务端收下|渠道限制/.test(src)) {
-    console.log('  ⚠️ 面板还留着行话（7523 / 服务端收下 / 渠道限制）—— 主人嫌绕，建议再删')
-  } else console.log('  ✅ 面板没有行话（7523 那些只留在文档里）')
-  // ② 选中群之后必须真的渲染出那条黄条
-  //    （会话列表要先点「从我的会话里选」才加载出来；群名在按钮的**子节点**里）
-  await clickAndRender('从我的会话里选')
-  const gFlat = walk(await renderNow())
-  const gBtn = gFlat.find((n) => n.tag === 'button' && n.props && n.props['data-dy-person'] !== undefined
-    && /测试群聊/.test(textOf(n, gFlat)))
-  if (!gBtn) {
-    console.log('  ❌ 会话列表里找不到群（假数据里得有群才测得了）'); fail++
-  } else {
-    try {
-      await gBtn.props.onClick({ target: { value: '' } })
-      await flush()
-      const gf = walk(await renderNow())
-      const gtxt = gf.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
-      if (/群里可能发不出消息/.test(gtxt) && /手机端正常/.test(gtxt)) {
-        console.log('  ✅ 选中群后，面板上出现群聊限制说明（不是藏起来的）')
-      } else {
-        console.log('  ❌ 选中群后没看到限制说明（提示被藏起来了）'); fail++
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: { ...(props || {}), children: children.flat(Infinity) } }),
+    useState(initial) {
+      const i = cursor++, host = current
+      if (!(i in host.hooks)) host.hooks[i] = typeof initial === 'function' ? initial() : initial
+      return [host.hooks[i], (value) => { host.hooks[i] = typeof value === 'function' ? value(host.hooks[i]) : value; dirty = true }]
+    },
+    useRef(initial) {
+      const i = cursor++
+      if (!(i in current.hooks)) current.hooks[i] = { current: initial }
+      return current.hooks[i]
+    },
+    useEffect(fn, deps) {
+      const i = cursor++, host = current, before = host.hooks[i]
+      if (!before || !deps || deps.some((value, index) => !Object.is(value, before.deps?.[index]))) {
+        effects.push(() => { before?.cleanup?.(); const cleanup = fn(); host.hooks[i] = { deps, cleanup } })
       }
-    } catch (e) { console.log(`  ❌ 点群抛错：${e?.message ?? e}`); fail++ }
+    },
+    Component: class { constructor(props) { this.props = props; this.state = {} } setState(next) { Object.assign(this.state, next); dirty = true } },
   }
+  const document = {
+    createElement: () => ({ style: {}, setAttribute() {}, appendChild() {}, select() {}, remove() {} }),
+    head: { appendChild() {} }, body: { appendChild() {} }, querySelector: () => null, execCommand: () => true,
+  }
+  const navigator = { clipboard: { writeText: async (text) => copies.push(text) } }
+  const fetch = async (address, opts = {}) => {
+    const url = new URL(address, 'http://fixture.local'), path = url.pathname.replace('/api/douyin-duty', '')
+    const method = opts.method || 'GET', body = opts.body ? JSON.parse(opts.body) : null
+    calls.push({ path, query: url.search, method, body })
+    let response
+    if (path === '/config') {
+      if (method === 'POST') {
+        if (data.configError) throw new Error('设置写入失败')
+        const { __clearKeys, ...patch } = body
+        config = { ...config, ...patch }
+      }
+      response = { ok: true, config: clone(config) }
+    } else if (path === '/status') {
+      if (data.statusError) throw new Error('读取设置失败')
+      response = { ok: true, version: '9.9.9', home: 'H:/dy', ...state, counts: data.counts, pickedToday: data.counts.total, report: 'H:/dy/out/today.md', nextWindow: { startsAt: EPOCH + 86_400_000, endsAt: EPOCH + 90_000_000, label: '中午' } }
+    } else if (path === '/progress') {
+      if (data.progressError) throw new Error('状态读取失败')
+      response = { ok: true, round: clone(data.round), counts: data.counts, running: data.running ?? ['preparing', 'running', 'unknown'].includes(data.round.phase), report: { exists: true, stamp: data.reportStamp }, ...(url.searchParams.has('log') ? { tail: data.tail } : {}) }
+      if (data.progress) response = await data.progress(clone(response))
+    } else if (path === '/report') {
+      if (data.reportError) throw new Error('结果读取失败')
+      response = clone(data.reports[url.searchParams.get('scope') || 'today'])
+    } else if (path === '/persona') {
+      if (method === 'POST') data.persona = { ...data.persona, text: body.text, custom: Boolean(body.text.trim()), effective_label: body.text ? '我写的人设' : '插件自带的那份' }
+      response = data.persona
+    } else if (path === '/run') response = typeof data.run === 'function' ? await data.run(body) : data.run
+    else if (path === '/comment/reply') response = typeof data.reply === 'function' ? await data.reply(body) : data.reply
+    else if (path === '/comment/ai-reply') {
+      if (method === 'POST') {
+        response = typeof data.commentAI === 'function' ? await data.commentAI(body) : data.commentAI || {ok:true,job:{id:'comment-job-one',status:'sent',done:true,sent:true,text:'DSH 评论回复'}}
+        if (response?.job) data.commentJob = response.job
+      } else {
+        if (data.commentStatusError) throw new Error('状态暂不可用')
+        response = {ok:true,job:data.commentJob || null}
+      }
+    }
+    else if (path === '/inbox') response = typeof data.inbox === 'function' ? await data.inbox(url.searchParams.get('scope')) : data.inbox
+    else if (path === '/account') response = { ok: true, logged_in: state.loggedIn, account: state.loggedIn ? { nick: '测试账号昵称', uid: '9999000011112222' } : null }
+    else if (path === '/install' || path === '/environment/repair') {
+      if (path === '/environment/repair' && data.install404) return { ok: false, status: 404, json: async () => ({ ok: false }) }
+      response = typeof data.installStart === 'function' ? await data.installStart(body) : data.installStart
+      if (response.ok && (response.started || response.busy || response.install?.phase === 'running')) {
+        state.installing = true; state.install = response.install || { phase: 'running' }
+      }
+    }
+    else if (path === '/login/qr') {
+      response = typeof data.qr === 'function' ? await data.qr(body) : data.qr
+      if (response.ok && response.already_logged_in) state.loggedIn = true
+    }
+    else if (path === '/login/check' || path === '/login/wait') { state.loggedIn = true; response = { ok: true } }
+    else if (path === '/login/clear') { state.loggedIn = false; response = { ok: true } }
+    else if (path === '/login/close') response = { ok: true }
+    else if (path === '/guide') {
+      if (data.guideError) throw new Error('说明读取失败')
+      response = { ok: true, text: '# 新手流程\n\n1. 装环境\n2. 扫码登录\n3. 跑一轮' }
+    }
+    else if (path === '/doctor') response = typeof data.doctor === 'function' ? await data.doctor(body) : data.doctor
+    else if (path === '/dm/people') response = { ok: true, people: [
+      { nick: '测试好友', sec_uid: 'MS4wLjABAAAA_test1', preview: '最近聊过', has_id: true },
+      { nick: '另一个朋友', sec_uid: 'MS4wLjABAAAA_test2', duplicate: true, preview: '好的', has_id: true },
+      { nick: '测试群聊', sec_uid: '', is_group: true, preview: '群里在说话' },
+    ], hint: '重名时看最近消息区分' }
+    else if (path === '/chat/read') response = data.chatRead || { ok: true, to: body.to, to_sec_uid: body.to_id,
+      messages: [{ from: 'me', text: '爱你哟。' }, { from: 'them', text: '我也爱你' }, { from: 'unknown', text: '无法确认方向', awe: 800 }], context: { facts: ['喜欢猫', '在杭州'] } }
+    else if (path === '/chat/send') response = { ok: true, sent: true }
+    else if (path === '/chat/reply') {
+      if (method === 'POST') {
+        if (data.aiReply) response = await data.aiReply(body)
+        else { data.aiJob = { id: 'job-one', status: 'sent', done: true, sent: true, text: 'DSH 生成的回复' }; response = { ok: true, job: data.aiJob } }
+      } else {
+        if (data.aiStatusError) throw new Error('暂时断线')
+        response = { ok: true, job: data.aiJob || null }
+      }
+    }
+    else if (path === '/chat/fix') response = { ok: true, human: '检查完成' }
+    else if (path === '/memory') response = { ok: true, stats: { dm: 2, comment: 1, bytes: 4096 } }
+    else if (path === '/memory/clear') response = { ok: true, stats: { dm: 0, comment: 0, bytes: 0 } }
+    else if (path === '/update') response = { ok: true, current: '9.9.9', latest: '9.9.9', checked: true, hasUpdate: false, source: 'npm registry', tried: [] }
+    else if (path === '/ai-usage') response = { ok: true, doc: '# 接入说明', mcp: { exists: true, server: 'H:/dy/tools/mcp-server.mjs', selfTest: 'node mcp-server.mjs --selftest', configText: '{"mcpServers":{}}' } }
+    else if (path === '/chat/watch') response = { ok: true, health: 'ok', human: '正在等待新消息', sec: 30, checks: 1 }
+    else throw new Error('未模拟的接口：' + method + ' ' + path)
+    return { ok: true, status: 200, json: async () => clone(response) }
+  }
+  let mod, registered, overlay = false
+  const window = { navigator, __ModuleLoader__: { load(def) { mod = def.factory((name) => { assert.equal(name, 'react'); return React }) } } }
+  const setInterval = (fn, delay) => { const id = nextTimer++; intervals.set(id, { fn, delay }); return id }
+  const setTimeout = (fn, delay) => { const id = nextTimer++; if (!delay) queueMicrotask(fn); else timeouts.set(id, { fn, delay }); return id }
+  new Function('window', 'document', 'navigator', 'fetch', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', source)(
+    window, document, navigator, fetch, setInterval, (id) => intervals.delete(id), setTimeout, (id) => timeouts.delete(id))
+  assert.ok(mod, 'client must self-register')
+  mod.apply({ effect() {}, get: () => ({ inject: (_, fn) => fn(), register: (meta, component) => {
+    if (meta.name === 'settings.section') registered = component
+    if (meta.name === 'shell.overlay') overlay = true
+    return () => {}
+  } }) })
+  assert.ok(registered, 'settings section must register')
+  assert.equal(overlay, false, 'pet overlay must not register')
+  function render(element, path = 'root') {
+    if (element == null || typeof element === 'boolean') return null
+    if (Array.isArray(element)) return element.map((child, i) => render(child, path + '.' + i)).flat(Infinity).filter((child) => child != null)
+    if (typeof element === 'string' || typeof element === 'number') return String(element)
+    const { type, props } = element
+    if (typeof type === 'function') {
+      if (type.prototype?.render) return render(new type(props).render(), path + '.class')
+      const previous = current, previousCursor = cursor
+      current = instances.get(path) || { hooks: [] }; instances.set(path, current); cursor = 0
+      const output = type(props)
+      current = previous; cursor = previousCursor
+      return render(output, path + '.' + (type.name || 'component'))
+    }
+    return { tag: type, props, children: render(props.children || [], path + '.children') }
+  }
+  async function flush() {
+    for (let i = 0; i < 20; i++) {
+      await Promise.resolve(); await Promise.resolve()
+      if (dirty) {
+        dirty = false
+        tree = render(React.createElement(registered, {}))
+        const pending = effects; effects = []; for (const effect of pending) effect()
+      }
+    }
+    return tree
+  }
+  const nodes = (node = tree) => node == null ? [] : Array.isArray(node) ? node.flatMap((item) => nodes(item)) : typeof node === 'string' ? [] : [node, ...nodes(node.children)]
+  const text = (node = tree) => node == null ? '' : Array.isArray(node) ? node.map((item) => text(item)).join(' ') : typeof node === 'string' ? node : text(node.children)
+  const area = (name) => nodes().find((node) => node.props?.['data-dy-area'] === name)
+  const button = (label, scope = tree) => nodes(scope).find((node) => node.tag === 'button' && (text(node) === label || node.props['aria-label'] === label))
+  const attr = (name, scope = tree) => nodes(scope).find((node) => name in (node.props || {}))
+  const setupRow = (name) => nodes(area('setup')).find((node) => node.props['data-dy-setup-row'] === name)
+  const change = async (node, value) => { assert.ok(node, 'input must exist'); node.props.onChange({ target: { value } }); await flush() }
+  const clickNode = async (node) => { assert.ok(node, 'button must exist'); assert.ok(!node.props.disabled, 'button must be enabled: ' + text(node)); await node.props.onClick({ target: { value: '' } }); await flush() }
+  const click = async (label, section) => clickNode(button(label, section ? area(section) : tree))
+  const poll = async (delay = 4000) => { for (const timer of [...intervals.values()]) if (timer.delay === delay) await timer.fn(); await flush() }
+  const timeout = async (delay) => { for (const [id, timer] of [...timeouts]) if (timer.delay === delay) { timeouts.delete(id); await timer.fn() } await flush() }
+  const dispose = () => { disposed = true; for (const instance of instances.values()) for (const hook of instance.hooks) hook?.cleanup?.(); intervals.clear(); timeouts.clear() }
+  return { data, state, calls, copies, flush, nodes, text, area, setupRow, button, attr, change, click, clickNode, poll, timeout, dispose,
+    get config() { return config }, get tree() { return tree }, get disposed() { return disposed } }
 }
 
-/* ── 🔴 真 @ 的工具名不能写错（2026-10-26 修）──
- *    值班提示词原来让模型调 douyin_comment_reply + mode:"ui"，
- *    但真 @ 的工具叫 douyin_comment_mention（reply 只能发普通评论）。 */
-console.log('\n【真 @ 工具名】')
-{
-  const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
-  if (/douyin_comment_mention/.test(idx)) console.log('  ✅ 值班提示词指向 douyin_comment_mention（真 @ 专用）')
-  else { console.log('  ❌ 值班提示词没提 douyin_comment_mention'); fail++ }
-  if (/mode = "ui"|mode="ui"/.test(idx)) {
-    console.log('  ❌ 值班提示词还在用 mode:"ui"（douyin_comment_reply 没这个参数，会发成普通评论）'); fail++
-  } else console.log('  ✅ 没让模型用不存在的 mode:"ui" 参数')
+let passed = 0
+async function scenario(name, test) {
+  try { await test(); passed++; console.log('  ✅ ' + name) }
+  catch (error) { console.error('  ❌ ' + name + '\n' + error.stack); process.exitCode = 1 }
 }
 
-/* ── 看日志 ── */
-console.log('\n【看日志】')
-const rLog = await clickAndRender('看日志')
-if (rLog) {
-  if (/证据包已备好/.test(rLog.text)) console.log('  ✅ 日志内容显示出来了')
-  else { console.log('  ❌ 日志没显示'); fail++ }
-  if (/上次跑：/.test(rLog.text)) console.log('  ✅ 显示上次跑的时间')
-  else { console.log('  ❌ 没显示上次跑时间'); fail++ }
-}
+console.log('【首次使用与常用入口】')
+await scenario('常用功能与独立关于区可见，不写配置或读取消息', async () => {
+  const h = harness({ state: { loggedIn: false, venvReady: false } }); await h.flush()
+  assert.deepEqual(h.nodes().filter((node) => 'data-dy-area' in node.props).map((node) => node.props['data-dy-area']), ['setup', 'run', 'sending', 'messages', 'persona', 'prefs', 'help', 'about'])
+  assert.equal(h.nodes().filter((node) => 'data-dy-card' in node.props).length, 8)
+  assert.ok(h.nodes().every((node) => !('onClick' in node.props) || typeof node.props.onClick === 'function'))
+  assert.deepEqual(h.nodes(h.area('setup')).filter((node) => 'data-dy-setup-row' in node.props).map((node) => node.props['data-dy-setup-row']), ['environment', 'account'])
+  assert.match(h.text(h.setupRow('environment')), /运行环境.*首次使用安装一次.*安装环境/)
+  assert.match(h.text(h.setupRow('account')), /抖音账号.*将在浏览器中打开扫码页面.*扫码登录/)
+  assert.ok(h.button('检查环境', h.area('setup')))
+  assert.ok(!h.attr('data-dy-steps', h.area('setup')))
+  assert.ok(!h.button('刷新就绪状态', h.area('setup')))
+  assert.ok(h.button('现在跑一轮').props.disabled)
+  assert.ok(!h.button('保存日期'))
+  assert.ok(!h.attr('data-dy-reply-text'))
+  assert.ok(!h.attr('data-dy-raw-log'))
+  assert.ok(!h.nodes(h.area('persona')).some((node) => node.tag === 'textarea'))
+  assert.match(h.text(h.area('persona')), /当前生效：插件自带的那份/)
+  assert.ok(h.button('读取消息').props.disabled)
+  assert.equal(h.calls.filter((call) => call.method === 'POST').length, 0)
+  assert.equal(h.calls.filter((call) => ['/inbox', '/chat/read'].includes(call.path)).length, 0)
+  assert.ok(h.calls.every((call) => !call.query.includes('log=1')))
+  assert.equal(h.config.autoSend, true, 'opening settings preserves the existing sending configuration')
+  h.dispose()
+})
+await scenario('装环境、二维码和登录反馈在操作处更新', async () => {
+  const h = harness({ state: { loggedIn: false, venvReady: false } }); await h.flush()
+  await h.click('安装环境')
+  assert.match(h.text(h.setupRow('environment')), /安装中/)
+  h.state.installing = false; h.state.venvReady = true; h.state.install = { phase: 'completed', stage: 'done', endedAt: EPOCH + 60_000 }
+  await h.poll(3000)
+  assert.match(h.text(h.attr('data-dy-toast')), /运行环境已就绪/)
+  assert.ok(h.calls.some((call) => call.path === '/doctor'), 'installation completion refreshes the full check')
+  await h.click('扫码登录')
+  assert.equal(h.calls.find((call) => call.path === '/login/qr').body.force, '')
+  assert.ok(h.attr('data-dy-qr')); assert.match(h.text(h.area('setup')), /短信验证码.*拖动滑块/)
+  await h.click('我扫完了')
+  assert.ok(!h.attr('data-dy-qr')); assert.ok(!h.button('现在跑一轮').props.disabled)
+  assert.match(h.text(h.attr('data-dy-toast')), /登录成功/)
+  assert.match(h.text(h.area('run')), /测试账号昵称/)
+  assert.ok(!h.text().includes('9999000011112222'))
+  h.dispose()
+})
+await scenario('Cookie 缺失只影响账号，环境检查仍通过且可重新检查', async () => {
+  const h = harness({ state: { loggedIn: false, venvReady: true } }); await h.flush()
+  await h.click('检查环境', 'setup')
+  assert.match(h.text(h.setupRow('environment')), /运行环境 已就绪/)
+  assert.ok(!h.attr('data-dy-sub', h.setupRow('environment')), 'ready environment has no redundant explanation')
+  assert.ok(!h.text(h.setupRow('environment')).includes('Cookie'))
+  assert.ok(!h.attr('data-dy-environment-issues'))
+  assert.match(h.text(h.setupRow('account')), /将在浏览器中打开扫码页面/)
+  assert.match(h.text(h.attr('data-dy-toast')), /运行环境检查通过/)
+  assert.ok(!h.text(h.area('setup')).includes('运行环境检查通过'), 'success does not occupy a persistent row')
+  assert.ok(h.button('重新检查', h.area('setup')))
+  assert.ok(!h.button('修复环境', h.area('setup')))
+  assert.ok(!h.calls.some((call) => call.path === '/environment/repair'))
+  await h.timeout(3000)
+  assert.ok(!h.attr('data-dy-toast'), 'success toast dismisses automatically')
+  assert.match(h.text(h.setupRow('environment')), /已就绪/, 'persistent state remains after toast disappears')
+  h.dispose()
+})
+await scenario('环境缺项在操作处显示处理方法，能直接修复并展开完整检查', async () => {
+  const doctor = fixtureDoctor({ loggedIn: true, venvReady: true })
+  const signer = { id: 'signer', category: 'environment', required: true, item: '签名器组件', state: 'bad', detail: '缺少 ws',
+    fix: '点击「修复环境」安装评论读取组件。', action: { id: 'repair_environment', label: '修复运行环境' } }
+  const dsh = { id: 'dsh', category: 'environment', required: true, item: 'DSH 入口', state: 'bad', detail: '找不到后台入口',
+    fix: '在帮助与排查中填写 DSH 入口路径，然后重新检查。', action: { id: 'manual', label: '填写 DSH 入口' } }
+  doctor.items.push(signer, dsh); doctor.environment = { ready: false, items: [...doctor.environment.items, signer, dsh], repairable: true }
+  const h = harness({ data: { doctor } }); await h.flush(); await h.click('检查环境', 'setup')
+  assert.match(h.text(h.attr('data-dy-environment-issues')), /签名器组件.*缺少 ws.*修复环境.*DSH 入口.*填写 DSH 入口路径/)
+  assert.ok(h.button('修复环境', h.area('setup')))
+  await h.click('查看完整检查与处理方法 ↓')
+  assert.ok(h.button('看接入方式', h.area('help')), 'the help card was expanded by the inline fix link')
+  assert.match(h.text(h.area('help')), /签名器组件.*缺少 ws.*DSH 入口/)
+  await h.click('修复环境', 'setup')
+  assert.equal(h.calls.filter((call) => call.path === '/environment/repair').length, 1)
+  assert.match(h.text(h.setupRow('environment')), /正在安装运行依赖.*安装中/)
+  h.dispose()
+})
+await scenario('修复启动返回 ok:false 时保留可重试入口，不显示乐观安装状态', async () => {
+  const h = harness({ state: { loggedIn: false, venvReady: false }, data: { installStart: { ok: false, error: 'Python 不可用，请先安装' } } }); await h.flush()
+  await h.click('安装环境')
+  assert.match(h.text(h.area('setup')), /装依赖失败：Python 不可用，请先安装/)
+  assert.ok(!h.text(h.setupRow('environment')).includes('安装中'))
+  assert.ok(!h.text(h.area('setup')).includes('正在补齐运行依赖'))
+  assert.ok(!h.button('安装环境').props.disabled)
+  assert.equal(h.state.installing, false)
+  assert.equal(h.calls.filter((call) => call.path === '/doctor').length, 0)
+  h.dispose()
+})
+await scenario('只有新修复接口为404时回退旧安装入口，安装完成自动重查', async () => {
+  const h = harness({ state: { loggedIn: false, venvReady: false }, data: { install404: true } }); await h.flush()
+  await h.click('安装环境')
+  assert.deepEqual(h.calls.filter((call) => ['/environment/repair', '/install'].includes(call.path)).map((call) => call.path), ['/environment/repair', '/install'])
+  h.state.installing = false; h.state.venvReady = true; h.state.install = { phase: 'completed', stage: 'done', endedAt: EPOCH + 60_000 }
+  await h.poll(3000)
+  assert.match(h.text(h.setupRow('environment')), /已就绪/)
+  assert.equal(h.calls.filter((call) => call.path === '/doctor').length, 1)
+  assert.match(h.text(h.setupRow('account')), /将在浏览器中打开扫码页面/)
+  h.dispose()
+})
+await scenario('没有二维码元素时仍可确认登录、关闭窗口和重新打开', async () => {
+  for (const qr of [
+    { ok: false, no_qr_element: true, browser_open: true, can_check: true, hint: '请直接在浏览器扫码' },
+    { ok: true, no_qr_element: true, qr_url: '/stale-image.png', hint: '请直接在浏览器扫码' },
+  ]) {
+    const h = harness({ state: { loggedIn: false }, data: { qr } }); await h.flush()
+    await h.click('扫码登录')
+    assert.ok(!h.attr('data-dy-qr'), 'no_qr_element takes precedence over an obsolete qr_url')
+    assert.match(h.text(h.setupRow('account')), /请直接在浏览器扫码/)
+    for (const label of ['我扫完了', '关闭登录窗口', '重新打开登录窗口']) assert.ok(!h.button(label).props.disabled)
+    await h.click('我扫完了')
+    assert.match(h.text(h.setupRow('account')), /已保存登录态.*测试账号昵称/)
+    h.dispose()
+  }
+})
+await scenario('占用冲突或启动失败时，无图片也能强制重新打开登录窗口', async () => {
+  for (const initial of [
+    { ok: false, conflict: 'profile_in_use', error: '配置正在占用' },
+    { ok: false, error: 'Chrome 未能打开', hint: '请检查浏览器安装后重试' },
+  ]) {
+    const h = harness({ state: { loggedIn: false }, data: { qr: initial } }); await h.flush(); await h.click('扫码登录')
+    assert.ok(!h.attr('data-dy-qr'))
+    assert.ok(!h.button('重新打开登录窗口').props.disabled)
+    assert.match(h.text(h.setupRow('account')), initial.conflict ? /正常关闭插件的后台浏览器/ : /Chrome 未能打开.*检查浏览器安装/)
+    h.data.qr = { ok: true, qr_url: '/api/douyin-duty/login/qr.png' }
+    await h.click('重新打开登录窗口')
+    assert.equal(h.calls.filter((call) => call.path === '/login/qr').at(-1).body.force, '1')
+    assert.ok(h.attr('data-dy-qr')); h.dispose()
+  }
+})
+await scenario('已登录响应优先于二维码URL，不让使用者重复扫码', async () => {
+  const h = harness({ state: { loggedIn: false }, data: { qr: { ok: true, already_logged_in: true, qr_url: '/stale-image.png' } } }); await h.flush()
+  await h.click('扫码登录')
+  assert.ok(!h.attr('data-dy-qr')); assert.ok(!h.button('我扫完了'))
+  assert.match(h.text(h.setupRow('account')), /已保存登录态.*测试账号昵称/)
+  assert.match(h.text(h.attr('data-dy-toast')), /已经直接登录好了/)
+  assert.ok(!h.button('现在跑一轮').props.disabled)
+  h.dispose()
+})
+await scenario('登录窗口异步打开期间禁用重复点击，旧事件也不能重复请求', async () => {
+  let release
+  const h = harness({ state: { loggedIn: false }, data: { qr: () => new Promise((resolve) => { release = resolve }) } }); await h.flush()
+  const login = h.button('扫码登录')
+  const first = login.props.onClick(); const second = login.props.onClick(); await h.flush()
+  assert.equal(h.calls.filter((call) => call.path === '/login/qr').length, 1)
+  assert.ok(h.button('打开中…').props.disabled)
+  release({ ok: true, qr_url: '/api/douyin-duty/login/qr.png' }); await first; await second; await h.flush()
+  assert.ok(h.attr('data-dy-qr')); h.dispose()
+})
+await scenario('环境修复异步启动期间不重复安装，二维码图片失败仍可继续登录', async () => {
+  let release
+  const h = harness({ state: { loggedIn: false, venvReady: false }, data: { installStart: () => new Promise((resolve) => { release = resolve }) } }); await h.flush()
+  const install = h.button('安装环境')
+  const first = install.props.onClick(); const second = install.props.onClick(); await h.flush()
+  assert.equal(h.calls.filter((call) => call.path === '/environment/repair').length, 1)
+  assert.match(h.text(h.setupRow('environment')), /安装中/)
+  assert.ok(h.button('扫码登录').props.disabled)
+  release({ ok: true, started: true, install: { phase: 'running', stage: 'dependencies' } }); await first; await second; await h.flush()
+  h.state.installing = false; h.state.venvReady = true; h.state.install = { phase: 'completed', stage: 'done' }; await h.poll(3000)
+  await h.click('扫码登录'); h.attr('data-dy-qr').props.onError(); await h.flush()
+  assert.ok(!h.attr('data-dy-qr'))
+  assert.match(h.text(h.setupRow('account')), /二维码图片未加载/)
+  assert.ok(!h.button('我扫完了').props.disabled)
+  assert.ok(!h.button('重新打开登录窗口').props.disabled)
+  h.dispose()
+})
+await scenario('设置读取失败有重试，结果读取失败与空结果分开', async () => {
+  const h = harness({ data: { statusError: true } }); await h.flush()
+  assert.match(h.text(), /暂时没能读取设置/)
+  h.data.statusError = false; await h.click('重新读取')
+  assert.ok(h.area('setup'))
+  h.data.reportError = true; await h.click('刷新结果')
+  assert.match(h.text(h.area('run')), /暂时无法读取推荐结果/)
+  h.dispose()
+})
 
-/* ── 桌宠联动（2026-10-25 拆分：窗口/人格/弹幕归独立插件 dsh-deskpet，这里只剩状态源）── */
-console.log('\n【桌宠联动】')
-{
-  const idx = readFileSync(join(ROOT, 'index.js'), 'utf8')
-  const cl = readFileSync(join(ROOT, 'client.js'), 'utf8')
-  // ⚠️ 断言看**去掉注释后的代码**：为什么要拆、搬走了什么，这些解释都在注释里，
-  //    全文搜会把"注释里说我们不写 pet-window-state.json"误判成"我们在写"。
-  const idxCode = idx.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
-  // ⚠️ 拆分后的规矩（这条守的是"两个插件不许抢同一个文件"）：
-  //    抖音侧可以读状态、可以提供状态源，但**不许**再写 pet-window-state.json ——
-  //    那文件归 dsh-deskpet 写。两个都写 = 谁后落盘谁赢 = 她说的话随机消失。
-  if (/petStateOf/.test(idxCode)) console.log('  ✅ 状态聚合在（petStateOf，给状态源用）')
-  else { console.log('  ❌ 状态聚合没了'); fail++ }
-  if (/deskpetStateSource/.test(idxCode)) console.log('  ✅ 有状态源注册（deskpetStateSource）')
-  else { console.log('  ❌ 没有状态源注册 —— 桌宠那边拿不到抖音的状态'); fail++ }
-  if (/petWinWrite|pet-window-state\.json/.test(idxCode)) { console.log('  ❌ 抖音侧还在写 pet-window-state.json —— 会跟桌宠互相覆盖'); fail++ }
-  else console.log('  ✅ 抖音侧不写窗口状态文件（归 dsh-deskpet）')
-  if (/spawn\(hostExe|PetHost\.exe/.test(idxCode)) { console.log('  ❌ 抖音侧还在拉起窗口进程 —— 会跟桌宠抢实例'); fail++ }
-  else console.log('  ✅ 抖音侧不拉窗口（窗口归 dsh-deskpet）')
-  /* 🔴 2026-10-26 主人：「联动桌宠选项暂时不要出现」
-   *   代码还在（HIDE_PET_LINK 控制），但界面上不许出现这个开关。
-   *   所以要断言的是「源码里有 petLinkTo」「界面上没有联动桌宠」。 */
-  if (/petLinkTo/.test(cl)) console.log('  ✅ 联动能力仍在源码里（petLinkTo，HIDE_PET_LINK 可恢复）')
-  else { console.log('  ❌ 连 petLinkTo 都没了 —— 恢复时得重写'); fail++ }
-  if (/HIDE_PET_LINK\s*=\s*true/.test(cl)) console.log('  ✅ 「联动桌宠」开关按主人要求隐藏（HIDE_PET_LINK=true）')
-  else { console.log('  ❌ HIDE_PET_LINK 不在 —— 那个开关会冒出来'); fail++ }
-  if (/slots\.inject\('shell\.overlay'/.test(cl)) { console.log('  ❌ 还在往 shell.overlay 注册（会出两只她）'); fail++ }
-  else console.log('  ✅ GUI 内没有浮层（只有桌面窗一只）')
-}
+console.log('\n【运行、额度与结果】')
+await scenario('自动额度用完或计划暂停仍可一键手动运行，发送范围明确', async () => {
+  const h = harness({ config: { autoEnabled: false, perDay: 0, autoSend: false } }); await h.flush()
+  assert.match(h.text(h.area('run')), /手动每轮最多推荐 3 条，不占自动额度/)
+  assert.match(h.text(h.area('run')), /本轮只生成推荐，不自动发送/)
+  assert.ok(!h.button('现在跑一轮').props.disabled)
+  await h.click('现在跑一轮')
+  assert.equal(h.calls.filter((call) => call.path === '/run').length, 1)
+  assert.equal(h.calls.filter((call) => call.path === '/config' && call.method === 'POST').length, 0)
+  h.dispose()
+})
+await scenario('启动中禁重入，运行期间保留上一轮，结束自动更新结果', async () => {
+  let release
+  const h = harness({ data: { run: () => new Promise((resolve) => { release = resolve }) } }); await h.flush()
+  const start = h.button('现在跑一轮')
+  const pending = start.props.onClick(); await h.flush()
+  const duplicate = start.props.onClick(); await h.flush()
+  assert.equal(h.calls.filter((call) => call.path === '/run').length, 1)
+  assert.match(h.text(h.area('run')), /正在准备这一轮/)
+  h.data.round = round('running', { id: 'round-two', startedAt: Date.now(), endedAt: null, result: null })
+  await h.poll()
+  assert.match(h.text(h.area('run')), /上一轮推荐 · 本轮结果尚未生成/)
+  assert.match(h.text(h.area('run')), /最近的作品/)
+  h.data.round = round('completed', { id: 'round-two', startedAt: h.data.round.startedAt, endedAt: Date.now() + 60_000, warnings: [] })
+  h.data.counts = { auto: 5, manual: 2, unknown: 2, total: 9 }
+  h.data.reports.recent = { ...h.data.reports.recent, roundId: 'round-two', picks: [{ id: '7401234567890123402', title: '新的作品', text: '新理由', url: 'https://www.douyin.com/video/7401234567890123402' }] }
+  h.data.reportStamp = 'stamp-two'; release({ ok: true }); await pending; await duplicate; await h.flush(); await h.poll()
+  assert.match(h.text(h.area('run')), /本轮已完成/)
+  assert.match(h.text(h.area('run')), /新的作品/)
+  assert.match(h.text(h.attr('data-dy-stats')), /手动推荐\s+2\s+条/)
+  assert.ok(!h.button('现在跑一轮').props.disabled)
+  const completedReads = h.calls.filter((call) => call.path === '/progress').length
+  await h.poll(); await h.poll()
+  assert.equal(h.calls.filter((call) => call.path === '/progress').length, completedReads, 'completed runs return to slower polling')
+  h.dispose()
+})
+await scenario('刷新等待在途轮询后重读今日计数，旧日结果不会覆盖今日统计', async () => {
+  const h = harness({ data: { round: round('running'), counts: { auto: 0, manual: 0, unknown: 0, total: 0 } } }); await h.flush()
+  let release
+  h.data.progress = (snapshot) => new Promise((resolve) => { release = () => resolve(snapshot) })
+  const polling = h.poll(); await h.flush()
+  const before = h.calls.filter((call) => call.path === '/progress').length
+  h.data.progress = null
+  h.data.counts = { auto: 0, manual: 1, unknown: 0, total: 1 }
+  h.data.reports.recent = { ...h.data.reports.recent, day: '2026-11-02', counts: { auto: 9, manual: 9, total: 18 } }
+  const refresh = h.click('刷新结果'); await h.flush()
+  assert.ok(h.button('读取中…').props.disabled)
+  release(); await polling; await refresh
+  assert.ok(h.calls.filter((call) => call.path === '/progress').length > before, 'a fresh progress read follows the in-flight poll')
+  assert.match(h.text(h.attr('data-dy-stats')), /今日推荐\s+1\s+条.*手动推荐\s+1\s+条/)
+  assert.ok(!h.text(h.attr('data-dy-stats')).includes('18'))
+  h.dispose()
+})
+await scenario('0 条是有效完成；推荐、日报和三种发送结果分别展示', async () => {
+  const h = harness({ data: { round: round('completed', { warnings: [], result: { recommendations: 0, reportUpdated: false, sends: { dm: { succeeded: 1, failed: 2, unknown: 3 }, card: { succeeded: 0, failed: 0, unknown: 1 }, comment: { succeeded: 1, failed: 0, unknown: 0 } } } }) } })
+  h.data.reports.recent.picks = []; await h.flush()
+  assert.match(h.text(h.area('run')), /本轮已完成，暂无新的合适内容/)
+  assert.match(h.text(h.area('run')), /新增 0 条推荐 · 本轮未更新日报/)
+  assert.match(h.text(h.area('run')), /私信：成功 1，失败 2，未确认 3/)
+  assert.match(h.text(h.area('run')), /卡片：成功 0，失败 0，未确认 1/)
+  assert.match(h.text(h.area('run')), /旧记录未区分 2 条/)
+  h.dispose()
+})
+await scenario('状态未知不自动宣称成功，不允许重复启动', async () => {
+  const h = harness({ data: { round: round('unknown', { result: null }) } }); await h.flush()
+  assert.match(h.text(h.area('run')), /暂未确认本轮是否结束/)
+  assert.ok(h.button('运行中…').props.disabled)
+  assert.equal(h.calls.filter((call) => call.path === '/run').length, 0)
+  h.dispose()
+})
+await scenario('进程已结束但结果未确认时保留旧结果，仍可明确手动重跑', async () => {
+  const h = harness({ data: { running: false, round: round('unknown', { result: { validated: false, recommendations: 0, reportUpdated: false, sends: emptySends() } }) } })
+  await h.flush()
+  assert.match(h.text(h.area('run')), /本轮推荐结果尚未确认，保留最近一次结果/)
+  assert.ok(!h.text(h.area('run')).includes('新增 0 条推荐'))
+  assert.ok(!h.button('现在跑一轮').props.disabled)
+  h.dispose()
+})
+await scenario('最近/今日范围、笔记链接和 Markdown 安全排版', async () => {
+  const h = harness(); await h.flush()
+  assert.match(h.text(h.area('run')), /最近的作品/)
+  assert.equal(h.nodes().find((node) => node.tag === 'a' && h.text(node) === '打开作品 ↗').props.href, 'https://www.douyin.com/note/7401234567890123401')
+  await h.click('今日全部'); assert.match(h.text(h.area('run')), /今日的作品/)
+  await h.click('完整日报')
+  assert.ok(h.nodes().some((node) => node.tag === 'strong' && h.text(node) === '加粗理由'))
+  assert.ok(h.nodes().some((node) => node.tag === 'li' && h.text(node) === '一条推荐'))
+  assert.ok(!h.nodes().some((node) => node.tag === 'script' || node.props?.dangerouslySetInnerHTML))
+  assert.ok(!h.nodes().some((node) => node.tag === 'a' && String(node.props.href).startsWith('javascript:')))
+  assert.ok(!h.text().includes('**加粗理由**'))
+  h.dispose()
+})
+await scenario('本轮记录与原始日志默认折叠，提醒过滤和复制均脱敏', async () => {
+  const h = harness(); await h.flush()
+  assert.ok(!h.attr('data-dy-events'))
+  await h.click('本轮记录')
+  assert.match(h.text(h.attr('data-dy-events')), /开始获取候选.*部分评论未读到/)
+  assert.ok(!h.nodes().some((node) => node.tag === 'pre' && h.text(node).includes('SECRET_COOKIE')))
+  await h.click('只看提醒')
+  assert.ok(!h.text(h.attr('data-dy-events')).includes('开始获取候选'))
+  const raw = h.attr('data-dy-raw-log'); raw.props.onToggle({ currentTarget: { open: true } }); await h.flush()
+  assert.match(h.text(h.area('run')), /旧轮次日志/)
+  assert.ok(!h.text().includes('SECRET_COOKIE') && !h.text().includes('SECRET_HOOK'))
+  await h.click('复制原始日志')
+  assert.ok(!h.copies.at(-1).includes('SECRET_COOKIE') && !h.copies.at(-1).includes('SECRET_HOOK'))
+  assert.match(h.copies.at(-1), /douyin\.com\/note/)
+  await h.click('本轮记录'); await h.click('现在跑一轮')
+  assert.ok(!h.calls.filter((call) => call.path === '/progress').at(-1).query.includes('log=1'), 'closing records stops raw log reads')
+  h.dispose()
+})
 
-console.log(fail ? `\n渲染检查：${fail} 项失败` : '\n渲染检查：全部通过')
-// ⚠️ 组件里的 setInterval（桌宠/状态屏轮询）没有清理替身会执行 —— 进程会挂着不退，
-//    selfcheck 的 spawnSync 有 timeout 但每次都拖满 120 秒。显式退出。
-process.exit(fail ? 1 : 0)
+console.log('\n【DSH 评论回复】')
+await scenario('评论无手工输入，阅读只查状态；一次点击交给 DSH 并保留作品、评论和楼根', async () => {
+  let release
+  const h=harness({config:{autoSend:false},data:{commentAI:()=>new Promise(resolve=>{release=resolve})}});await h.flush();await h.click('读取消息');await h.click('评论区 @ 与回复')
+  assert.equal(h.nodes(h.area('messages')).filter(n=>['textarea','input'].includes(n.tag)).length,0)
+  assert.doesNotMatch(h.text(h.area('messages')),/写下要回复|确认回复|没回过/)
+  assert.match(h.text(h.area('messages')),/过往发言/)
+  assert.equal(h.calls.filter(c=>c.path==='/comment/ai-reply'&&c.method==='POST').length,0)
+  const action=h.attr('data-dy-ai-comment');const first=action.props.onClick(),second=action.props.onClick();await h.flush()
+  assert.equal(h.calls.filter(c=>c.path==='/comment/ai-reply'&&c.method==='POST').length,1)
+  assert.deepEqual(h.calls.find(c=>c.path==='/comment/ai-reply'&&c.method==='POST').body,{
+    aweme_id:'7693806860863802662',comment_id:'7699090731688952613',root_comment_id:'7699090731688952600',work_url:'https://www.douyin.com/note/7693806860863802662',aweme_type:68,confirm:true})
+  release({ok:true,job:{id:'comment-job-one',status:'sent',done:true,sent:true,text:'DSH 评论回复'}});await first;await second;await h.flush()
+  assert.match(h.text(h.area('messages')),/DSH 已回复.*DSH 评论回复/)
+  assert.ok(h.attr('data-dy-ai-comment').props.disabled)
+  assert.equal(h.calls.filter(c=>c.path==='/comment/reply').length,0)
+  h.dispose()
+})
+await scenario('评论生成失败可重试，发送结果未确认只查询不重发', async () => {
+  const h=harness({data:{commentAI:{ok:true,job:{id:'comment-fail',status:'failed',done:true,error:'模型不可用，没有发送'}}}});await h.flush();await h.click('读取消息');await h.click('评论区 @ 与回复')
+  await h.click('DSH 回复');assert.match(h.text(h.area('messages')),/模型不可用/);assert.ok(!h.attr('data-dy-ai-comment').props.disabled)
+  h.data.commentAI={ok:true,job:{id:'comment-unknown',status:'uncertain',done:true,error:'发送结果无法确认'}}
+  await h.click('DSH 回复');assert.ok(h.attr('data-dy-ai-comment').props.disabled)
+  await h.click('查询处理结果');assert.match(h.text(h.area('messages')),/发送结果无法确认/)
+  assert.equal(h.calls.filter(c=>c.path==='/comment/ai-reply'&&c.method==='POST').length,2)
+  h.dispose()
+})
+await scenario('已发送但落位存疑保留正文和说明，恢复状态不再启动任务', async () => {
+  const h=harness({data:{commentJob:{id:'saved-job',status:'sent-warning',done:true,sent:true,text:'已发出的正文',note:'回复位置未确认，请核对原评论'}}});await h.flush();await h.click('读取消息');await h.click('评论区 @ 与回复')
+  assert.match(h.text(h.area('messages')),/已发送，回复位置待核对.*已发出的正文/)
+  assert.ok(h.attr('data-dy-ai-comment').props.disabled)
+  assert.equal(h.calls.filter(c=>c.path==='/comment/ai-reply'&&c.method==='POST').length,0)
+  h.dispose()
+})
+await scenario('评论缺少标识禁止生成；状态读取失败可只读重试', async () => {
+  const h=harness();h.data.inbox.at=[inboxItem({comment_id:''})];await h.flush();await h.click('读取消息');await h.click('评论区 @ 与回复')
+  assert.ok(h.attr('data-dy-ai-comment').props.disabled);assert.match(h.text(h.area('messages')),/缺少原评论标识/)
+  assert.equal(h.calls.filter(c=>c.path==='/comment/ai-reply').length,0);h.dispose()
+  const e=harness({data:{commentStatusError:true}});await e.flush();await e.click('读取消息');await e.click('评论区 @ 与回复')
+  assert.ok(e.attr('data-dy-ai-comment').props.disabled);assert.match(e.text(e.area('messages')),/回复状态暂不可用/)
+  e.data.commentStatusError=false;await e.click('查询处理结果');assert.ok(!e.attr('data-dy-ai-comment').props.disabled)
+  assert.equal(e.calls.filter(c=>c.path==='/comment/ai-reply'&&c.method==='POST').length,0);e.dispose()
+})
+
+console.log('\n【计划与原有能力回归】')
+await scenario('计划草稿统一保存；默认时段与自定义共同生效，清空自定义不影响默认', async () => {
+  const h = harness(); await h.flush(); await h.click('运行偏好')
+  const selector = h.nodes().find((node) => node.tag === 'select' && node.props['aria-label'] === '重复日期')
+  await h.change(selector, 'weekdays')
+  assert.equal(h.calls.filter(c=>c.path==='/config'&&c.method==='POST').length,0)
+  await h.click('保存计划')
+  assert.deepEqual(h.config.scheduleDays, [1, 2, 3, 4, 5])
+  await h.change(h.nodes().find(n=>n.props['aria-label']==='重复日期'),'custom')
+  const monday = h.nodes().find((node) => node.tag === 'button' && node.props['aria-label'] === '周一')
+  await h.clickNode(monday); await h.click('保存计划')
+  assert.deepEqual(h.config.scheduleDays, [2, 3, 4, 5])
+  assert.equal(h.nodes().filter(n=>n.props['data-dy-plan-window']!==undefined).length,1)
+  await h.clickNode(h.nodes().find(n=>n.props['aria-label']==='移除自定义时段 1'))
+  await h.click('保存计划'); assert.deepEqual(h.config.windows, [])
+  assert.equal(h.config.noon,true);assert.equal(h.config.night,true)
+  assert.deepEqual(h.calls.filter((call) => call.path === '/config' && call.body?.windows).at(-1).body.__clearKeys, ['windows'])
+  assert.match(h.text(h.area('prefs')), /跨午夜.*开始日期/)
+  h.dispose()
+})
+await scenario('关闭的两个默认时段仍可见，切换只改草稿；失败保留，重新启用可检查冲突', async () => {
+  const h=harness({config:{noon:false,night:false,windows:[{start:'13:00',end:'15:00',label:'午后'}]}})
+  await h.flush();await h.click('运行偏好')
+  const toggle=name=>h.nodes().find(n=>n.props.role==='switch'&&n.props['aria-label']===name)
+  assert.equal(toggle('中午时段').props['aria-checked'],false)
+  assert.equal(toggle('夜间时段').props['aria-checked'],false)
+  assert.match(h.text(h.area('prefs')),/12:00–14:00/);assert.match(h.text(h.area('prefs')),/18:00–次日 09:00/)
+  await h.clickNode(toggle('中午时段'))
+  assert.match(h.text(h.area('prefs')),/中午与自定义时段 1重叠/)
+  assert.ok(h.button('保存计划').props.disabled);assert.equal(h.config.noon,false)
+  await h.clickNode(toggle('中午时段'));await h.clickNode(toggle('夜间时段'))
+  assert.equal(h.calls.filter(c=>c.method==='POST'&&c.path==='/config').length,0)
+  h.data.configError=true;await h.click('保存计划');assert.equal(h.config.night,false)
+  assert.equal(toggle('夜间时段').props['aria-checked'],true)
+  h.data.configError=false;await h.click('保存计划');assert.equal(h.config.night,true)
+  assert.equal(h.config.noon,false);assert.deepEqual(h.config.windows,[{start:'13:00',end:'15:00',label:'午后'}])
+  await h.clickNode(toggle('夜间时段'));await h.click('保存计划')
+  assert.equal(toggle('夜间时段').props['aria-checked'],false)
+  assert.equal(h.nodes().filter(n=>n.props['data-dy-plan-preset']!==undefined).length,2)
+  h.dispose()
+})
+await scenario('保存失败保留数量/时段草稿，反馈留在运行偏好', async () => {
+  const h = harness(); await h.flush(); await h.click('运行偏好')
+  const input = h.nodes().find((node) => node.tag === 'input' && node.props['aria-label'] === '手动每轮最多推荐')
+  await h.change(input, '7'); h.data.configError = true; await h.click('保存手动数量')
+  assert.equal(h.nodes().find((node) => node.props['aria-label'] === '手动每轮最多推荐').props.value, '7')
+  assert.match(h.text(h.area('prefs')), /保存失败/)
+  h.data.configError = false; await h.click('保存手动数量'); assert.equal(h.config.manualPerRun, 7)
+  await h.clickNode(h.nodes().find(n=>n.props['aria-label']==='移除自定义时段 1'))
+  h.data.configError = true; await h.click('保存计划'); assert.ok(!h.button('保存计划').props.disabled)
+  assert.match(h.text(h.attr('data-dy-plan')), /保存失败/)
+  h.dispose()
+})
+await scenario('计划冲突与跨午夜校验；编辑草稿不会提前生效，收起后保留', async () => {
+  const h=harness({config:{noon:true,night:false,windows:[],scheduleDays:[1]}});await h.flush();await h.click('运行偏好')
+  const field=label=>h.nodes().find(n=>n.props['aria-label']===label)
+  await h.click('添加自定义时段');assert.ok(h.button('保存计划').props.disabled)
+  await h.change(field('自定义时段 1 开始'),'13:00');await h.change(field('自定义时段 1 结束'),'15:00')
+  assert.match(h.text(h.area('prefs')),/重叠/);assert.ok(h.button('保存计划').props.disabled)
+  await h.change(field('自定义时段 1 开始'),'23:00');await h.change(field('自定义时段 1 结束'),'01:00')
+  assert.match(h.text(h.area('prefs')),/结束 · 次日/);assert.ok(!h.button('保存计划').props.disabled)
+  await h.click('运行偏好');await h.click('运行偏好')
+  assert.equal(field('自定义时段 1 开始').props.value,'23:00')
+  assert.equal(h.calls.filter(c=>c.path==='/config'&&c.method==='POST').length,0)
+  await h.click('保存计划');assert.deepEqual(h.config.windows,[{start:'23:00',end:'01:00',label:''}])
+  await h.change(field('自定义时段 1 开始'),'01:00');assert.match(h.text(h.area('prefs')),/开始与结束不能相同/)
+  h.dispose()
+})
+await scenario('原有重叠计划仍能单独暂停，保存失败保留原计划和草稿', async () => {
+  const h=harness({config:{windows:[{start:'13:00',end:'15:00'}]}});await h.flush();await h.click('运行偏好')
+  await h.click('暂停当前计划')
+  assert.equal(h.config.autoEnabled,false);assert.equal(h.config.windows[0].start,'13:00')
+  assert.deepEqual(h.calls.filter(c=>c.path==='/config'&&c.method==='POST').at(-1).body,{autoEnabled:false})
+  h.dispose()
+})
+await scenario('人设草稿可扩大、收起、撤销；只保存明确编辑的内容', async () => {
+  const h=harness();await h.flush();await h.click('编辑人设')
+  assert.ok(h.button('保存人设').props.disabled)
+  await h.click('扩大编辑区');assert.equal(h.attr('data-dy-persona-text').props['data-large'],'')
+  await h.change(h.attr('data-dy-persona-text'),'新的表达边界')
+  await h.click('收起编辑');await h.click('编辑人设')
+  assert.equal(h.attr('data-dy-persona-text').props.value,'新的表达边界')
+  assert.equal(h.calls.filter(c=>c.path==='/persona'&&c.method==='POST').length,0)
+  await h.click('撤销修改','persona');assert.match(h.attr('data-dy-persona-text').props.value,/插件口吻/)
+  await h.change(h.attr('data-dy-persona-text'),'新的表达边界');await h.click('保存人设')
+  assert.equal(h.calls.filter(c=>c.path==='/persona'&&c.method==='POST').length,1)
+  assert.match(h.text(h.attr('data-dy-toast')),/人设已保存/);h.dispose()
+})
+
+await scenario('联系人、群聊限制、主动 @ 多选与手动联系人仍可用', async () => {
+  const h = harness(); await h.flush(); await h.click('选择接收人')
+  assert.match(h.text(h.attr('data-dy-recipients')), /重名/)
+  const option = (name) => h.nodes().find((node) => node.props.role === 'checkbox' && node.props['aria-label'] === name)
+  await h.clickNode(option('测试群聊'))
+  assert.match(h.text(h.area('sending')), /网页端群聊.*手机端正常/)
+  assert.equal(h.config.dmPeers.at(-1).nick, '测试群聊')
+  await h.clickNode(h.nodes().find((node) => node.tag === 'summary' && h.text(node) === '手动添加接收人'))
+  await h.change(h.nodes().find((node) => node.tag === 'input' && node.props.placeholder === '比如：示例好友'), '手动好友')
+  await h.change(h.nodes().find((node) => node.tag === 'input' && node.props.placeholder === 'MS4wLjABAAAA…'), 'MS4wLjABAAAA_manual')
+  await h.click('添加接收人'); assert.equal(h.config.dmPeers.at(-1).nick, '手动好友')
+  await h.click('完成')
+  const atSwitch = h.nodes(h.area('sending')).find((node) => node.props.role === 'switch' && node.props['aria-label'] === '评论区 @ 提醒')
+  await h.clickNode(atSwitch); assert.equal(h.config.commentAtMe, true)
+  await h.click('选择 @ 对象')
+  assert.equal(option('测试群聊').props.disabled, true)
+  const atCandidates = h.nodes().filter((node) => node.props.role === 'checkbox' && !node.props.disabled)
+  await h.clickNode(atCandidates[0]); assert.ok(h.config.atPeers.length)
+  await h.clickNode(h.nodes().find((node) => node.props.role === 'checkbox' && node.props['aria-checked']))
+  assert.equal(h.config.atPeers.length, 0)
+  assert.deepEqual(h.calls.filter((call) => call.path === '/config' && call.method === 'POST').at(-1).body.__clearKeys, ['atPeers'])
+  assert.equal(h.calls.filter((call) => call.path === '/dm/people').length, 1, 'both pickers reuse the loaded conversations')
+  assert.equal(h.calls.filter((call) => /\/chat\/send|\/comment\/reply|\/run$/.test(call.path)).length, 0)
+  h.dispose()
+})
+await scenario('发送设置保存失败保留选中状态，搜索和关闭弹窗不修改配置', async () => {
+  const h = harness(); await h.flush(); await h.click('选择接收人')
+  h.data.configError = true
+  await h.clickNode(h.nodes().find((node) => node.props.role === 'checkbox' && !node.props.disabled))
+  assert.equal(h.config.dmPeers.length, 0)
+  assert.match(h.text(h.attr('data-dy-recipients')), /保存失败/)
+  const count = h.calls.filter((call) => call.path === '/config' && call.method === 'POST').length
+  await h.change(h.nodes().find((node) => node.props['aria-label'] === '搜索会话昵称'), '没有这个名字')
+  assert.match(h.text(h.attr('data-dy-recipients')), /没有匹配的会话/)
+  await h.click('完成')
+  assert.equal(h.calls.filter((call) => call.path === '/config' && call.method === 'POST').length, count)
+  assert.equal(h.attr('data-dy-recipients'), undefined)
+  h.dispose()
+})
+await scenario('私信按分类读取，评论慢或失败不阻塞私信；刷新失败保留原会话', async () => {
+  const h=harness();await h.flush();await h.click('读取消息')
+  assert.deepEqual(h.calls.filter(c=>c.path==='/inbox').map(c=>c.query),['?scope=dm'])
+  const old=h.data.inbox;let finish
+  h.data.inbox=scope=>scope==='comment'?new Promise(resolve=>{finish=resolve}):{ok:false,error:'暂时断线'}
+  await h.click('评论区 @ 与回复');assert.match(h.text(h.area('messages')),/正在读取最近的消息/)
+  await h.click('私信 · 1');assert.ok(h.attr('data-dy-inbox-dm'))
+  await h.click('刷新消息');assert.ok(h.attr('data-dy-inbox-dm'));assert.match(h.text(h.area('messages')),/暂时断线/)
+  finish({ok:false,error:'评论读取失败'});await h.flush()
+  assert.doesNotMatch(h.text(h.area('messages')),/评论读取失败/)
+  h.data.inbox=old;await h.click('刷新消息');assert.doesNotMatch(h.text(h.area('messages')),/暂时断线/)
+  h.dispose()
+})
+await scenario('私信阅读只读，显式点击才让 DSH 生成并发送；不受自动发送开关影响', async () => {
+  const h = harness({ config: { autoSend: false, chatWatch: false } }); await h.flush(); await h.click('读取消息')
+  await h.clickNode(h.attr('data-dy-inbox-dm'))
+  assert.match(h.text(h.area('messages')), /关于对方：喜欢猫、在杭州/)
+  const bubbles = h.nodes().filter((node) => 'data-dy-bubble' in node.props)
+  assert.ok(bubbles.some((node) => node.props['data-mine'] !== undefined))
+  assert.ok(bubbles.some((node) => node.props['data-them'] !== undefined))
+  assert.ok(bubbles.some((node) => h.text(node).includes('分享卡片')))
+  assert.equal(h.calls.filter((c) => c.path === '/chat/reply' && c.method === 'POST').length, 0)
+  assert.equal(h.nodes(h.area('messages')).filter((n) => n.tag === 'input').length, 0)
+  await h.click('DSH 回复')
+  assert.deepEqual(h.calls.find((c) => c.path === '/chat/reply' && c.method === 'POST').body, {to:'测试好友',to_id:'MS4wLjABAAAA_test1',confirm:true})
+  assert.match(h.text(h.area('messages')), /DSH 已回复.*DSH 生成的回复/)
+  assert.equal(h.calls.filter((c) => c.path === '/chat/send').length, 0)
+  assert.equal(h.config.autoSend, false); assert.equal(h.config.chatWatch, false)
+  h.dispose()
+})
+await scenario('DSH 回复进行中防连点，断线后只查询；结果不明不能重发', async () => {
+  const h = harness({data:{aiReply: async () => { throw new Error('连接中断') }}}); await h.flush(); await h.click('读取消息'); await h.clickNode(h.attr('data-dy-inbox-dm'))
+  const action=h.button('DSH 回复'); await action.props.onClick(); await action.props.onClick(); await h.flush()
+  assert.equal(h.calls.filter(c=>c.path==='/chat/reply'&&c.method==='POST').length,1)
+  assert.match(h.text(h.area('messages')), /暂未确认处理结果/)
+  h.data.aiJob={id:'job-one',status:'uncertain',done:true,error:'发送结果未确认，请核对原会话'}
+  await h.click('查询处理结果')
+  assert.ok(h.button('DSH 回复').props.disabled)
+  assert.match(h.text(h.area('messages')), /发送结果待核对/)
+  h.data.aiJob.inbound = { text: '我也爱你', at: 'old' }
+  h.data.chatRead = { ok: true, messages: [{ from: 'them', text: '新的问题', at: 'new' }] }
+  await h.click('刷新对话')
+  assert.ok(!h.button('DSH 回复').props.disabled, 'new inbound may be handled without retrying old uncertain send')
+  assert.match(h.text(h.area('messages')), /对方又发来了新消息/)
+  h.dispose()
+})
+await scenario('模型明确失败可重试，关闭对话或切分类不会触发发送', async () => {
+  const h=harness({data:{aiReply:async()=>({ok:false,error:'请先选择模型'})}});await h.flush();await h.click('读取消息');await h.clickNode(h.attr('data-dy-inbox-dm'))
+  await h.click('DSH 回复');assert.match(h.text(h.area('messages')),/请先选择模型/)
+  assert.ok(!h.button('DSH 回复').props.disabled)
+  await h.click('返回私信');await h.clickNode(h.button('评论区 @ 与回复 · 1') || h.button('评论区 @ 与回复'))
+  assert.equal(h.calls.filter(c=>c.path==='/chat/reply'&&c.method==='POST').length,1)
+  h.dispose()
+})
+await scenario('人设来源常驻、插件正文与中性回退可编辑保存；记忆按需展开', async () => {
+  const h = harness(); await h.flush(); await h.click('编辑人设')
+  const editor = h.nodes(h.area('persona')).find((node) => node.tag === 'textarea')
+  assert.match(editor.props.value, /插件口吻/)
+  await h.change(editor, '我的新口吻')
+  assert.match(h.text(h.area('persona')), /当前生效：插件自带的那份/, 'editing is not an effective source change')
+  await h.click('保存人设', 'persona')
+  assert.match(h.text(h.area('persona')), /当前生效：我写的人设/)
+  await h.click('填入中性默认'); assert.match(h.nodes(h.area('persona')).find((node) => node.tag === 'textarea').props.value, /中性默认/)
+  await h.click('读取统计')
+  assert.match(h.text(h.area('messages')), /私信 2 人.*评论 1 条作品/)
+  await h.click('清空全部记忆'); assert.equal(h.calls.filter(c=>c.path==='/memory/clear').length,0)
+  await h.click('取消'); assert.ok(h.button('清空全部记忆'))
+  assert.ok(!h.text().includes('不上传'))
+  h.dispose()
+})
+await scenario('帮助保留环境检查、DSH 路径、MCP、更新和使用说明', async () => {
+  const h = harness(); await h.flush(); await h.click('帮助与排查')
+  await h.click('检查环境', 'help'); assert.match(h.text(h.area('help')), /运行环境.*可以使用/)
+  await h.click('看接入方式'); assert.match(h.text(h.area('help')), /mcpServers/)
+  await h.click('复制 MCP 配置'); assert.match(h.copies.at(-1), /mcpServers/)
+  assert.ok(h.nodes(h.area('help')).some((node) => node.tag === 'input' && String(node.props.placeholder).includes('cli.js')))
+  await h.click('检查更新'); assert.match(h.text(h.area('about')), /已是最新版本/)
+  assert.equal(h.nodes().filter(n=>n.tag==='button'&&h.text(n)==='检查更新').length,1)
+  await h.click('使用指南')
+  assert.equal(h.attr('data-dy-guide').tag, 'dialog')
+  assert.match(h.text(h.attr('data-dy-guide')), /新手流程/)
+  assert.doesNotMatch(h.text(h.area('run')), /新手流程/)
+  await h.click('关闭'); assert.ok(!h.attr('data-dy-guide'))
+  h.dispose()
+})
+await scenario('使用指南读取失败在弹窗内重试，Escape 关闭', async () => {
+  const h = harness({ data: { guideError: true } }); await h.flush(); await h.click('使用指南')
+  assert.match(h.text(h.attr('data-dy-guide')), /使用指南读取失败/)
+  h.data.guideError = false; await h.click('重新读取指南')
+  assert.match(h.text(h.attr('data-dy-guide')), /新手流程/)
+  h.attr('data-dy-guide').props.onCancel({ preventDefault() {} }); await h.flush()
+  assert.ok(!h.attr('data-dy-guide'))
+  assert.equal(h.calls.filter((call) => call.method === 'POST').length, 0)
+  h.dispose()
+})
+await scenario('桌宠隔离与真 @ 工具约定继续有效', async () => {
+  const backend = readFileSync(join(ROOT, 'index.js'), 'utf8')
+  const code = backend.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
+  assert.match(code, /petStateOf/); assert.match(code, /deskpetStateSource/)
+  assert.doesNotMatch(code, /petWinWrite|pet-window-state\.json|spawn\(hostExe|PetHost\.exe/)
+  assert.doesNotMatch(source, /onChange:.*patch\(\{ petLinkTo/)
+  assert.doesNotMatch(source, /slots\.inject\('shell\.overlay'/)
+  assert.match(backend, /douyin_comment_mention/)
+  assert.doesNotMatch(backend, /mode = "ui"|mode="ui"/)
+  const h = harness(); await h.flush(); assert.ok(!h.text().includes('联动桌宠')); h.dispose()
+})
+
+console.log(`\n渲染检查：${passed} 个场景通过${process.exitCode ? '，存在失败' : ''}`)

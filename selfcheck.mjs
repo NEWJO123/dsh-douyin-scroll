@@ -526,7 +526,8 @@ try {
   if (/OBJECT_ARRAYS/.test(idx) && /windows/.test(idx)) ok('normalize 用白名单保住对象数组（空数组也不会吃）')
   else bad('normalize 还在靠 base[k].length 判断 —— 空 DEFAULT 会把对象数组吃光')
   // tick 必须把自定义时段并进去
-  if (/custom:\$\{i\}/.test(idx) && /cfg\.windows/.test(idx)) ok('定时器会把自定义时段拼进候选窗口')
+  const schedule = readFileSync(join(here, 'lib', 'schedule.mjs'), 'utf8')
+  if (/scheduledWindows\(cfg/.test(idx) && /cfg\.windows/.test(schedule)) ok('定时器使用包含自定义时段的统一计划判断')
   else bad('定时器没读 cfg.windows —— 配了也不跑')
   // ⚠️ 总开关 peakValley 不许再拦截（UI 已经没有它了）
   const hasPeakGate = /^\s*if \(!cfg\.peakValley\) return\s*$/m.test(idx)
@@ -657,21 +658,16 @@ try {
     bad(`设置页渲染失败：${why || String(r.stderr || '').slice(0, 200)}`)
   }
 
-  /* ── 4j-1. 面板三组结构（源码级守卫，2026-10-25） ── */
+  /* ── 4j-1. 常用入口常驻，低频区域和日志默认折叠 ── */
   const cl = readFileSync(join(here, 'client.js'), 'utf8')
-  for (const name of ['常开必看', '出问题才看', '一次配好']) {
-    if (cl.includes(`'${name}'`)) ok(`面板有组标题「${name}」`)
-    else bad(`面板缺组标题「${name}」—— 三组结构被打散了`)
+  for (const area of ['setup', 'run', 'sending', 'messages', 'persona', 'prefs', 'help']) {
+    if (cl.includes(`'data-dy-area': '${area}'`)) ok(`面板保留 ${area} 功能区域`)
+    else bad(`面板缺少 ${area} 功能区域`)
   }
-  // 组标题必须用 data-dy-group，不能占 data-dy-card（否则卡片计数不准）
-  if (/h\('div', \{ 'data-dy-group': '' \}/.test(cl) && /'data-dy-groupname'/.test(cl)) {
-    ok('组标题用 data-dy-group + data-dy-groupname（不占 data-dy-card，卡片计数才对）')
-  } else bad('组标题没有用 data-dy-group —— 卡片数会算错')
-  // 两个折叠组的状态默认 false（收起）
-  if (/const \[foldErr, setFoldErr\] = React\.useState\(false\)/.test(cl)) ok('「出问题才看」默认收起（foldErr 初始 false）')
-  else bad('「出问题才看」默认不是收起的 —— 面板会一上来就摊开')
-  if (/const \[foldCfg, setFoldCfg\] = React\.useState\(false\)/.test(cl)) ok('「一次配好」默认收起（foldCfg 初始 false）')
-  else bad('「一次配好」默认不是收起的')
+  for (const state of ['foldErr', 'foldCfg', 'logOpen', 'rawOpen', 'personaOpen']) {
+    if (new RegExp(`const \\[${state},[^\\]]+\\] = React\\.useState\\(false\\)`).test(cl)) ok(`${state} 默认折叠`)
+    else bad(`${state} 未默认折叠`)
+  }
   // hook 顺序：折叠状态必须在 `if (!st || !cfg)` 那个提前 return **之前**声明
   {
     const iFold = cl.indexOf('const [foldErr, setFoldErr]')
@@ -680,9 +676,9 @@ try {
       ok('折叠状态声明在「读设置中…」提前 return 之前（hook 顺序稳定，不会白屏）')
     } else bad(`折叠状态的 useState 放错位置（foldErr@${iFold} return@${iBail}）—— 必须在提前 return 之前`)
   }
-  // 二维码登录（新手必经）必须在「常开必看」里、默认就看得到
-  if (cl.indexOf("'开始使用'") < cl.indexOf("'出问题才看'")) {
-    ok('「开始使用」（含扫码登录）在「出问题才看」之前 ⇒ 属于常开必看，默认展开')
+  // 新手必需操作置于低频设置之前；可见性由上面的实际渲染测试验证。
+  if (cl.indexOf("'data-dy-area': 'setup'") < cl.indexOf("'data-dy-area': 'prefs'")) {
+    ok('首次使用入口位于运行偏好之前')
   } else bad('「开始使用」被排到折叠组后面了 —— 新手看不到扫码登录')
 } catch (e) { bad(`渲染检查跑不起来：${e.message}`) }
 
@@ -833,15 +829,14 @@ try {
   if (/\.lost-/.test(saveCfgBody)) ok('真要丢非空值会先备份成 .lost-<时间戳>')
   else bad('没有备份 —— 丢了只能靠翻日志猜')
   // ④ 面板：disabled 必须解释原因（不许只变灰）
-  //    0.5.9d 起「评论区 @ 提醒」改成「开关永远能点 + 点开即选人」，
-  //    所以这里的判据从旧文案（「点不动 —— 不是坏了」）改成新设计（不许再有变灰的死开关）。
+  //    自动发送是 @ 开关的前置条件；名单独立编辑，不能因尚未选人锁死开关。
   const cli11 = readIf(join(here, 'client.js'))
-  if (/disabled: !cfg\.autoSend \|\| busy === 'patch'/.test(cli11) && !/disabled: !cfg\.autoSend \|\| !atNick/.test(cli11)) {
-    ok('面板没有「缺前置条件就变灰」的死开关（0.5.9d：@ 开关永远能点，点开即选人）')
+  if (/disabled: !cfg\.autoSend \|\| Boolean\(busy\)/.test(cli11) && /自动发送已关闭，@ 提醒暂不生效/.test(cli11)) {
+    ok('@ 开关仅依赖自动发送与保存状态，并就地解释未生效原因')
   } else bad('面板又有变灰的死开关 —— 主人点了没反应会以为软件坏了')
-  if (/if \(!atPeers\.length && v && !people\) loadPeople\(\)/.test(cli11)) {
-    ok('@ 开关点开时自动读会话列表并选人（不会点了没反应）')
-  } else bad('@ 开关点开后没有自动读列表/选人 —— 点了像没反应')
+  if (/openRecipients\('at'\)/.test(cli11) && /已开启，选择对象后才会 @/.test(cli11) && /if \(people === null\) loadPeople\(\)/.test(cli11)) {
+    ok('@ 名单有独立选人入口，首次打开读取会话；空名单解释待选状态')
+  } else bad('@ 名单缺选人入口或未解释空名单状态')
 } catch (e) { bad(`4j-11 检查跑不起来：${e.message}`) }
 
 /* ── 4j-7 结束 ── */
@@ -885,14 +880,14 @@ try {
   else bad('im-send.mjs 没有 --list —— 面板列不出人')
   if (/dm\/people/.test(idx)) ok('后端有 /dm/people（读会话里的人）')
   else bad('后端缺 /dm/people')
-  if (/从我的会话里选/.test(cl) && /pickPerson/.test(cl)) ok('面板能"从我的会话里选"人（不用手填 sec_uid）')
+  if (/选择接收人/.test(cl) && /openRecipients\('dm'\)/.test(cl) && /pickPerson/.test(cl)) ok('面板可从会话中选择接收人（不用手填 sec_uid）')
   else bad('面板还在让用户手填私信对象')
   // ⑧ 同名必须标出来
   if (/duplicate/.test(ims) && /重名/.test(cl)) ok('同名的人会被标出来（避免选错）')
   else bad('同名的人没标 —— 重名时可能选错人')
   // ⑨ 新手流程说明要能看到（不用让用户去翻 GitHub）
-  if (/怎么用？/.test(cl) && /\/guide/.test(cl) && idx.includes('/api/douyin-duty/guide')) {
-    ok('面板有「怎么用？」能展开新手流程')
+  if (/使用指南/.test(cl) && /data-dy-guide/.test(cl) && /\/guide/.test(cl) && idx.includes('/api/douyin-duty/guide')) {
+    ok('面板有「使用指南」独立文档弹窗')
   } else bad('面板没有新手流程入口 —— 用户还得自己去翻文档')
   if (existsSync(join(here, 'GUIDE.md'))) ok('GUIDE.md 在（新手流程正文）')
   else bad('缺 GUIDE.md')
@@ -912,8 +907,8 @@ try {
   /* ── ⑫ 这些基本功能不许再丢 ── */
   const mustHave = [
     ['每天挑几条', /每天挑几条/],
-    ['日报详细程度', /日报写多细/],
-    ['通知方式', /通知：/],
+    ['日报详细程度', /日报详细程度/],
+    ['通知方式', /通知方式/],
     // 🔴 2026-10-26 主人：「人设是不是该改成我的人设」⇒ 标题定为「我的人设」
     ['人设编辑', /'我的人设'/],
   ]
@@ -1145,31 +1140,31 @@ try {
   // ① 收件箱：评论区 @ 我 + 谁私信我
   if (idx.includes('/api/douyin-duty/inbox')) ok('后端有 /inbox（评论区 @ + 私信列表一次读完）')
   else bad('后端缺 /inbox —— 面板看不到谁找我')
-  if (/看看谁找我/.test(cl)) ok('面板有「看看谁找我」按钮')
+  if (/读取消息/.test(cl)) ok('面板有「读取消息」按钮')
   else bad('面板没有消息入口')
-  if (/评论区 @ 我/.test(cl) && /最近私信/.test(cl)) ok('消息卡分了两块：评论区 @ 我 / 最近私信')
+  if (/评论区 @ 与回复/.test(cl) && /私信/.test(cl)) ok('消息卡分了两块：评论区 @ 与回复 / 私信')
   else bad('消息卡没分块')
-  if (/该回了/.test(cl) && /needs_reply/.test(cl)) ok('私信标了「该回了」（他最后说的比我晚）')
+  if (/待回复/.test(cl) && /needs_reply/.test(cl)) ok('私信标了「待回复」（他最后说的比我晚）')
   else bad('私信没说该不该回 —— 用户还得自己翻')
-  if (/记 \$\{p\.remembered/.test(cl) || /记 \$\{p\.remembered \|\| 0\}/.test(cl) || /remembered/.test(cl)) ok('显示跟这个人记得多少条（记忆）')
-  else bad('没显示记忆条数')
+  if (/mem\.dm/.test(cl) && /mem\.comment/.test(cl)) ok('对话记忆按需显示私信人数与评论作品数')
+  else bad('缺少记忆统计')
 
   // ② 评论区 @ 我：点进去能看到"我在这条视频下说过什么"
-  if (/my_comments_here/.test(cl) && /我在\s*这条视频下说过/.test(cl)) ok('评论区 @ 带我在这条视频下说过什么（靠记忆去重）')
+  if (/my_comments_here/.test(cl) && /我在这条作品下的过往发言/.test(cl)) ok('评论区 @ 保留作品下的历史发言（视频和图文共用）')
   else bad('评论区 @ 没带"我说过什么" —— 可能重复回同一句')
 
   // ③ 聊天模式
   if (idx.includes('/api/douyin-duty/chat/read') && idx.includes('/api/douyin-duty/chat/send')) ok('后端有 /chat/read + /chat/send')
   else bad('后端缺聊天接口')
-  if (/跟 ' \+ chat\.who\.nick \+ ' 聊/.test(cl)) ok('面板有聊天界面')
+  if (/function ChatConversation/.test(cl)) ok('面板有独立的私信会话界面')
   else bad('面板没有聊天界面')
   if (/data-dy-bubble/.test(cl)) ok('消息用气泡显示')
   else bad('消息不是气泡')
   if (/data-dy-inbox-dm/.test(cl)) ok('收件箱的私信按钮可点开聊天')
   else bad('收件箱的人点不开聊天')
-  if (/记得关于他的/.test(cl)) ok('聊天界面显示了记忆里的长期事实')
+  if (/关于对方：/.test(cl)) ok('聊天界面显示了记忆里的长期事实')
   else bad('聊天界面没显示记忆')
-  if (/发出去会进记忆|发出去的话会记进记忆/.test(cl)) ok('聊天说明了"发出去会进记忆"')
+  if (/回复时会作为上下文提供给当前使用的模型/.test(cl)) ok('说明记忆保存在本机且会作为回复上下文')
   else bad('聊天没说记忆行为')
   // 🔴 聊天发送必须落记忆（不然下次读还是不知道说过什么）
   if (/chat\/send'[\s\S]{0,1500}?noteSent\(stateDir/.test(idx)) ok('聊天发出去的消息会进记忆')
@@ -1192,9 +1187,9 @@ try {
   else bad('看消息间隔默认值不对')
   if (/聊天模式/.test(cl) && /Switch/.test(cl)) ok('设置页有「聊天模式」开关')
   else bad('面板没有聊天模式开关')
-  if (/React\.useEffect[\s\S]{0,900}?chat\/read/.test(cl) && /, 30_000\)/.test(cl)) ok('聊天界面开着时 30 秒自动刷新')
+  if (/const messages = setInterval[\s\S]{0,200}?read\(\)[\s\S]{0,100}30_000/.test(cl)) ok('聊天界面开着时 30 秒自动刷新')
   else bad('聊天界面不会自动刷新')
-  if (/chat\/read'[\s\S]{0,900}?im-http\.py/.test(idx)) ok('/chat/read 也走 HTTP 快路径（面板刷新不冷启浏览器）')
+  if (/const readChatConversation[\s\S]{0,1600}?im-http\.py/.test(idx) && /chat\/read'[\s\S]{0,700}?readChatConversation/.test(idx)) ok('/chat/read 复用 HTTP 快路径（面板刷新不冷启浏览器）')
   else bad('/chat/read 没接快路径 —— 面板每刷一次冷启一次浏览器')
   // 🔴 盯梢不许**自己发**：循环里出现「带正文发出去」的调用就报红。
   //    2026-10-25 晚口径更新：盯梢「看见」之后允许**转进值班会话**（tryDeliverToSession，
@@ -1328,9 +1323,9 @@ try {
     else bad('读失败没有自动重试 —— 普通用户只会觉得"它不回我"')
     if (/failStreak >= 3 && cwState\.notifiedKey !== notifyKey/.test(idxM)) ok('连续失败 3 次主动弹通知（且每种错只提醒一次，不刷屏）')
     else bad('连续失败不通知用户 —— 只写状态屏没人会去看')
-    if (/path === '\/api\/douyin-duty\/chat\/fix'/.test(idxM) && /一键修好/.test(cliM)) ok('面板有「一键修好」按钮 + 后端自救接口')
+    if (/path === '\/api\/douyin-duty\/chat\/fix'/.test(idxM) && /检查并修复聊天/.test(cliM)) ok('面板保留聊天检查修复按钮与接口')
     else bad('缺一键自救 —— 普通用户遇到问题只能干等')
-    if (/need_user/.test(idxM) && /还差一步/.test(cliM)) ok('自救失败时明确告诉用户"还差哪一步"（不让用户自己猜）')
+    if (/need_user/.test(idxM) && /need_user\?\.what/.test(cliM) && /need_user\?\.how/.test(cliM)) ok('聊天检查保留失败原因与后续处理建议')
     else bad('自救失败没告诉用户该干嘛')
     /* 🔴🔴 2026-10-26 凌晨：挂载自愈 + 不许变成"关不掉的开关"
      *   自愈看的是独立的 intent 文件（chat-watch-intent.json），不是 config.json ——
@@ -1359,7 +1354,7 @@ try {
     else bad('值班鱼缺席没有回退 —— 鱼不在时私信会石沉大海')
     if (/clientTimeZone: pickClientTimeZone\(\)/.test(idxM)) ok('值班投递带 clientTimeZone（dsh-time-context 校验需要）')
     else bad('值班投递缺 clientTimeZone —— 那轮时区会变 unavailable')
-    if (/消息投给/.test(cliM) && /值班小鱼/.test(cliM) && /chatWatchTarget/.test(cliM)) ok('面板有「消息投给」切换（前台/值班小鱼）')
+    if (/新消息交给/.test(cliM) && /值班小鱼/.test(cliM) && /chatWatchTarget/.test(cliM)) ok('面板有「新消息交给」切换（前台/值班小鱼）')
     else bad('面板缺投递目标切换 —— 主人没法选消息投给谁')
   } catch (e) { bad(`4m 检查跑不起来：${e.message}`) }
 
@@ -1446,7 +1441,7 @@ try {
   else bad('提示词没写怎么在评论区 @ 提醒 —— 开了也不会发')
   if (/只在\*\*最值得的那一条\*\*发/.test(idx)) ok('限制只发最值得的 1 条（不会刷屏）')
   else bad('没限制条数 —— 可能每条都发')
-  if (/只管「插件自己在后台跑的轮次」/.test(cl)) ok('面板说清了适用范围（只管后台轮次，不影响当场对话）')
+  if (/点击「DSH 回复」，不受自动发送开关影响/.test(cl)) ok('面板说明自动发送与逐条 DSH 回复的范围')
   else bad('面板没说清适用范围 —— 用户会以为当场也不能发')
 
   // ④ 跑一轮失败要能看见原因
@@ -1464,7 +1459,7 @@ try {
   else bad('/run 没给面板可显示的消息')
 
   // ⑥ 面板要有"看日志"
-  if (/看日志/.test(cl) && idx.includes('/api/douyin-duty/log')) ok('面板有「看日志」（点了没反应能自己排查）')
+  if (/本轮记录/.test(cl) && /原始日志/.test(cl) && idx.includes('/api/douyin-duty/progress')) ok('面板保留本轮记录及按需展开的原始日志')
   else bad('面板没有看日志入口')
 
   /* ── ⑦ 模型跟随：注释行必须能匹配 ──
@@ -1646,9 +1641,9 @@ try {
   //    判据用**步骤序号 + 各自的完成条件**（比在代码里找中文稳）：
   //       第 1 步的完成条件是 st.venvReady（装环境），第 2 步是 st.loggedIn（登录）。
   const cl = readFileSync(join(here, 'client.js'), 'utf8')
-  const step1 = /st\.venvReady \? '' : undefined \}, st\.venvReady \? '✓' : '1'/.test(cl)
+  const step1 = /'data-dy-setup-row': 'environment'/.test(cl)
   const step2 = /st\.loggedIn \? '' : undefined \}, st\.loggedIn \? '✓' : '2'/.test(cl)
-  const i1 = cl.indexOf("st.venvReady ? '✓' : '1'")
+  const i1 = cl.indexOf("'data-dy-setup-row': 'environment'")
   const i2 = cl.indexOf("st.loggedIn ? '✓' : '2'")
   if (step1 && step2 && i1 > 0 && i2 > i1) ok('设置页顺序正确：第 1 步装环境 → 第 2 步扫码登录')
   else bad(`设置页没有「先装环境再登录」的步骤顺序（step1=${step1}@${i1} step2=${step2}@${i2}）—— 用户不知道该先做什么`)

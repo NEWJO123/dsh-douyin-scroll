@@ -149,6 +149,7 @@ class DraftGateTests(unittest.TestCase):
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { createCommentSender } from './lib/comment-send.mjs';
 const fail = () => { throw new Error('SIDE EFFECT: draft crossed send gate'); };
 const args = { aweme_id:'7000000000000000001', work_url:'https://www.douyin.com/note/7000000000000000001', aweme_type:0,
   comment_id:'9223372036854775807', root_comment_id:'9223372036854775806', text:'offline draft' };
@@ -161,13 +162,13 @@ const verify = (draft) => {
 const host = readFileSync('index.js', 'utf8');
 const nameAt = host.indexOf("name: 'douyin_comment_reply'");
 assert.ok(nameAt > 0);
-const begin = host.lastIndexOf('tool({', nameAt);
-const end = host.indexOf('\n  })', nameAt) + '\n  })'.length;
+const begin = host.lastIndexOf('const commentReplySpec = {', nameAt);
+const end = host.indexOf('const executeCommentReply = ', nameAt);
 assert.ok(begin >= 0 && end > begin);
 const declaration = host.slice(host.indexOf('const workParameters'), host.indexOf('// ⭐ 这两样'));
 const hostContext = { tool:(value) => { hostContext.reply = value; }, runNodeTool:fail, runPy:fail,
   sendGate:fail, fetch:fail, markSent:fail, readbackAfter:fail };
-vm.runInNewContext(declaration + host.slice(begin, end), hostContext);
+vm.runInNewContext(declaration + host.slice(begin, end) + ';globalThis.reply = commentReplySpec;', hostContext);
 for (const confirm of [undefined, false]) {
   const draft = await hostContext.reply.execute({ ...args, confirm });
   verify(draft);
@@ -179,7 +180,7 @@ verify(uiDraft);
 const mcp = readFileSync('tools/mcp-server.mjs', 'utf8');
 const work = mcp.slice(mcp.indexOf('const workProperties'), mcp.indexOf('const SERVER_NAME'));
 const tools = mcp.slice(mcp.indexOf('const TOOLS = ['), mcp.indexOf('/* ─────────────────────────── JSON-RPC'));
-const context = { needLogin:() => null, needSetup:() => null, runNode:fail, run:fail, runPy:fail, fetch:fail };
+const context = { needLogin:() => null, needSetup:() => null, runNode:fail, run:fail, runPy:fail, fetch:fail, createCommentSender, HOME:'unused-offline-home' };
 vm.runInNewContext(work + tools + ';globalThis.testTools = TOOLS;', context);
 for (const confirm of [undefined, false]) {
   const draft = context.testTools.find(t => t.name === 'douyin_comment_reply').handler({ ...args, confirm });

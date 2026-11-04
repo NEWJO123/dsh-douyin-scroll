@@ -12,7 +12,7 @@ const publishSource = readFileSync(new URL('../lib/comment-publish-ui.mjs', impo
 // Exercise the native publisher's actual control flow with immediate UI waits.
 // Browser expressions still execute against the fake DOM, and CDP is entirely local.
 const publishComment = vm.runInNewContext(
-  publishSource.replace(/^import[^\n]*\n/gm, '').replace('export async function publishComment', 'async function publishComment') + ';publishComment',
+  publishSource.replace(/^import[^\n]*\n/gm, '').replace(/^export /gm, '') + ';publishComment',
   { sleep: async () => {}, openCommentsPanel, pageRequestSource, scrollComments,
     URL, URLSearchParams, Buffer, setTimeout, clearTimeout },
 )
@@ -59,7 +59,7 @@ function fakeNode({ x = 0, y = 0, width = 50, height = 25, text = '', cid = '' }
   }
 }
 
-function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId = '', replyTo = '' } = {}) {
+function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId = '', replyTo = '', cloneRoot = false, unknownClones = false } = {}) {
   const calls = []
   const listeners = new Map()
   const state = { inserted: '', selected: '', intercepted: false, nativeRequests: 0, reads: [], uiBegan: false }
@@ -82,10 +82,13 @@ function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId
   const rootButton = fakeNode({ x: 30, y: 80, text: '回复' })
   const nestedButton = fakeNode({ x: 40, y: 140, text: '回复' })
   const hiddenLegacy = fakeNode({ width: 0, height: 0, text: 'root text', cid: root })
+  const rootClone = fakeNode({ x: 10, y: 250, width: 500, height: 100, text: 'root text', cid: unknownClones ? '' : root })
   rootItem.children = [rootButton, nestedItem]
   nestedItem.children = [nestedButton]
   rootItem.querySelectorAll = () => [rootButton, nestedButton]
   nestedItem.querySelectorAll = () => [nestedButton]
+  rootClone.querySelectorAll = () => [rootButton]
+  if (unknownClones) rootItem.getAttribute = () => null
   const editor = fakeNode({ x: 10, y: 400, width: 500, height: 60 })
   const scope = fakeNode({ x: 0, y: 390, width: 600, height: 100 })
   const arrow = fakeNode({ x: 480, y: 450, width: 30, height: 30 })
@@ -100,7 +103,7 @@ function nativePage({ mutate = () => {}, responseBody, duplicate = false, rootId
       assert.equal(state.reads.length, expectedReads, 'All target/root text reads must precede native UI work')
       if (selector === '.public-DraftEditor-content') return [editor]
       if (selector.includes('comment-list') && selector.includes('comment-item')) return [list, hiddenLegacy, rootItem, nestedItem]
-      if (selector === '[data-e2e="comment-item"]') return [hiddenLegacy, rootItem, nestedItem]
+      if (selector === '[data-e2e="comment-item"]') return [hiddenLegacy, rootItem, nestedItem, ...(cloneRoot ? [rootClone] : [])]
       if (selector.includes('comment-list')) return [list]
       throw new Error('Unexpected DOM query: ' + selector)
     },
@@ -188,6 +191,18 @@ test('dry native publishing inspects matching IDs and blocks the request', async
   assert.equal(result.payload.text, text)
   assert.equal(countCalls(page, 'Fetch.continueRequest'), 0)
   assert.equal(countCalls(page, 'Fetch.failRequest'), 1)
+})
+
+test('same-ID visible clones select the original once; text-only duplicates stop before editor input', async () => {
+  const page = nativePage({ rootId: root, cloneRoot: true, responseBody: success })
+  assert.equal((await publishComment(page.c, { aweme_id: id, root, text })).attempted, true)
+  assert.equal(countCalls(page, 'Fetch.continueRequest'), 1)
+  const ambiguous = nativePage({ rootId: root, cloneRoot: true, unknownClones: true })
+  const result = await publishComment(ambiguous.c, { aweme_id: id, root, text })
+  assert.equal(result.attempted, false)
+  assert.match(result.error, /匹配多条/)
+  assert.equal(countCalls(ambiguous, 'Input.insertText'), 0)
+  assert.equal(countCalls(ambiguous, 'Fetch.continueRequest'), 0)
 })
 
 test('wrong work, text, root or nested target never releases a request', async () => {

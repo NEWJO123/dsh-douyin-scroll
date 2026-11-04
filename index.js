@@ -40,6 +40,14 @@ import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharte
 import { saveCookie, readCookie, hasCredential, credentialInfo, clearCredential, cookiePath } from './lib/credential.mjs'
 import { sendWebhook, condense, maskUrl } from './lib/notify.mjs'
 import { sendToast, toastSummary } from './lib/toast.mjs'
+import { readRunProgress, reportPicks } from './lib/run-status.mjs'
+import { ALL_DAYS, autoEnabled, scheduleDays, scheduledWindows, schedulePatchError, remapUsedWindows } from './lib/schedule.mjs'
+import { beginRound, readRecord, writeRecord, recordEvent, finishRound, submitRoundResult,
+  recommendationCounts, dayRecommendations, roundIsBusy, safeLog } from './lib/run-record.mjs'
+import { createCommentSender } from './lib/comment-send.mjs'
+import { createDmReplyService, generateDmReply, loadReplyPersona } from './lib/dm-reply.mjs'
+import { createCommentAiReplyService, createCommentEvidenceCache, generateCommentReply } from './lib/comment-ai-reply.mjs'
+import { setupFiles, PY_IMPORT_PROBE, PY_PACKAGES } from './lib/setup-health.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
 import {
   loadDmMemory, mergeDmMemory, noteSent, addFacts, dmContext,
@@ -85,6 +93,9 @@ export const optional = ['llm', 'webServer']
 export const Config = !z ? undefined : z.object({
   /** 每天最多挑几条（0 = 不自动刷，但还能手动跑） */
   perDay: z.natural().default(5).extra('volatile', true),
+  manualPerRun: z.natural().default(3).extra('volatile', true),
+  autoEnabled: z.boolean().default(true).extra('volatile', true),
+  scheduleDays: z.array(z.natural()).default([0, 1, 2, 3, 4, 5, 6]).extra('volatile', true),
   /** 每次最多筛选几个候选（送给模型判断的上限，省 token） */
   maxPerRun: z.natural().default(12).extra('volatile', true),
   /** 峰谷自动刷（总开关） */
@@ -348,7 +359,7 @@ export function apply(ctx, config) {
 
   /* ── 配置：逐字段按默认值类型挑一遍（apply 传进来的值不保证是标量） ── */
   const DEFAULTS = {
-    perDay: 5, maxPerRun: 12, peakValley: false, noon: true, night: true,
+    perDay: 5, manualPerRun: 3, autoEnabled: true, scheduleDays: [...ALL_DAYS], maxPerRun: 12, peakValley: false, noon: true, night: true,
     windows: [],
     keywords: [], channels: [], authors: [],
     minDescLen: 12, minComments: 3,
@@ -387,7 +398,7 @@ export function apply(ctx, config) {
    *    面板的「清空关键词」按钮会带 `__clearKeys: ['keywords']` —— 显式口子，过守卫。
    *    （键名带双下划线前缀，天生撞不了配置字段名；clampPatch 不认识它，不会漏出去。）
    */
-  const ARRAY_FIELDS = Object.keys(DEFAULTS).filter((k) => Array.isArray(DEFAULTS[k]))
+  const ARRAY_FIELDS = Object.keys(DEFAULTS).filter((k) => Array.isArray(DEFAULTS[k]) && !['windows', 'scheduleDays'].includes(k))
   /**
    * 把面板的显式清空标记摘出来：返回 { patch（干净 patch）, cleared（明确要清空的数组字段） }。
    * `__clearKeys` 只活在「面板 → persistCfg」这一段，进不了配置（clampPatch 会丢掉未知键），
@@ -410,7 +421,7 @@ export function apply(ctx, config) {
       if (v === undefined || v === null) continue
       if (Array.isArray(base[k])) {
         if (!Array.isArray(v)) continue
-        out[k] = OBJECT_ARRAYS.has(k)
+        out[k] = k === 'scheduleDays' ? scheduleDays(v) : OBJECT_ARRAYS.has(k)
           ? v.filter((x) => x && typeof x === 'object' && !Array.isArray(x))
           : v.filter((x) => typeof x === 'string')
       }
@@ -450,6 +461,8 @@ export function apply(ctx, config) {
     const p = {}
     for (const k of Object.keys(patch || {})) if (k in DEFAULTS) p[k] = patch[k]
     if ('perDay' in p) p.perDay = Math.max(0, Math.min(Number(p.perDay) || 0, 300))
+    if ('manualPerRun' in p) p.manualPerRun = Math.max(1, Math.min(Math.trunc(Number(p.manualPerRun) || 3), 30))
+    if ('scheduleDays' in p) p.scheduleDays = scheduleDays(p.scheduleDays)
     if ('maxPerRun' in p) p.maxPerRun = Math.max(1, Math.min(Number(p.maxPerRun) || 1, 30))
     if ('minDescLen' in p) p.minDescLen = Math.max(0, Math.min(Number(p.minDescLen) || 0, 200))
     if ('minComments' in p) p.minComments = Math.max(0, Math.min(Number(p.minComments) || 0, 1000))
@@ -475,7 +488,12 @@ export function apply(ctx, config) {
     return row
   }
   const hostCfg = () => normalize(config, { ...DEFAULTS })
-  const savedCfg = () => normalize(readJson(cfgFile, {}), { ...DEFAULTS })
+  const savedCfg = () => {
+    const saved = readJson(cfgFile, {})
+    const out = normalize(saved, { ...DEFAULTS })
+    out.autoEnabled = autoEnabled({ ...out, autoEnabled: saved.autoEnabled })
+    return out
+  }
   /**
    * 🔴🔴🔴 合并规则的核心（2026-10-25 事故后重写，别改回去）：
    *
@@ -750,9 +768,18 @@ export function apply(ctx, config) {
     // ⭐ 显式清空口子（2026-10-25 晚）：面板真要清空某个数组字段时带 `__clearKeys`，
     //    这里摘出来传给两路保存；标记本身**不是配置字段**（clampPatch 会丢），不能靠它过关。
     const { patch, cleared } = stripClearKeys(rawPatch)
+    const scheduleError = schedulePatchError(cfg, patch)
+    if (scheduleError) return { error: scheduleError }
     const prevChatWatch = Boolean(cfg.chatWatch)   // 变更前值（判断"开关刚被打开"用）
     const clean = clampPatch(patch)
+    const previousSchedule = { ...cfg }
     saveCfg(clean, { cleared })
+    if (['noon', 'night', 'windows', 'scheduleDays'].some((key) => key in clean)) {
+      const stateFile = join(stateDir, 'state.json')
+      const state = readJson(stateFile, {})
+      const used = remapUsedWindows(previousSchedule, cfg, state.windows || {})
+      if (JSON.stringify(used) !== JSON.stringify(state.windows || {})) writeJson(stateFile, { ...state, windows: used })
+    }
     syncCollectorCfg()               // ⭐ Python 那头的 router 读 collector.json
     // ⭐ 触发点②「上岗报号」：开关从关→开的那一刻，小鱼主动私信说一句话（主人 2026-10-25 令）。
     //    异步开跑（im-send 走无头 Chrome 要几十秒，绝不能卡住设置请求）；成败都写 chat-watch.log。
@@ -811,7 +838,7 @@ export function apply(ctx, config) {
     ? join(stateDir, '.venv', 'Scripts', 'python.exe')
     : join(stateDir, '.venv', 'bin', 'python')
   /** ⭐ "就绪"必须检查依赖真的装上了，不能只看目录存不存在 */
-  const venvReadyNow = () => existsSync(venvPython()) && hasPkg(join(stateDir, '.venv'), 'httpx')
+  const venvReadyNow = () => setupFiles(stateDir).pythonReady
 
   const installLogFile = join(stateDir, 'install.log')
   const appendInstall = (s) => { try { appendFileSync(installLogFile, s, 'utf8') } catch { /* 算了 */ } }
@@ -861,47 +888,66 @@ export function apply(ctx, config) {
   ]
 
   let installing = false
-  /** 建 venv + 装主依赖 —— ⭐ **起完就返回，不等它装完**（否则会话会僵住几分钟） */
+  let install = { phase: 'idle', stage: '', error: '', startedAt: 0, endedAt: 0 }
+  /** 只补缺失的运行依赖；登录态由第二步单独处理。起完即返回，避免堵住宿主。 */
   const runInstall = () => {
-    if (installing) return { ok: true, busy: true, log: installLogFile, hint: '正在装，别重复起' }
+    if (installing) return { ok: true, busy: true, install, log: installLogFile, hint: '正在修复运行环境，请勿重复启动' }
     installing = true
+    install = { phase: 'running', stage: 'checking', error: '', startedAt: Date.now(), endedAt: 0 }
     appendInstall(`\n=== ${new Date().toISOString()} 开始装主依赖 ===\n`)
     ;(async () => {
       try {
         const req = join(pluginDir, 'requirements.txt')
         const venvPy = venvPython()
-        const uvCmd = await resolveUv()
+        let uvCmd = null
         if (!existsSync(venvPy)) {
+          install.stage = 'python'
+          uvCmd = await resolveUv()
           if (uvCmd) await spawnTo(uvCmd, ['venv', '--seed', join(stateDir, '.venv')])
           if (!existsSync(venvPy)) await spawnTo(String(cfg.pythonPath || 'python'), ['-m', 'venv', join(stateDir, '.venv')])
         }
         if (!existsSync(venvPy)) {
           const msg = '建不了 Python 环境 —— 这台机器上既没有可用的 uv，也没有可用的 python。\n'
             + '装一个就行：uv（单文件 exe，https://docs.astral.sh/uv/）或 Python 3.10+（安装时勾 Add to PATH），然后回来再点一次。\n'
-          appendInstall(msg); log('装依赖：建环境失败'); installing = false; return
+          throw new Error(msg)
         }
-        let code = 1
-        for (const m of MIRRORS) {
-          if (code === 0) break
-          if (uvCmd) code = await spawnTo(uvCmd, ['pip', 'install', '--python', venvPy, '-i', m, '-r', req])
-          if (code !== 0) code = await spawnTo(venvPy, ['-m', 'pip', 'install', '-i', m, '-r', req])
+        const importsReady = async () => {
+          const result = await spawnCapture(venvPy, ['-c', PY_IMPORT_PROBE], { timeout: 30_000, env: pyEnv() })
+          let imported = {}
+          try { if (result.status === 0) imported = JSON.parse(result.stdout) } catch { /* reinstall below */ }
+          return PY_PACKAGES.every((name) => imported[name]?.ok === true)
         }
-        if (code === 0 && existsSync(venvPy)) {
-          await persistCfg({ pythonPath: venvPy })
-          appendInstall(`已把 pythonPath 设为 ${venvPy}\n`)
-          // ⭐ 签名器运行时（Issue #2① / #4）：jsdom + 字节 SDK + 真签验货 —— 没它读评论是死的
+        install.stage = 'dependencies'
+        if (!(await importsReady())) {
+          uvCmd ||= await resolveUv()
+          let code = 1
+          for (const m of MIRRORS) {
+            if (code === 0) break
+            if (uvCmd) code = await spawnTo(uvCmd, ['pip', 'install', '--python', venvPy, '-i', m, '-r', req])
+            if (code !== 0) code = await spawnTo(venvPy, ['-m', 'pip', 'install', '-i', m, '-r', req])
+          }
+          if (code !== 0 || !(await importsReady())) throw new Error('httpx / curl_cffi 尚未安装完整或无法导入，请查看本处安装记录后重试')
+        } else appendInstall('httpx / curl_cffi 已可正常导入，无需重装\n')
+        if (String(cfg.pythonPath) !== venvPy) await persistCfg({ pythonPath: venvPy })
+        if (!setupFiles(stateDir).signer.ready) {
+          install.stage = 'signer'
           appendInstall('\n=== 签名器运行时（读评论要用） ===\n')
-          const sCode = await spawnTo(process.execPath, [join(pluginDir, 'tools', 'signer-setup.mjs')], { cwd: pluginDir })
+          const sCode = await spawnTo(process.execPath, [join(pluginDir, 'tools', 'signer-setup.mjs')], {
+            cwd: pluginDir, env: { DOUYIN_HOME: stateDir, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) },
+          })
           log(`签名器运行时安装结束：exit=${sCode}`)
+          if (sCode !== 0 || !setupFiles(stateDir).signer.ready) throw new Error('Python 依赖已就位，但签名器未修复完成，请查看安装记录后重试')
         }
-        appendInstall(`=== 结束（exit ${code}，venvReady=${venvReadyNow()}）===\n`)
-        log(`装主依赖结束：exit=${code} venvReady=${venvReadyNow()}`)
+        install.phase = 'completed'; install.stage = 'done'
+        appendInstall('=== 运行环境已就位；账号登录请在第二步完成 ===\n')
+        log('装主依赖结束：Python 依赖和签名器已就位')
       } catch (e) {
+        install.phase = 'failed'; install.error = safeLog(e?.message || e)
         appendInstall(`装依赖崩了：${e?.stack ?? e}\n`)
         log(`装依赖崩了：${e?.message ?? e}`)
-      } finally { installing = false }
+      } finally { installing = false; install.endedAt = Date.now() }
     })()
-    return { ok: true, started: true, log: installLogFile, hint: '正在后台装依赖（走国内镜像，通常几十秒）' }
+    return { ok: true, started: true, install, log: installLogFile, hint: '正在检查并补齐运行依赖，登录请在第二步完成' }
   }
 
   /* ─────────────── MCP（已移除） ───────────────
@@ -1002,14 +1048,15 @@ export function apply(ctx, config) {
    * ⚠️ 2026-10-22：这里以前写死 `IM_CDP_PORT: '9334'` —— 那等于把 lib/chrome.mjs 的
    *    端口自动探测**废掉**（强制 9334，撞上就死）。现在只注入家目录，端口交给 lib 自己找。
    */
-  const runNodeTool = async (script, args = [], { timeout = 240_000 } = {}) => {
+  const runNodeToolUnlocked = async (script, args = [], { timeout = 240_000 } = {}) => {
     const f = join(pluginDir, 'tools', script)
     if (!existsSync(f)) return { status: -1, stdout: '', stderr: `缺少 tools/${script}` }
-    return withScriptLock(script, () => spawnCapture(process.execPath, [f, ...args], {
+    return spawnCapture(process.execPath, [f, ...args], {
       timeout,
       env: pyEnv({ DOUYIN_HOME: stateDir }),
-    }))
+    })
   }
+  const runNodeTool = (script, args = [], options = {}) => withScriptLock(script, () => runNodeToolUnlocked(script, args, options))
   /**
    * 跑插件自带的 Python 脚本（tools/*.py），返回 {status, stdout, stderr} —— 永不抛
    * ⚠️ 2026-10-21：这里以前是一份内置 MCP server（vendor/douyin-mcp，33 个文件 / 506 KB）+
@@ -1033,6 +1080,74 @@ export function apply(ctx, config) {
     if (i < 0 || j <= i) return null
     try { return JSON.parse(t.slice(i, j + 1)) } catch { return null }
   }
+
+  /** Settings reads and one-shot replies share the same identity checks and DM memory flow. */
+  const readChatConversation = async ({ toId, to, unlocked = false }) => {
+    if (!toId && !to) return { ok: false, error: '不知道读谁的会话' }
+    if (!hasCredential(stateDir)) return { ok: false, error: '还没登录' }
+    if (toId) {
+      try {
+        const result = await runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', '40', '--include-nontext'], { timeout: 30_000 })
+        const json = pickJson(result.stdout)
+        if (result.status === 0 && json?.ok && json.matched) {
+          if (json.matched.sec_uid !== toId) return { ok: false, error: '私信对象身份核对失败，没有读取其他人的上下文' }
+          const messages = Array.isArray(json.matched.messages) ? json.matched.messages : []
+          let context = null
+          try {
+            mergeDmMemory(stateDir, toId, json.matched.nickname || to, messages)
+            context = dmContext(stateDir, toId, { recent: 20 })
+          } catch { /* Fresh read remains available if memory storage fails. */ }
+          return { ok: true, via: 'http', to: json.matched.nickname || to, to_sec_uid: toId,
+            count: messages.length, mine: messages.filter((message) => message.from === 'me').length,
+            them: messages.filter((message) => message.from === 'them').length,
+            unknown: messages.filter((message) => !['me', 'them'].includes(message.from)).length,
+            messages: messages.slice(-40), context: context || { note: '记忆里没有更多对话记录' } }
+        }
+      } catch { /* The existing verified browser read is the explicit fallback. */ }
+    }
+    const argv = ['--read']
+    if (to) argv.push('--to', to)
+    if (toId) argv.push('--to-id', toId)
+    const result = await (unlocked ? runNodeToolUnlocked : runNodeTool)('im-send.mjs', argv, { timeout: 240_000 })
+    const json = pickJson(result.stdout)
+    if (result.status !== 0 || !json?.ok) return { ok: false, error: String(json?.error || '读不到会话') }
+    if (json.verified_open !== true || (toId && json.to_sec_uid !== toId)) return { ok: false, error: '打开的私信会话身份核对失败' }
+    let context = null
+    try {
+      if (json.to_sec_uid) {
+        mergeDmMemory(stateDir, json.to_sec_uid, json.to || to, Array.isArray(json.messages) ? json.messages : [])
+        context = dmContext(stateDir, json.to_sec_uid, { recent: 20 })
+      }
+    } catch { /* Fresh read remains available if memory storage fails. */ }
+    return { ok: true, via: 'browser', to: json.to, to_sec_uid: json.to_sec_uid,
+      count: json.count, mine: json.mine, them: json.them, unknown: json.unknown,
+      messages: Array.isArray(json.messages) ? json.messages.slice(-40) : [],
+      context: context || { note: '记忆里没有更多对话记录' } }
+  }
+
+  const manualDmReply = createDmReplyService({
+    stateDir, read: readChatConversation,
+    generate: ({ conversation, signal }) => {
+      const llm = (() => { try { return ctx.get('llm') } catch { return null } })()
+      const route = (() => { try { return ctx.get('agentDefaultModel')?.currentSelection?.() } catch { return null } })()
+      return generateDmReply({ llm, route, signal, conversation, context: conversation.context,
+        persona: loadReplyPersona(stateDir, pluginDir) })
+    },
+    withSendLock: (fn) => withScriptLock('im-send.mjs', fn),
+    send: async ({ toId, to, text }) => {
+      const argv = ['--to-id', toId, '--text', text]
+      if (to) argv.push('--to', to)
+      const result = await runNodeToolUnlocked('im-send.mjs', argv, { timeout: 240_000 })
+      const json = pickJson(result.stdout)
+      if (result.status !== 0 || json?.readback !== true) return { ok: false, sent: false,
+        error: '发送器没有完成可信回读，发送结果不确定；不会重发，请先查看抖音会话' }
+      return json
+    },
+    noteSent: ({ toId, to, text }) => {
+      noteSent(stateDir, toId, to, text, 'text')
+      noteDm('text', toId)
+    },
+  })
 
   /**
    * ⭐⭐ 2026-10-23 新增：**发送闸 / 限流退避 / 三态回读**
@@ -1169,6 +1284,7 @@ export function apply(ctx, config) {
       const warn = j.warns || []
       if (bad.length) log(`doctor: ${bad.length} 项要修（${bad.map((x) => x.item).join('、')}）`)
       return {
+        ...j,
         ok: j.ok !== false,
         items: j.items,
         must_fix: bad,
@@ -1597,7 +1713,7 @@ export function apply(ctx, config) {
     },
   })
 
-  tool({
+  const commentReplySpec = {
     name: 'douyin_comment_reply',
     /**
      * ⭐⭐ 2026-10-23 **重新设计**（使用者：「回评论好像还有问题，要不要重新设计一下」）
@@ -1751,7 +1867,7 @@ export function apply(ctx, config) {
       const gate = await sendGate(stateDir, mode)
       if (!gate.ok) {
         return {
-          ok: false, error: '发送太密，被本地闸拦下了', wait_sec: gate.waitSec,
+          ok: false, attempted: false, error: '发送太密，被本地闸拦下了', wait_sec: gate.waitSec,
           hint: `上一轮发送在 ${gate.lastSec} 秒前。抖音对连发很敏感（实测连发 3 条后 403）。`
             + `等 ${gate.waitSec} 秒再试，或者干脆攒一批、隔几分钟发。`,
         }
@@ -1827,7 +1943,10 @@ export function apply(ctx, config) {
 
       markSent(stateDir, 'api')
       if (res.ok) {
-        try { noteMyComment(stateDir, aweme, { cid: res.cid || '', text }) } catch { /* 记不上不影响发 */ }
+        try {
+          noteMyComment(stateDir, aweme, { cid: res.cid || '', text })
+          if (replyTo && res.cid && res.placement?.verified === true && res.placement?.ok === true) markSeen(stateDir, aweme, [replyTo])
+        } catch { /* 记不上不影响发 */ }
       }
       /**
        * ⭐ 核实"真的进了楼没有"（2026-10-23 定稿）
@@ -1847,6 +1966,11 @@ export function apply(ctx, config) {
       }
       return { ...res, mode, placement: placedRight, readback }
     },
+  }
+  const executeCommentReply = createCommentSender({ home: stateDir, execute: commentReplySpec.execute })
+  tool({ ...commentReplySpec, execute: executeCommentReply })
+  const commentEvidence = createCommentEvidenceCache({
+    read: () => readAtMe({ limit: 30, include_seen: true, mark_seen: false }),
   })
 
   /**
@@ -1863,7 +1987,7 @@ export function apply(ctx, config) {
     if (!hasCredential(stateDir)) return { ok: false, error: '还没登录', hint: '先在设置页扫码登录' }
     const r = await runPy('notice-read.py', ['--raw'], { timeout: 150_000 })
     const j = pickJson(r.stdout)
-    if (!j) return { ok: false, error: '没读到通知', stderr: String(r.stderr || '').slice(0, 300) }
+    if (r.status !== 0 || j?.ok !== true) return { ok: false, error: String(j?.error || '没读到通知'), stderr: String(r.stderr || '').slice(0, 300) }
     const items = Array.isArray(j.items) ? j.items : []
     /**
      * ⭐ 两类都算"有人在跟我说话"：
@@ -1908,6 +2032,7 @@ export function apply(ctx, config) {
       })
       if (out.length >= limit) break
     }
+    commentEvidence.remember(out)
 
     // ⚠️ 只有**明确要求**才标记看过了（默认不标，免得"看一眼就消失"）
     if (args.mark_seen === true) {
@@ -1946,6 +2071,17 @@ export function apply(ctx, config) {
         : (ats.length ? '这些都回过了（加 include_seen:true 可以再看一遍）' : '最近没有新的 @ / 回复'),
     }
   }
+
+  const manualCommentReply = createCommentAiReplyService({
+    stateDir, evidence: (target) => commentEvidence.get(target), send: executeCommentReply,
+    alreadyReplied: (original) => Boolean(loadCommentMemory(stateDir, original.aweme_id)?.seen?.includes(original.comment_id)),
+    generate: ({ evidence, signal }) => {
+      const llm = (() => { try { return ctx.get('llm') } catch { return null } })()
+      const route = (() => { try { return ctx.get('agentDefaultModel')?.currentSelection?.() } catch { return null } })()
+      return generateCommentReply({ llm, route, signal, evidence, memory: loadCommentMemory(stateDir, evidence.aweme_id),
+        persona: loadReplyPersona(stateDir, pluginDir) })
+    },
+  })
 
   tool({
     name: 'douyin_at_me',
@@ -2240,7 +2376,9 @@ export function apply(ctx, config) {
     async execute(args) {
       let host = null
       if (args?.patch && typeof args.patch === 'object' && !Array.isArray(args.patch)) {
-        host = (await persistCfg(args.patch)).host
+        const saved = await persistCfg(args.patch)
+        if (saved.error) return { ok: false, error: saved.error }
+        host = saved.host
       }
       return { ok: true, config: cfg, windows: WINDOWS, home: stateDir, venvReady: venvReadyNow(), host }
     },
@@ -2257,14 +2395,14 @@ export function apply(ctx, config) {
 
   /**
    * ⭐ 跨天翻篇：插件可能连续挂好几天，`state.json` 的 day 不该停在旧日期。
-   *    只重置**按天算的计数**（轮数 / 挑了几条 / 谷时窗口），
+   *    只重置**按天算的计数**（轮数 / 挑了几条）；带日期的时段记录保留，防跨夜重跑。
    *    `dutyRunningAt` / `roundActive` 必须留着 —— 半夜跨点那一轮可能还在跑，不能把防双开的闸拆了。
    */
   const rollDay = () => {
     const st = readJson(dutyStateFile, {})
     const today = dayKey()
     if (st.day === today) return st
-    const next = { ...st, day: today, count: 0, picked: 0, windows: {} }
+    const next = { ...st, day: today, count: 0, picked: 0 }
     writeJson(dutyStateFile, next)
     return next
   }
@@ -2291,11 +2429,9 @@ export function apply(ctx, config) {
       return ids.size
     } catch { return 0 }
   }
-  const countPickedToday = (now = new Date()) => {
-    const st = readJson(dutyStateFile, {})
-    const fromState = st.day === dayKey(now) ? Number(st.picked || 0) : 0
-    return Math.max(fromState, countPicks(reportFileOf(now)))
-  }
+  const reportTextOfDay = (day = dayKey()) => { try { return readFileSync(join(outDir, `${day}.md`), 'utf8') } catch { return '' } }
+  const countsToday = (now = new Date()) => recommendationCounts(stateDir, dayKey(now), reportTextOfDay(dayKey(now)))
+  const countPickedToday = (now = new Date()) => countsToday(now).total
   const roundsToday = (now = new Date()) => {
     const st = readJson(dutyStateFile, {})
     return st.day === dayKey(now) ? Number(st.count || 0) : 0
@@ -2466,7 +2602,7 @@ export function apply(ctx, config) {
    *    发评论那条链路只该在用户显式打开时才给 ⇒ 用 env 在**注册层**拦掉。
    *    扫码登录（`douyin_login_interactive`）**永远不给** —— 那是给人做的。
    */
-  const ensureOverlay = () => {
+  const ensureOverlay = (roundId = '') => {
     const file = join(stateDir, 'headless-overlay.yml')
     const posix = (p) => String(p).replace(/\\/g, '/')
     const yml = []
@@ -2581,6 +2717,7 @@ export function apply(ctx, config) {
             `        args: ['${posix(mcpServer)}']`,
             '        env:',
             `          DOUYIN_HOME: '${posix(stateDir)}'`,
+            `          DOUYIN_ROUND_ID: '${roundId}'`,
             '        # 发送类工具慢（要起无头浏览器），给足时间',
             '        toolCallTimeoutMs: 300000',
             '        failOnStartupError: false',
@@ -2598,7 +2735,7 @@ export function apply(ctx, config) {
     try { writeFileSync(file, yml.join('\n'), 'utf8'); return file } catch (e) { log(`写 overlay 失败：${e?.message ?? e}`); return null }
   }
 
-  const promptFor = (why = 'manual') => {
+  const promptFor = (why = 'manual', round = null) => {
     let duty = charterPath(pluginDir, stateDir)
     try { duty = String(duty).split('<家目录>').join(stateDir) } catch { /* 按原文用 */ }
     const kws = Array.isArray(cfg.keywords) ? [...new Set(cfg.keywords.filter(Boolean))] : []
@@ -2660,8 +2797,9 @@ export function apply(ctx, config) {
     } catch (e) { log(`读人设失败：${e?.message ?? e}`) }
 
     const quota = Math.max(0, Number(cfg.perDay) || 0)
-    const already = countPickedToday()
-    const left = Math.max(0, quota - already)
+    const already = countsToday().auto
+    const left = round?.budget ?? (why === 'manual' ? Number(cfg.manualPerRun) || 3 : Math.max(0, quota - already))
+    const roundDay = round?.day || dayKey()
     const commentOn = Boolean(cfg.autoComment && cfg.mentionName && cfg.commentExecutor !== 'off')
 
     return `你是这个账号的抖音助手。`
@@ -2671,13 +2809,13 @@ export function apply(ctx, config) {
       + personaWarn
       + (ownerDoc ? '' : '⭐ 这一轮**没有**拿到使用者的人设 ⇒ **按中性说话**，别扮演任何人。')
       + `\n\n⭐ **这一轮只有一件事**：读章程 ${duty}，按里面的判据刷一轮抖音，把报告写到 `
-      + `${join(outDir, `${dayKey()}.md`)}。`
+      + `${join(outDir, `${roundDay}.md`)}。`
       + (cfg.reportLevel === 'brief'
         ? `日报写成**薄版**：每条一两行（值不值得 + 链接）就够，别写长摘要。`
         : cfg.reportLevel === 'off'
           ? `这一轮**不要写日报文件**；只有真发了评论才留一句话。`
           : `日报写**完整版**（为什么值得 + 你自己的一句话）。`)
-      + (cfg.reportLevel === 'off' ? '' : `⚠️ 今天那份报告里可能已有上一轮的内容 ⇒ **追加到末尾，别覆盖**（配额按全天算）。`)
+      + (cfg.reportLevel === 'off' ? '' : `⚠️ 今天那份报告里可能已有上一轮的内容 ⇒ **追加到末尾，别覆盖**。`)
       + (cfg.reportLevel === 'off' ? '' : '⭐ 报告里**每挑中一条**，第一行必须顶格写 `### 视频ID`（例 `### 7401234567890123401`）—— 宿主**就数这些标题行**算今天挑了几条。只是提到 / 跳过 / 判断不了 的**不要**加这种标题（加了会吃掉额度）。')
       + `\n\n📋 **这一轮的输入**：`
       + `关键词：${kwPick.take.length ? kwPick.take.join('、') : kwPick.note}`
@@ -2709,9 +2847,13 @@ export function apply(ctx, config) {
       + `\`no_desc\` 没文案 / \`too_short_video\` 时长<12 秒 / \`short_and_quiet\` 文案太短且评论少。`
       + `照实写进报告（「因文案太短且评论少跳过 N 条」…），别让使用者以为漏抓了。`
       + `\n`
-      + (already > 0
-        ? `今天已经挑过 ${already} 条 ⇒ **这一轮最多再挑 ${left} 条**（「每天最多 ${quota} 条」是全天总量，不是每轮）；`
-        : `今天最多挑 ${quota} 条；`)
+      + (why === 'manual'
+        ? `这是手动一轮，**最多推荐 ${left} 条**，不占自动每日额度；`
+        : `今天自动已推荐 ${already} 条，自动每日上限 ${quota} 条，**这一轮最多再推荐 ${left} 条**；`)
+      + (round ? `\n⭐ 完成本轮判断和必要操作后，必须写入结构化结果文件 \`${join(stateDir, 'runs', `${round.id}.submission.json`)}\`。`
+        + `内容为严格 JSON：{"roundId":"${round.id}","picks":[{"id":"候选作品ID","title":"标题","reason":"推荐理由"}]}。`
+        + `只列本轮实际推荐的候选，最多 ${left} 条；没有合适内容时 picks:[]。日报关闭时也必须写这份结果。`
+        + '不能用普通回复代替；发送结果由工具实际响应单独记录，不要在结果文件里自称已发送。' : '')
       + `采集：推荐流只读接口（不签名、不碰写接口）。`
       + `\n判重表 = ${join(stateDir, 'seen.md')}（**就是这个绝对路径**）；读不出来/写不进去**必须在报告里明说**。`
       + `\n`
@@ -2721,7 +2863,7 @@ export function apply(ctx, config) {
        */
       + (!cfg.autoSend
         ? `🔴 **自动发送关着**：**一个字都不要往抖音发** —— 不发私信、不发卡片、不发评论。`
-          + `\n   这一轮你只干两件事：① 读 round-evidence.json 判断 ② 写报告。`
+          + `\n   这一轮读取 round-evidence.json 判断，按设置写报告，并记录结构化本轮结果。`
           + `\n   报告里可以写「建议发给他：xxx」，但**不要真的调用任何发送工具**。`
         : [
           /**
@@ -2910,32 +3052,31 @@ export function apply(ctx, config) {
    *      ② 每次启动插件时**主动清一次**残留（进程重启 = 上一轮的子进程已经没了）
    *      ③ 被挡住时把**原因和时间**一起返回，面板能显示
    */
-  const ROUND_STALE_MS = 12 * 60 * 1000
   const roundBusyInState = () => {
     try {
       const st = readJson(dutyStateFile, {})
       if (!st || !st.roundActive) return false
-      const at = Number(st.dutyRunningAt || 0)
-      if (!at || Date.now() - at > ROUND_STALE_MS) {
+      if (!roundIsBusy(st)) {
         bumpState({ roundActive: false, dutyRunningAt: 0 })
-        log('发现上一轮的"运行中"标记是陈旧的（超过 12 分钟）⇒ 已自动清掉')
+        const previous = readRecord(stateDir, st.roundId)
+        if (previous && !previous.endedAt) {
+          previous.phase = 'unknown'; previous.endedAt = Date.now()
+          previous.warnings.push('上轮进程已不在，未取得完整结束结果')
+          writeRecord(stateDir, previous)
+        }
+        log('上一轮的宿主和子进程均已不在，已解除运行标记；结果仍按记录展示')
         return false
       }
       return true
-    } catch { return false }
+    } catch { return true }
   }
-  /**
-   * ⭐ 插件每次（重新）加载时，清掉上次残留的"运行中"标记。
-   *    理由：插件重新加载 = 宿主重建了 fiber ⇒ 上一轮起的 headless 子进程
-   *    要么已经被带走、要么已经结束，绝不可能还在"跑"。
-   *    不清的话就会出现"看着没在跑，但点不动"。
-   */
+  /** 重载只核对所有权；不会把重载或等待时间当作任务结束。 */
   const clearStaleRoundOnBoot = () => {
     try {
       const st = readJson(dutyStateFile, {})
       if (!st || !st.roundActive) return
-      bumpState({ roundActive: false, dutyRunningAt: 0 })
-      log('插件重新加载：清掉了上次残留的"运行中"标记（否则点「现在跑一轮」会被误挡）')
+      if (!roundIsBusy(st)) roundBusyInState()
+      else log('插件重新加载：保留上次运行标记，尚未取得原进程的最终结果')
     } catch { /* 清不掉不影响启动 */ }
   }
   clearStaleRoundOnBoot()
@@ -2948,14 +3089,14 @@ export function apply(ctx, config) {
    *   both    —— toast + webhook
    * 报告文件**永远**写，这里只管"额外提醒"。
    */
-  const notifyRoundEnd = async (code) => {
+  const notifyRoundEnd = async (code, outcome = null) => {
     try {
       const mode = String(cfg.notifyMode || 'toast')
       if (mode === 'file') return
       const wantToast = mode === 'toast' || mode === 'both'
       const wantHook = mode === 'webhook' || mode === 'both'
       const f = join(outDir, `${dayKey()}.md`)
-      const text = (() => { try { return readFileSync(f, 'utf8') } catch { return '' } })()
+      const text = outcome ? outcome.reportText || '' : (() => { try { return readFileSync(f, 'utf8') } catch { return '' } })()
       const fallback = `（这一轮没有产出报告，退出码 ${code}）`
 
       if (wantToast) {
@@ -2965,7 +3106,10 @@ export function apply(ctx, config) {
          *    使用者完全不知道是被限流了，以为插件坏了。
          */
         let title, body
-        if (lastFailure) {
+        if (outcome) {
+          title = outcome.phase === 'completed' ? '刷抖音 · 本轮已完成' : outcome.phase === 'failed' ? '刷抖音 · 本轮异常结束' : '刷抖音 · 结果尚未确认'
+          body = outcome.phase === 'completed' ? `本轮新增推荐 ${outcome.result?.recommendations || 0} 条。${outcome.result?.reportUpdated ? '报告已更新。' : '本轮没有更新报告。'}` : (outcome.warnings || []).join('；')
+        } else if (lastFailure) {
           title = `刷抖音 · ${lastFailure.title}`
           body = String(lastFailure.fix || lastFailure.detail || '').slice(0, 200)
         } else {
@@ -2984,7 +3128,8 @@ export function apply(ctx, config) {
       if (!wantHook) return
       const url = String(cfg.webhookUrl || '').trim()
       if (!url) { log('通知：选了 webhook 但没填地址 ⇒ 跳过'); return }
-      const { title, text: body } = condense(text || fallback, { title: `刷抖音 · ${dayKey()}` })
+      const noticeText = outcome && outcome.phase !== 'completed' ? (outcome.warnings || []).join('；') : text || fallback
+      const { title, text: body } = condense(noticeText, { title: `刷抖音 · ${outcome?.day || dayKey()}` })
       const r = await sendWebhook({ url, preset: cfg.webhookPreset, title, markdown: body })
       log(`通知：webhook ${r.ok ? '已发送' : '失败'} → ${maskUrl(url)}${r.error ? ' / ' + r.error : ''}`)
     } catch (e) { log(`通知异常（不影响这一轮）：${e?.message ?? e}`) }
@@ -3093,12 +3238,8 @@ export function apply(ctx, config) {
           const at = Number(st.dutyRunningAt || 0)
           if (at) {
             const mins = Math.round((Date.now() - at) / 60000)
-            const leftMs = Math.max(0, ROUND_STALE_MS - (Date.now() - at))
             detail = `上一轮从 ${new Date(at).toLocaleString('zh-CN')} 开始，已经 ${mins} 分钟；`
-              + (leftMs > 0
-                ? `${Math.ceil(leftMs / 60000)} 分钟后会自动解除。`
-                : '马上会自动解除，再点一次就行。')
-              + '如果它其实早就不跑了（比如那轮被限流打断了），等它自动解除或重启 dsh。'
+              + '尚未收到最终结束状态，请等本轮结果。'
           }
         } catch { /* 拿不到就只给通用说法 */ }
         log(`刷抖音已在跑，忽略这次触发（${why}）：${detail || '上一轮未结束'}`)
@@ -3110,27 +3251,39 @@ export function apply(ctx, config) {
       }
       refreshCfg()
       syncCollectorCfg()
-      // ⭐ 手动触发也要过每日配额闸（bili-scroll 踩过：连点两次手动，一天从 20 条刷到 80 条）
       const quota = Number(cfg.perDay || 0)
-      const picked = countPickedToday()
-      if (quota > 0 && picked >= quota) {
-        log(`配额已满：今天已挑 ${picked} 条（上限 ${quota}），这一轮不跑`)
-        return { started: false, why, quotaFull: true, picked, quota, error: `今天的配额已经用完了（已挑 ${picked} / 上限 ${quota}）` }
+      const picked = countsToday().auto
+      const manual = why === 'manual'
+      if (!manual && (!autoEnabled(cfg) || quota <= 0)) return { started: false, why, disabled: true, error: '自动任务已暂停' }
+      if (!manual && picked >= quota) {
+        log(`自动额度已满：今天自动已推荐 ${picked} 条（上限 ${quota}），这一轮不跑`)
+        return { started: false, why, quotaFull: true, picked, quota, error: `今天自动额度已用完（${picked} / ${quota}），仍可手动运行` }
       }
       // ⭐ 先把闸拉上（防双开），再去异步准备证据包 + 起那一轮 —— 准备证据要十几秒，
       //    同步做会把宿主卡住（HTTP 请求和定时器都在这条线程上）。
       dutyRunning = true
+      const round = beginRound(stateDir, { why, budget: manual ? Number(cfg.manualPerRun) || 3 : Math.max(0, quota - picked), reportBefore: reportTextOfDay() })
+      lastFailure = null
       bumpState({
-        dutyRunningAt: Date.now(),
+        dutyRunningAt: round.startedAt,
         roundActive: true,
-        lastRunAt: new Date().toISOString(),
+        lastRunAt: new Date(round.startedAt).toISOString(),
         lastWhy: why,
+        roundId: round.id, ownerPid: process.pid, childPid: 0,
         count: roundsToday() + 1,
       })
       ;(async () => {
         try {
           petSay('刷抖音喽！鱼先去把候选捞回来～')
           const ev = await buildEvidence(Math.max(1, Math.min(Number(cfg.maxPerRun) || 12, 30)))
+          const evidence = ev.ok ? readJson(join(stateDir, 'round-evidence.json'), {}) : { builtAt: new Date().toISOString(), list: [] }
+          evidence.roundId = round.id
+          writeJson(join(stateDir, 'round-evidence.json'), evidence)
+          round.candidates = evidence.list || []
+          writeRecord(stateDir, round)
+          recordEvent(stateDir, round.id, { stage: 'candidates', level: ev.ok ? 'info' : 'warning', message: ev.ok ? `已取得 ${ev.count} 条候选` : `候选未取得：${ev.error}` })
+          const missingComments = round.candidates.slice(0, 5).filter((item) => Number(item.comment) > 0 && !item.top_comments?.length).length
+          if (missingComments) recordEvent(stateDir, round.id, { stage: 'comments', level: 'warning', message: `有 ${missingComments} 条候选的评论未读取到，判断只使用已有证据` })
           log(ev.ok
             ? `证据包已备好：${ev.count} 条 → ${join(stateDir, 'round-evidence.json')}`
             : `证据包没备成（${ev.error}）—— 这一轮照样起，模型会读到空包并如实写进报告`)
@@ -3150,10 +3303,10 @@ export function apply(ctx, config) {
               log(`   dsh plugin --profile ${prof} add link:${pluginDir || '<本插件目录>'}`)
             }
           } catch { /* 查不到就算了，别挡着跑 */ }
-          const overlay = ensureOverlay()
+          const overlay = ensureOverlay(round.id)
           const args = [...dsh.args, '--profile', cfg.headlessProfile || 'headless']
           if (overlay) args.push('--patch', overlay)
-          args.push(promptFor(why))
+          args.push(promptFor(why, round))
           const cwd = stateDir
           log(`刷抖音开跑（${why}）：${dsh.command} ${args.slice(0, 3).join(' ')} …  cwd=${cwd}`)
           petSay('开工开工～鱼一条条挑，马上回来')
@@ -3162,8 +3315,14 @@ export function apply(ctx, config) {
             shell: dsh.shell,
             windowsHide: true,
             stdio: ['ignore', 'pipe', 'pipe'],
-            env: pyEnv({ DOUYIN_DUTY_HOME: stateDir, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
+            env: pyEnv({ DOUYIN_DUTY_HOME: stateDir, DOUYIN_ROUND_ID: round.id, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
           })
+          round.phase = 'running'; round.childPid = child.pid || 0
+          try {
+            writeRecord(stateDir, round)
+            bumpState({ childPid: child.pid || 0 })
+            recordEvent(stateDir, round.id, { stage: 'running', message: '候选已交给本轮任务，正在判断和整理结果' })
+          } catch (e) { log(`本轮启动记录保存失败，仍继续等待原进程结束：${safeLog(e?.message || e)}`) }
           /**
            * ⭐ 超时看门狗（2026-10-20 实测加）：那一轮**干完活之后可能不退出** ——
            *    实测模型已经把报告写完了、也回话了，但进程又挂了十几分钟（MCP 子进程把事件循环撑住）。
@@ -3172,24 +3331,35 @@ export function apply(ctx, config) {
            *    ⇒ 超过 roundTimeoutMin（默认 15 分钟）就杀掉，并按"超时"记账。
            */
           const timeoutMin = Math.max(3, Math.min(Number(process.env.DOUYIN_ROUND_TIMEOUT_MIN) || 15, 120))
+          let timedOut = false
+          let spawnError = ''
           const watchdog = setTimeout(() => {
             try {
+              timedOut = true
               log(`⚠️ 这一轮超过 ${timeoutMin} 分钟没结束 ⇒ 强制结束（报告可能已经写了）`)
               child.kill()
               // 再给 10 秒收尸，还不退就硬杀整棵子树
               setTimeout(() => { try { child.kill('SIGKILL') } catch { /* 已经没了 */ } }, 10_000).unref?.()
+              recordEvent(stateDir, round.id, { stage: 'timeout', level: 'error', message: `本轮超过 ${timeoutMin} 分钟，已请求停止，仍等待进程结束` })
             } catch (e) { log(`看门狗杀进程失败：${e?.message ?? e}`) }
           }, timeoutMin * 60_000)
           watchdog.unref?.()
           // ⚠️ 这里是 stream 的 data 回调 —— 抛异常会**杀掉整个宿主进程** ⇒ rawWrite 内部已全包 try/catch
           child.stdout?.on('data', (b) => rawWrite(String(b)))
           child.stderr?.on('data', (b) => rawWrite(String(b)))
-          child.on('exit', (code) => {
-            try { clearTimeout(watchdog) } catch { /* 无所谓 */ }
-            dutyRunning = false
-            bumpState({ dutyRunningAt: 0, roundActive: false })
+          child.on('close', (code, signal) => {
+            clearTimeout(watchdog)
+            let finishedResult = null
+            try {
+            const submitted = readJson(join(stateDir, 'runs', `${round.id}.submission.json`), null)
+            if (submitted?.roundId === round.id) {
+              const validated = submitRoundResult(stateDir, round.id, submitted)
+              if (!validated.ok) recordEvent(stateDir, round.id, { stage: 'result', level: 'warning', message: `本轮结果未通过检查：${validated.error}` })
+            }
+            const outcome = finishRound(stateDir, round.id, { code, signal, error: spawnError, timedOut, reportText: reportTextOfDay(round.day) })
+            finishedResult = outcome
             log(`刷抖音结束（${why}，code=${code}）`)
-            petSay(code === 0 ? '这轮挑完啦！报告写好了，主人去看呀～' : '这轮…有点不顺利，鱼歇会儿再战')
+            petSay(outcome.phase === 'completed' ? '这轮挑完啦，结果已经记下了～' : '这轮结果还没有全部确认，主人看一下记录呀')
             stubReportIfMissing(code)
             rotateLogIfBig()
             try {
@@ -3199,19 +3369,37 @@ export function apply(ctx, config) {
               if (picked > prev) { bumpState({ picked }); log(`今天挑到 ${picked} 条（上限 ${Number(cfg.perDay) || 0} 条）`) }
             } catch (e) { log(`数挑了几条时出错（不影响这一轮）：${e?.message ?? e}`) }
             // 通知（不阻塞、失败只记日志）
-            Promise.resolve(notifyRoundEnd(code)).catch((e) => log('通知异常：' + (e?.message ?? e)))
+            Promise.resolve(notifyRoundEnd(code, outcome)).catch((e) => log('通知异常：' + (e?.message ?? e)))
+            } catch (e) {
+              log(`本轮结束记录保存失败，状态仍未确认：${safeLog(e?.message || e)}`)
+            } finally {
+              try {
+                const current = readJson(dutyStateFile, {})
+                if (current.roundId === round.id) {
+                  dutyRunning = false
+                  bumpState({ dutyRunningAt: 0, roundActive: false, childPid: 0,
+                    ...(finishedResult?.result?.validated ? { lastResultRoundId: round.id } : {}) })
+                }
+              } catch (e) { log(`运行标记保存失败：${safeLog(e?.message || e)}`) }
+            }
           })
-          child.on('error', (e) => { dutyRunning = false; bumpState({ roundActive: false }); log(`刷抖音起不来：${e?.message ?? e}`) })
+          child.on('error', (e) => { spawnError = String(e?.message || e); log(`刷抖音起不来：${spawnError}`) })
         } catch (e) {
-          dutyRunning = false
-          bumpState({ dutyRunningAt: 0, roundActive: false })
+          try { finishRound(stateDir, round.id, { error: String(e?.message || e), reportText: reportTextOfDay(round.day) }) }
+          catch (writeError) { log(`本轮失败记录保存失败：${safeLog(writeError?.message || writeError)}`) }
+          try {
+            if (readJson(dutyStateFile, {}).roundId === round.id) {
+              dutyRunning = false
+              bumpState({ dutyRunningAt: 0, roundActive: false })
+            }
+          } catch (writeError) { log(`运行标记保存失败：${safeLog(writeError?.message || writeError)}`) }
           log(`刷抖音开跑失败（${why}）：${e?.stack ?? e}`)
         }
       })()
-      return { started: true, why, profile: cfg.headlessProfile, note: '正在准备证据包（十几秒），随后起那一轮 —— 进度看 duty.log' }
+      return { started: true, why, roundId: round.id, budget: round.budget, profile: cfg.headlessProfile, note: '正在准备本轮候选，结果和记录会自动更新' }
     } catch (e) {
       dutyRunning = false
-      bumpState({ roundActive: false })
+      try { bumpState({ roundActive: false }) } catch { /* 原错误保留给调用方 */ }
       log(`刷抖音开跑失败（${why}）：${e?.stack ?? e}`)
       return { started: false, why, error: String(e?.message ?? e) }
     }
@@ -3229,32 +3417,17 @@ export function apply(ctx, config) {
       //    现在「有没有任何一个时段开着」本身就是开关：全关 = 只手动跑。
       const now = new Date()
       const st = readJson(dutyStateFile, {})
-      const today = dayKey(now)
-      if (countPickedToday(now) >= Number(cfg.perDay || 0)) return
+      if (!autoEnabled(cfg) || countsToday(now).auto >= Number(cfg.perDay || 0)) return
       // ⭐ 未登录不自动值班（2026-10-31，B 站「装了就卡死」）：没 Cookie 时这一轮
       //    注定失败，白冻结宿主一次探测 —— 装完插件安安静静等用户先登录。手动跑不受影响。
       if (!hasCredential(stateDir)) return
-      if (String(cfg.reportLevel || 'full') === 'off' && roundsToday(now) >= 1) return
       // ⭐ 把所有生效的时段拼成一个列表：内置中午/晚上 + 用户自定义
-      //    自定义的也按「每天一次」去重，key 用 `custom:<下标>`，改时段后旧 key 自然失效。
-      const range = []
-      if (cfg.noon) range.push({ key: 'noon', label: '中午', ...WINDOWS.noon })
-      if (cfg.night) range.push({ key: 'night', label: '晚上', ...WINDOWS.night })
-      const customs = Array.isArray(cfg.windows) ? cfg.windows : []
-      customs.forEach((w, i) => {
-        const s = String(w?.start || '').trim()
-        const e = String(w?.end || '').trim()
-        if (!/^\d{1,2}:\d{2}$/.test(s) || !/^\d{1,2}:\d{2}$/.test(e)) return
-        range.push({ key: `custom:${i}`, label: String(w?.label || '').trim() || `${s}–${e}`, start: s, end: e })
-      })
-
+      //    自定义按「开始日期一次」去重，key 用 `custom:<下标>`；设置保存时保留/重映射已用记录。
+      const range = scheduledWindows(cfg, now, st.windows || {})
       for (const w of range) {
-        if (!inWindow(now, w)) continue
-        const key = `${today}:${w.key}`
-        if (st.windows?.[key]) continue
-        // 只记「这个时段用过了」；轮数 / lastRunAt / lastWhy 由 runDuty 统一记
-        bumpState({ windows: { ...(st.windows || {}), [key]: true } })
-        runDuty(`window:${w.key}`)
+        if (!w.active) continue
+        const result = runDuty(`window:${w.key}`)
+        if (result.started) bumpState({ windows: { ...(st.windows || {}), [w.key]: true } })
         return
       }
     } catch (e) {
@@ -3527,7 +3700,7 @@ export function apply(ctx, config) {
    * ⚠️ 报号走下面的 spawn **异步**版（2026-10-31 起 runNodeTool 也已异步化 + 浏览器互斥；
    *    这份独立实现保留不动 —— 报号的语义跟它绑着，别顺手合并）。
    */
-  const runNodeToolAsync = (script, args = [], { timeout = 240_000 } = {}) => new Promise((resolve) => {
+  const runNodeToolAsync = (script, args = [], { timeout = 240_000 } = {}) => withScriptLock(script, () => new Promise((resolve) => {
     const f = join(pluginDir, 'tools', script)
     if (!existsSync(f)) return resolve({ status: -1, stdout: '', stderr: `缺少 tools/${script}` })
     let out = ''
@@ -3545,7 +3718,7 @@ export function apply(ctx, config) {
     c.stderr?.on?.('data', (b) => { err += String(b) })
     c.on('error', (e) => { clearTimeout(timer); resolve({ status: -1, stdout: out, stderr: `${e?.message ?? e} ${err}`.trim() }) })
     c.on('close', (code) => { clearTimeout(timer); resolve({ status: code ?? -1, stdout: out, stderr: err }) })
-  })
+  }))
 
   const greetOnce = async (key, scene) => {
     const today = dayKey()
@@ -4464,6 +4637,10 @@ export function apply(ctx, config) {
       today,
       ranToday: st.day === today ? Number(st.count || 0) : 0,
       pickedToday: countPickedToday(),
+      counts: countsToday(),
+      canRun: !dutyRunning && !roundBusyInState(),
+      autoEnabled: autoEnabled(cfg),
+      nextWindow: countsToday().auto >= Number(cfg.perDay || 0) ? null : scheduledWindows(cfg, new Date(), st.windows || {})[0] || null,
       perDay: Number(cfg.perDay || 0),
       lastRunAt: st.lastRunAt || null,
       lastWhy: st.lastWhy || null,
@@ -4474,6 +4651,8 @@ export function apply(ctx, config) {
       account: readJson(join(stateDir, 'account.json'), null),
       venvReady: venvReadyNow(),
       installing,
+      install: { ...install },
+      environmentReady: setupFiles(stateDir).ready,
       installLog: installLogFile,
       installTail: tail(installLogFile),
       report: reportFileOf(new Date()),
@@ -4502,6 +4681,13 @@ export function apply(ctx, config) {
     }
     const path = url.pathname
     if (req.method === 'GET' && path === '/api/douyin-duty/status') return sendJson(res, 200, status())
+    if (req.method === 'GET' && path === '/api/douyin-duty/progress') {
+      const running = dutyRunning || roundBusyInState()
+      const progress = readRunProgress(stateDir, dayKey())
+      if (url.searchParams.get('log') !== '1') delete progress.tail
+      return sendJson(res, 200, { ok: true, ...progress, running, today: dayKey(),
+        pickedToday: countPickedToday(), perDay: Number(cfg.perDay || 0) })
+    }
     if (req.method === 'GET' && path === '/api/douyin-duty/config') {
       return sendJson(res, 200, { ok: true, config: cfg, windows: WINDOWS, home: stateDir })
     }
@@ -4516,7 +4702,9 @@ export function apply(ctx, config) {
        *   `if (patch.petOn === true) rmSync(pet-hide.json)`
        *   （面板把 petOn 打开 = 「叫她回来」）。petOn 归 dsh-deskpet 了，
        *   pet-hide.json 也在它家里 —— 面板「叫她回来」调它自己的 /api/deskpet/show。 */
-      const { clean, host } = await persistCfg(patch)
+      const saved = await persistCfg(patch)
+      if (saved.error) return sendJson(res, 200, { ok: false, error: saved.error })
+      const { clean, host } = saved
       log(`设置已更新：${JSON.stringify(clean)}（DSH 那边${host.ok ? '已同步' : '没写成：' + host.error}）`)
       petKeeperTick().catch((e) => log(`petKeeperTick（开关变更）异步出错：${e?.message ?? e}`))   // 联动状态变化立即反应（不等下一拍）
       return sendJson(res, 200, { ok: true, config: cfg, host })
@@ -4875,24 +5063,28 @@ export function apply(ctx, config) {
      */
     if (req.method === 'GET' && path === '/api/douyin-duty/inbox') {
       if (!hasCredential(stateDir)) return sendJson(res, 200, { ok: false, error: '还没登录', at: [], dm: [] })
-      const out = { ok: true, at: [], dm: [], at_n: 0, dm_n: 0, errors: [] }
+      const scope = ['dm', 'comment'].includes(url.searchParams.get('scope')) ? url.searchParams.get('scope') : 'all'
+      const out = { ok: true, at: [], dm: [], at_n: 0, dm_n: 0, errors: [], scope }
 
       // ① 评论区 @ 我
+      if (scope !== 'dm') {
       try {
         const r = await readAtMe({ limit: 20, include_seen: false })
         if (r && r.ok) { out.at = r.list || []; out.at_n = r.at_n || 0 }
         else out.errors.push('评论区 @：' + ((r && (r.error || r.hint)) || '读不到'))
       } catch (e) { out.errors.push('评论区 @：' + String(e?.message ?? e)) }
+      }
 
       /**
        * ② "谁私信我"：读**会话列表**（不是打开某个会话）。
        *    抖音的会话列表只有「最近聊过的人 + 最后一句话」，没有"未读"标记可用，
        *    所以这里如实说：列出最近跟我聊过的人 + 他最后说了什么 + 是不是他说的。
        */
+      if (scope !== 'comment') {
       try {
         const r = await runNodeTool('im-send.mjs', ['--list'], { timeout: 180_000 })
         const j = pickJson(r.stdout)
-        if (j && j.ok) {
+        if (r.status === 0 && j && j.ok) {
           const list = Array.isArray(j.people) ? j.people : []
           // 给每个人补上"最后一句是谁说的"（有记忆才知道）
           out.dm = list.map((p) => {
@@ -4903,6 +5095,7 @@ export function apply(ctx, config) {
             return {
               nick: p.nick,
               sec_uid: p.sec_uid,
+              is_group: p.is_group === true,
               preview: p.preview,
               duplicate: p.duplicate,
               /** 我们以前聊过几条（没聊过 = 0） */
@@ -4918,8 +5111,30 @@ export function apply(ctx, config) {
           out.dm_n = out.dm.filter((x) => x.needs_reply).length
         } else out.errors.push('私信列表：' + ((j && (j.error || j.hint)) || '读不到'))
       } catch (e) { out.errors.push('私信列表：' + String(e?.message ?? e)) }
+      }
 
       return sendJson(res, 200, out)
+    }
+
+    if (req.method === 'POST' && path === '/api/douyin-duty/comment/reply') {
+      const body = await readBody(req)
+      if (!String(body?.comment_id || '').trim()) return sendJson(res, 200, { ok: false, sent: false, error: '缺少原评论 ID，请重新读取这条消息' })
+      if (!hasCredential(stateDir)) return sendJson(res, 200, { ok: false, sent: false, error: '还没登录' })
+      const result = await executeCommentReply({
+        aweme_id: body.aweme_id, comment_id: body.comment_id, root_comment_id: body.root_comment_id,
+        work_url: body.work_url, aweme_type: body.aweme_type, text: body.text, confirm: body.confirm === true, mode: 'api',
+      })
+      return sendJson(res, 200, result)
+    }
+
+    if (req.method === 'POST' && path === '/api/douyin-duty/comment/ai-reply') {
+      const body = await readBody(req)
+      return sendJson(res, 200, manualCommentReply.start({ aweme_id: body?.aweme_id, comment_id: body?.comment_id,
+        root_comment_id: body?.root_comment_id, work_url: body?.work_url, aweme_type: body?.aweme_type, confirm: body?.confirm === true }))
+    }
+    if (req.method === 'GET' && path === '/api/douyin-duty/comment/ai-reply') {
+      return sendJson(res, 200, manualCommentReply.get({ id: url.searchParams.get('id'), aweme_id: url.searchParams.get('aweme_id'),
+        comment_id: url.searchParams.get('comment_id') }))
     }
 
     /* ── ⭐ 聊天模式：读某个人的完整上下文（面板「跟他聊」用） ── */
@@ -4928,64 +5143,16 @@ export function apply(ctx, config) {
       // 0.5.5：面板显式选谁就读谁 —— 不再兜底 cfg 单值（那是「读错人」的老根子）
       const toId = String(body?.to_id || '').trim()
       const to = String(body?.to || '').trim()
-      if (!toId && !to) return sendJson(res, 200, { ok: false, error: '不知道读谁的会话' })
-      /**
-       * ⭐ 快路径（2026-10-24）：有 to_id 就先走 HTTP（im-http.py，~1.1 秒、不启浏览器、
-       *    身份铁闸=sec_uid 反查核验）。命不中（陌生人/接口挂）再退回浏览器路径。
-       *    和 douyin_im_read 工具同一套双路径。
-       */
-      if (toId) {
-        try {
-          const r0 = await runPy('im-http.py', ['--read', '--peer-sec-uid', toId, '--limit', '40'], { timeout: 30_000 })
-          const h = pickJson(r0.stdout)
-          if (h && h.ok && h.matched) {
-            const msgs = Array.isArray(h.matched.messages) ? h.matched.messages : []
-            let context = null
-            try {
-              mergeDmMemory(stateDir, toId, to || h.matched.nickname || '', msgs)
-              context = dmContext(stateDir, toId, { recent: 20 })
-            } catch { /* 记忆失败不影响读 */ }
-            log(`chat/read(HTTP) ${h.matched.nickname || toId}: ${msgs.length} 条，${h.ms}ms`)
-            return sendJson(res, 200, {
-              ok: true, via: 'http', to: to || h.matched.nickname, to_sec_uid: toId,
-              count: msgs.length,
-              mine: msgs.filter((m) => m.from === 'me').length,
-              them: msgs.filter((m) => m.from === 'them').length,
-              unknown: 0,
-              messages: msgs.slice(-40),
-              context: context || { note: '这个人以前没聊过（记忆里没有记录）' },
-            })
-          }
-        } catch { /* 快路径失败 → 下面走浏览器 */ }
-      }
-      const argv = ['--read']
-      if (to) argv.push('--to', to)
-      if (toId) argv.push('--to-id', toId)
-      const r = await runNodeTool('im-send.mjs', argv, { timeout: 240_000 })
-      const j = pickJson(r.stdout)
-      if (!j) return sendJson(res, 200, { ok: false, error: '读不到会话', detail: String(r.stderr || r.stdout || '').slice(-400) })
-      if (!j.ok) return sendJson(res, 200, j)
-      // 合并进记忆 + 取上下文
-      let context = null
-      try {
-        const secUid = String(j.to_sec_uid || toId || '').trim()
-        if (secUid) {
-          /**
-           * ⚠️ 顺序很重要：**先合并、再取上下文**。
-           *    以前是先取 context 再 merge ⇒ 第一次读某个人的会话时，
-           *    context 永远是空的（"这个人以前没聊过"），
-           *    但其实这一下刚读到 11 条 —— 等于刚认识就说"我不认识你"。
-           */
-          mergeDmMemory(stateDir, secUid, j.to || to, Array.isArray(j.messages) ? j.messages : [])
-          context = dmContext(stateDir, secUid, { recent: 20 })
-        }
-      } catch { /* 记忆失败不影响读 */ }
-      return sendJson(res, 200, {
-        ok: true, to: j.to, to_sec_uid: j.to_sec_uid,
-        count: j.count, mine: j.mine, them: j.them, unknown: j.unknown,
-        messages: Array.isArray(j.messages) ? j.messages.slice(-40) : [],
-        context: context || { note: '这个人以前没聊过（记忆里没有记录）' },
-      })
+      return sendJson(res, 200, await readChatConversation({ toId, to }))
+    }
+
+    if (req.method === 'POST' && path === '/api/douyin-duty/chat/reply') {
+      const body = await readBody(req)
+      // The selected conversation and this click authorize exactly one reply; automation is unchanged.
+      return sendJson(res, 200, manualDmReply.start({ to_id: body?.to_id, to: body?.to, confirm: body?.confirm === true }))
+    }
+    if (req.method === 'GET' && path === '/api/douyin-duty/chat/reply') {
+      return sendJson(res, 200, manualDmReply.get({ id: url.searchParams.get('id'), to_id: url.searchParams.get('to_id') }))
     }
 
     /* ── ⭐ 聊天模式：发一条（带记忆，确认后才发） ── */
@@ -5022,12 +5189,12 @@ export function apply(ctx, config) {
       return sendJson(res, 200, {
         ok: true,
         logFile,
-        tail,
+        tail: safeLog(tail),
         lastRunAt: st.lastRunAt || null,
         lastWhy: st.lastWhy || null,
         roundActive: Boolean(st.roundActive),
         // ⭐ 现在能不能跑（把"为什么不能"提前说清楚，别等点了才说）
-        canRun: !dutyRunning && !roundBusyInState() && countPickedToday() < Number(cfg.perDay || 0),
+        canRun: !dutyRunning && !roundBusyInState(),
         pickedToday: countPickedToday(),
         perDay: Number(cfg.perDay || 0),
       })
@@ -5184,7 +5351,7 @@ export function apply(ctx, config) {
       }
     }
 
-    if (req.method === 'POST' && path === '/api/douyin-duty/install') return sendJson(res, 200, runInstall())
+    if (req.method === 'POST' && ['/api/douyin-duty/install', '/api/douyin-duty/environment/repair'].includes(path)) return sendJson(res, 200, runInstall())
     if (req.method === 'POST' && path === '/api/douyin-duty/install-browser') {
       return sendJson(res, 200, { ok: false, gone: true, hint: '2026-10-21 起不再需要浏览器依赖 —— bb-browser / playwright 那套已经整个删掉了' })
     }
@@ -5286,12 +5453,17 @@ export function apply(ctx, config) {
       return sendJson(res, 200, out)
     }
     if (req.method === 'GET' && path === '/api/douyin-duty/report') {
-      const day = String(url.searchParams.get('day') || dayKey()).replace(/[^0-9-]/g, '') || dayKey()
+      const scope = url.searchParams.get('scope') === 'recent' ? 'recent' : 'today'
+      const state = readJson(dutyStateFile, {})
+      const recent = scope === 'recent' ? readRecord(stateDir, state.lastResultRoundId) : null
+      const day = recent?.day || String(url.searchParams.get('day') || dayKey()).replace(/[^0-9-]/g, '') || dayKey()
       const file = join(outDir, day + '.md')
       let text = ''
       let exists = false
       try { exists = existsSync(file); if (exists) text = readFileSync(file, 'utf8').slice(0, 200000) } catch { /* 读不到就给空 */ }
-      return sendJson(res, 200, { ok: true, day, exists, file, text })
+      const picks = scope === 'recent' ? recent?.result?.picks || [] : dayRecommendations(stateDir, day, text)
+      if (scope === 'recent') { text = recent?.reportText || ''; exists = Boolean(text) }
+      return sendJson(res, 200, { ok: true, scope, day, exists, file, text: safeLog(text), picks, roundId: recent?.id || '', counts: recommendationCounts(stateDir, day, reportTextOfDay(day)) })
     }
     if (req.method === 'POST' && path === '/api/douyin-duty/open') {
       const body = await readBody(req)
@@ -5335,7 +5507,10 @@ export function apply(ctx, config) {
       const force = String((await readBody(req))?.force || '') === '1'
       // 先确保后台无头浏览器不占着 profile —— 它和扫码窗口共用一个 user-data-dir
       if (force) {
-        await runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 })
+        const closed = await runNodeTool('qr-login.mjs', ['close'], { timeout: 40_000 })
+        const closeResult = pickJson(closed.stdout)
+        if (!closeResult?.ok) return sendJson(res, 200, { ok: false, browser_open: false,
+          error: closeResult?.error || '未能正常关闭插件自己的浏览器，请先手动关闭登录窗口后重试' })
         await new Promise((r) => setTimeout(r, 1200))
       }
       const r = await runNodeTool('qr-login.mjs', ['start'], { timeout: 120_000 })
@@ -5345,7 +5520,7 @@ export function apply(ctx, config) {
         return sendJson(res, 200, {
           ok: false,
           error: '出二维码失败',
-          detail: String(r.stderr || r.stdout || '').slice(-600),
+          detail: safeLog(String(r.stderr || r.stdout || '').slice(-600)),
           hint: '常见原因：没装浏览器 / Chrome 被别的进程锁住。点「关掉后台浏览器重试」再试一次',
         })
       }
@@ -5353,12 +5528,13 @@ export function apply(ctx, config) {
         log(`扫码登录：${j.conflict || '失败'} ${j.error || ''}`)
         return sendJson(res, 200, j)
       }
-      // 转成浏览器能直接 <img src> 的地址
-      const qrName = String(j.qr || '').split(/[\\/]/).pop() || 'login-qr.png'
-      log(`扫码登录：二维码已出（${qrName}，端口 ${j.port}）`)
+      // 只有脚本真实保存了二维码才提供图片地址，不能把首页或空响应当作成功。
+      const hasQr = Boolean(j.qr && existsSync(join(stateDir, 'login-qr.png')))
+      log(j.already_logged_in ? '扫码登录：已恢复现有登录态' : hasQr
+        ? `扫码登录：二维码已出（端口 ${j.port}）` : '扫码登录：窗口已打开，尚未取得二维码')
       return sendJson(res, 200, {
         ...j,
-        qr_url: `/api/douyin-duty/login/qr.png?v=${Date.now()}`,
+        ...(hasQr ? { qr_url: `/api/douyin-duty/login/qr.png?v=${Date.now()}` } : {}),
       })
     }
     // 二维码图片本身（面板 <img src> 用）
