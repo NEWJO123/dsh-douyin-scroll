@@ -125,7 +125,8 @@ test('corrupt durable state fails closed instead of forgetting a possible send',
 for (const [label, messages, reason] of [
   ['no inbound', [], 'no_inbound'],
   ['already replied', [{ from: 'them', text: 'hi' }, { from: 'me', text: 'hello' }], 'already_replied'],
-  ['unknown sender', [{ from: 'unknown', text: 'hi' }], 'unknown_sender'],
+  // 🔴 2026-11-05：发送方判不出来 ⇒ 数据不可信，明确报错（不拿猜测决定回复对象）
+  ['untrusted sender', [{ from: 'unknown', text: 'hi' }], 'untrusted_sender'],
   ['latest image without text', [{ from: 'them', text: 'older question' }, { from: 'them', kind: 'image', text: '' }], 'unsupported_message'],
 ]) test(`${label} is explicitly skipped without model or sender`, async () => {
   const f = fixture({ async read() { return { ...inbound(), messages } } })
@@ -133,6 +134,39 @@ for (const [label, messages, reason] of [
     const done = await complete(f.service, f.service.start(target).job.id)
     assert.equal(done.status, 'skipped')
     assert.equal(done.reason, reason)
+    assert.equal(f.calls.generate, 0)
+    assert.equal(f.calls.send, 0)
+  } finally { f.close() }
+})
+
+test('an unattributable trailing message is reported as untrusted, never replied to by guessing', async () => {
+  // 方向不明不是「没判出来就猜上一条」，而是「这份数据不可信」—— 明确报错，不发
+  const f = fixture({ async read() {
+    return { ...inbound(), messages: [
+      { from: 'them', text: '在吗' },
+      { from: 'unknown', text: '', kind: 'unknown' },
+    ] }
+  } })
+  try {
+    const done = await complete(f.service, f.service.start(target).job.id)
+    assert.equal(done.status, 'skipped')
+    assert.equal(done.reason, 'untrusted_sender')
+    assert.match(done.note, /接口路径重读/)
+    assert.equal(f.calls.generate, 0, '不可信的数据不该拿去生成回复')
+    assert.equal(f.calls.send, 0)
+  } finally { f.close() }
+})
+
+test('a trailing message we sent still counts as already replied', async () => {
+  const f = fixture({ async read() {
+    return { ...inbound(), messages: [
+      { from: 'them', text: '在吗' },
+      { from: 'me', text: '在' },
+    ] }
+  } })
+  try {
+    const done = await complete(f.service, f.service.start(target).job.id)
+    assert.equal(done.reason, 'already_replied')
     assert.equal(f.calls.generate, 0)
     assert.equal(f.calls.send, 0)
   } finally { f.close() }
