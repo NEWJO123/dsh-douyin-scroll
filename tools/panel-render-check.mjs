@@ -49,7 +49,7 @@ const inboxItem = (extra = {}) => ({
 
 function harness(options = {}) {
   let config = { ...fixtureConfig(), ...options.config }
-  const state = { loggedIn: true, venvReady: true, installing: false, install: { phase: 'idle' }, ...options.state }
+  const state = { loggedIn: true, venvReady: true, installing: false, install: { phase: 'idle' }, toastSupported: true, platform: 'win32', ...options.state }
   const calls = [], copies = [], instances = new Map(), intervals = new Map(), timeouts = new Map()
   let cursor = null, current = null, dirty = true, tree = null, effects = [], nextTimer = 1, disposed = false
   const data = {
@@ -403,14 +403,50 @@ await scenario('环境修复异步启动期间不重复安装，二维码图片�
   assert.ok(!h.button('重新打开登录窗口').props.disabled)
   h.dispose()
 })
-await scenario('设置读取失败有重试，结果读取失败与空结果分开', async () => {
+await scenario('设置读取失败会自动重试，最终失败才给出口，重试成功则正常进面板', async () => {
+  // ① 一直失败：自动重试 3 次后必须给出「重新读取」出口，不能永远停在「读设置中」
   const h = harness({ data: { statusError: true } }); await h.flush()
+  assert.match(h.text(), /读设置中|正在重试|暂时没能读取设置/)
+  await h.timeout(1200)
+  assert.match(h.text(), /正在重试/)
+  await h.timeout(2400)
   assert.match(h.text(), /暂时没能读取设置/)
+  assert.match(h.text(), /已自动重试 3 次/)
   h.data.statusError = false; await h.click('重新读取')
   assert.ok(h.area('setup'))
   h.data.reportError = true; await h.click('刷新结果')
   assert.match(h.text(h.area('run')), /暂时无法读取推荐结果/)
   h.dispose()
+})
+
+await scenario('首次读取失败但自动重试成功时，面板不会卡在「读设置中」', async () => {
+  // ② 宿主刚起来、路由晚注册：第一次失败，重试成功 —— 用户不该看到任何错误，也不该卡住
+  let calls = 0
+  const h = harness({ data: { statusError: true } }); await h.flush()
+  assert.match(h.text(), /正在重试|读设置中/)
+  calls = h.data
+  h.data.statusError = false
+  await h.timeout(1200)
+  assert.ok(h.area('setup'), '重试成功后应当正常渲染设置页，而不是停在读设置中')
+  assert.ok(!/暂时没能读取设置/.test(h.text()))
+  h.dispose()
+})
+
+await scenario('非 Windows 平台会明说「Windows 通知收不到」，并建议替代方案', async () => {
+  // 🔴 2026-11-05：mac/Linux 上 toast 根本弹不出来（lib/toast.mjs 直接跳过），
+  // 以前面板不提示 —— 用户以为插件没跑。现在必须明说 + 给替代方案。
+  const h = harness({ state: { toastSupported: false, platform: 'darwin' } }); await h.flush()
+  await h.click('运行偏好')   // 运行偏好默认折叠，先展开才看得到通知方式
+  const text = h.text(h.area('prefs'))
+  assert.match(text, /这个平台没有 Windows 通知/)
+  assert.match(text, /darwin/)
+  assert.match(text, /Webhook/, '要给替代方案')
+  assert.match(text, /仅保存文件/)
+  // Windows 上不该出现这条警告
+  const win = harness({ state: { toastSupported: true, platform: 'win32' } }); await win.flush()
+  await win.click('运行偏好')
+  assert.ok(!/这个平台没有 Windows 通知/.test(win.text(win.area('prefs'))))
+  h.dispose(); win.dispose()
 })
 
 console.log('\n【运行、额度与结果】')

@@ -16,10 +16,11 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { sendToast } from '../lib/toast.mjs'
-import { homeDir } from '../lib/paths.mjs'
+import { homeDir, venvPython } from '../lib/paths.mjs'
 
 const HOME = homeDir()
-const VENV_PY = join(HOME, '.venv', 'Scripts', 'python.exe')
+// 🔴 2026-11-05：跨平台 —— Windows 是 Scripts\python.exe，mac/Linux 是 bin/python
+const VENV_PY = venvPython(HOME)
 const SCRIPT = new URL('./forward-pick.py', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
 
 const argv = process.argv.slice(2)

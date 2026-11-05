@@ -28,7 +28,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, utf8_stdio  # noqa: E402
+from _home import home_str, utf8_stdio, read_cookie_text  # noqa: E402
 
 # 体检输出里带昵称（可能含 emoji）—— 被 api-reply.py 读 stdout，崩了整条链就断（Issue #7②）
 utf8_stdio()
@@ -46,9 +46,9 @@ CHECK_URL = "https://www.douyin.com/aweme/v1/web/user/profile/self/?device_platf
 
 
 def _cookies() -> dict:
-    try:
-        raw = open(COOKIE_FILE, encoding="utf-8").read().strip()
-    except OSError:
+    # 走 read_cookie_text()：剥 BOM（带 BOM 的 Cookie 会让请求头编码失败）
+    raw = read_cookie_text()
+    if not raw:
         return {}
     jar = {}
     for p in raw.split(";"):

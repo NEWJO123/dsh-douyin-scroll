@@ -38,6 +38,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, redactCookie } from './lib/state.mjs'
 import { saveCookie, readCookie, hasCredential, credentialInfo, clearCredential, cookiePath } from './lib/credential.mjs'
+import { venvPython as venvPythonPath } from './lib/paths.mjs'
 import { sendWebhook, condense, maskUrl } from './lib/notify.mjs'
 import { sendToast, toastSummary } from './lib/toast.mjs'
 import { readRunProgress, reportPicks } from './lib/run-status.mjs'
@@ -47,7 +48,7 @@ import { beginRound, readRecord, writeRecord, recordEvent, finishRound, submitRo
 import { createCommentSender } from './lib/comment-send.mjs'
 import { createDmReplyService, generateDmReply, loadReplyPersona } from './lib/dm-reply.mjs'
 import { createCommentAiReplyService, createCommentEvidenceCache, generateCommentReply } from './lib/comment-ai-reply.mjs'
-import { setupFiles, PY_IMPORT_PROBE, PY_PACKAGES } from './lib/setup-health.mjs'
+import { setupFiles, probeImports, PY_IMPORT_PROBE, PY_PACKAGES } from './lib/setup-health.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
 import {
   loadDmMemory, mergeDmMemory, noteSent, addFacts, dmContext,
@@ -834,34 +835,114 @@ export function apply(ctx, config) {
   const hasPkg = (venvRoot, prefix) => {
     try { return readdirSync(sitePkgs(venvRoot)).some((n) => n.startsWith(prefix)) } catch { return false }
   }
-  const venvPython = () => process.platform === 'win32'
-    ? join(stateDir, '.venv', 'Scripts', 'python.exe')
-    : join(stateDir, '.venv', 'bin', 'python')
-  /** ⭐ "就绪"必须检查依赖真的装上了，不能只看目录存不存在 */
-  const venvReadyNow = () => setupFiles(stateDir).pythonReady
+  const venvPython = () => venvPythonPath(stateDir)
+  /**
+   * ⭐ "就绪"必须检查依赖**真的能 import**，不能只看目录存不存在。
+   *   🔴 2026-11-05：原来只查目录 —— 装了一半 / 装坏了（目录在、包是空壳）时会误判成
+   *   「环境就绪」，面板显示就绪、用户点跑一轮才失败，报错还含糊。
+   *
+   *   🔴🔴 同日二次修正（差点重犯 0.5.7 那个「装插件整个 DSH 卡死」）：
+   *      第一版直接在这里 `spawnSync` 跑 import 探针 —— 实测阻塞宿主 **659ms**，
+   *      而它会被 /status、/run 这些 HTTP 接口调用 ⇒ 每次缓存失效就冻住整个宿主。
+   *      现在改成**两段式**：
+   *        ① 同步快速路径：只看目录（毫秒级），先给调用方一个答案，绝不阻塞；
+   *        ② 后台异步探针：`spawn` 起 python 真验一次，结果回来再校准缓存。
+   *      面板那边有 3 秒轮询，所以「先显示目录结论、随后被校准」是可见且安全的；
+   *      真跑一轮（/run）走的是 spawnCapture，它自己会跑真探针，不受这里影响。
+   */
+  let venvReadyCache = { key: '', at: 0, value: false, probing: false }
+  const venvCacheKey = () => {
+    const files = setupFiles(stateDir)
+    if (!files.pythonReady) return { files, key: '' }
+    try {
+      const st = statSync(files.python)
+      return { files, key: `${files.python}|${st.mtimeMs}|${files.packages.httpx}|${files.packages.curl_cffi}` }
+    } catch { return { files, key: files.python } }
+  }
+  /** 后台真验一次（异步，不阻塞宿主）；失败也只降级成「未就绪 + 日志」 */
+  const scheduleVenvProbe = (files, key) => {
+    if (venvReadyCache.probing) return
+    venvReadyCache.probing = true
+    const py = files.python
+    const t = setTimeout(() => {
+      try {
+        const child = spawn(py, ['-c', PY_IMPORT_PROBE], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: pyEnv() })
+        let out = ''
+        child.stdout?.on('data', (b) => { out += String(b) })
+        child.on('error', (e) => { venvReadyCache = { key, at: Date.now(), value: false, probing: false }; log(`venv 探针起不来：${e?.message ?? e}`) })
+        child.on('exit', (code) => {
+          let ok = false
+          try { const j = JSON.parse(out || '{}'); ok = PY_PACKAGES.every((n) => j[n]?.ok === true) } catch { ok = false }
+          venvReadyCache = { key, at: Date.now(), value: ok, probing: false }
+          if (!ok) log('venv 目录在但依赖导入失败 —— 面板会显示「环境未就绪」，点「装主依赖」可修复')
+        })
+      } catch (e) {
+        venvReadyCache = { key, at: Date.now(), value: false, probing: false }
+        log(`venv 探针异常：${e?.message ?? e}`)
+      }
+    }, 0)
+    t.unref?.()
+  }
+  const venvReadyNow = () => {
+    const { files, key } = venvCacheKey()
+    if (!key) return false // 目录层就不齐，连探针都不用起
+    const now = Date.now()
+    if (venvReadyCache.key === key && now - venvReadyCache.at < 60_000) return venvReadyCache.value
+    // 还没验过这个版本 ⇒ 先按目录结论回答，同时后台真验（不阻塞）
+    if (!venvReadyCache.probing) scheduleVenvProbe(files, key)
+    return venvReadyCache.key === key ? venvReadyCache.value : true
+  }
 
   const installLogFile = join(stateDir, 'install.log')
   const appendInstall = (s) => { try { appendFileSync(installLogFile, s, 'utf8') } catch { /* 算了 */ } }
 
-  const spawnTo = (cmd, args, { sink = appendInstall, env = null, cwd = stateDir } = {}) => new Promise((resolve) => {
+  /**
+   * 🔴 2026-11-05：**必须带超时**。
+   *   原来没有超时 —— `pip install` 卡住（国内访问 PyPI 镜像经常卡、镜像站挂掉、
+   *   代理不通）时这个 Promise 永不 resolve ⇒ `installing` 永远是 true ⇒
+   *   面板永远显示「安装中…」、按钮全灰，用户只能重启 DSH 赌一把，而且重启后
+   *   `.venv` 可能是个半成品，更懵。
+   *   现在：超时就 kill 掉、记一条明确的失败原因，把控制权还给用户。
+   */
+  const spawnTo = (cmd, args, { sink = appendInstall, env = null, cwd = stateDir, timeoutMs = 600_000 } = {}) => new Promise((resolve) => {
     sink(`\n$ ${cmd} ${args.join(' ')}\n`)
-    let c
+    let c, done = false, timer = null
+    const finish = (code, note) => {
+      if (done) return
+      done = true
+      if (timer) clearTimeout(timer)
+      if (note) sink(note)
+      resolve(code)
+    }
     try {
       c = spawn(cmd, args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: pyEnv(env || {}) })
-    } catch (e) { sink(`起不来：${e?.message ?? e}\n`); return resolve(1) }
+    } catch (e) { sink(`起不来：${e?.message ?? e}\n`); return finish(1) }
     const w = (b) => sink(String(b))
     c.stdout?.on('data', w)
     c.stderr?.on('data', w)
-    c.on('exit', (code) => { sink(`\n--- exit ${code} ---\n`); resolve(code) })
-    c.on('error', (e) => { sink(`起不来：${e?.message ?? e}\n`); resolve(1) })
+    c.on('exit', (code) => { sink(`\n--- exit ${code} ---\n`); finish(code) })
+    c.on('error', (e) => { sink(`起不来：${e?.message ?? e}\n`); finish(1) })
+    timer = setTimeout(() => {
+      const sec = Math.round(timeoutMs / 1000)
+      sink(`\n⏱ 超过 ${sec} 秒还没结束 —— 强制结束（多半是网络卡在镜像站/代理上）\n`)
+      try { c.kill('SIGTERM') } catch { /* 已经退了 */ }
+      setTimeout(() => { try { if (!done) c.kill('SIGKILL') } catch { /* 忽略 */ } }, 5000).unref?.()
+      finish(1, `⏱ 这一步超时（${sec}s）已中止 —— 换网络/代理后重新点「装主依赖」即可，已装的部分不会重装\n`)
+    }, timeoutMs)
+    timer.unref?.()
   })
 
+  /** 探一下命令能不能跑（uv --version）。同样要带超时：命令卡住时不能让安装流程跟着挂住。 */
   const probeCmd = (cmd) => new Promise((resolve) => {
+    let done = false, timer = null
+    const finish = (v) => { if (done) return; done = true; if (timer) clearTimeout(timer); resolve(v) }
     try {
       const c = spawn(cmd, ['--version'], { windowsHide: true, stdio: 'ignore' })
-      c.on('exit', (code) => resolve(code === 0))
-      c.on('error', () => resolve(false))
-    } catch { resolve(false) }
+      c.on('exit', (code) => finish(code === 0))
+      c.on('error', () => finish(false))
+      timer = setTimeout(() => { try { c.kill('SIGKILL') } catch { /* 已退 */ } finish(false) }, 20_000)
+      timer.unref?.()
+    } catch { finish(false) }
   })
   let uvOk = null
   const haveUv = async () => {
@@ -1213,7 +1294,8 @@ export function apply(ctx, config) {
       st[`last_${mode}`] = Date.now()
       st.lastMode = mode
       st.lastAt = new Date().toISOString()
-      writeFileSync(sendGateFile, JSON.stringify(st, null, 2), 'utf8')
+      // 🔴 2026-11-05：改原子写（并发下直接写会读到半截 JSON ⇒ 发送闸/冷却窗口静默失效）
+      writeJson(sendGateFile, st)
     } catch { /* 记不上不影响发 */ }
   }
   /** 撞限流：设一个冷却窗口，期间所有发送都直接拒 */
@@ -1222,7 +1304,8 @@ export function apply(ctx, config) {
       const st = readJson(sendGateFile, {}) || {}
       st.blockedUntil = Date.now() + minutes * 60_000
       st.blockedAt = new Date().toISOString()
-      writeFileSync(sendGateFile, JSON.stringify(st, null, 2), 'utf8')
+      // 🔴 2026-11-05：原子写 —— 冷却窗口读成半截 JSON 会当「没被限流」，接着发就撞 403
+      writeJson(sendGateFile, st)
     } catch { /* 记不上不影响 */ }
   }
 
@@ -1343,7 +1426,11 @@ export function apply(ctx, config) {
       const wcRaw = args.with_comments === undefined ? 5 : Number(args.with_comments)
       const withComments = Math.max(0, Math.min(Number.isFinite(wcRaw) ? wcRaw : 5, 15))
       const r = await runPy('forward-pick.py', [], { timeout: 300_000 })
-      if (r.status !== 0) return { ok: false, error: '取候选失败', stderr: String(r.stderr || '').slice(0, 400) }
+      if (r.status !== 0) {
+        // 结构化错误在 stdout（如「还没有登录」），别只读 stderr
+        const j = pickJson(r.stdout)
+        return { ok: false, error: String(j?.error || '取候选失败'), hint: j?.hint, stderr: String(r.stderr || '').slice(0, 400) }
+      }
       let picked = {}
       try { picked = JSON.parse(readFileSync(join(stateDir, 'forward-pick.json'), 'utf8')) } catch { picked = {} }
       const rows = (Array.isArray(picked.rows) ? picked.rows : []).slice(0, top)
@@ -1389,14 +1476,18 @@ export function apply(ctx, config) {
       if (!existsSync(cookiePath(stateDir))) {
         return { ok: false, error: '还没有 Cookie', hint: '先扫码登录（tools/qr-login.mjs start），或设置页粘贴 Cookie' }
       }
-      const venvPy = join(stateDir, '.venv', 'Scripts', 'python.exe')
+      const venvPy = venvPythonPath(stateDir)
       const py = existsSync(venvPy) ? venvPy : (cfg.pythonPath || 'python')
       const r = await spawnCapture(py, [script], {
         timeout: 240_000,
         env: pyEnv({ DOUYIN_HOME: stateDir }),
       })
       if (r.status !== 0) {
-        return { ok: false, error: 'forward-pick.py 执行失败', stderr: String(r.stderr || r.error || '').slice(0, 400) }
+        // 🔴 2026-11-05：脚本把结构化错误写在 **stdout**（不是 stderr），
+        //    只读 stderr 会让用户看到笼统的「执行失败」，看不到真正原因（比如还没登录）。
+        const j = pickJson(r.stdout)
+        return { ok: false, error: String(j?.error || 'forward-pick.py 执行失败'), hint: j?.hint,
+          stderr: String(r.stderr || r.error || '').slice(0, 400) }
       }
       let picked = {}
       try { picked = JSON.parse(readFileSync(join(stateDir, 'forward-pick.json'), 'utf8')) } catch { picked = {} }
@@ -1673,7 +1764,7 @@ export function apply(ctx, config) {
       raw: { type: 'boolean', description: '连原始条目一起返回（默认 false）' },
     },
     async execute(args = {}) {
-      const venvPy = join(stateDir, '.venv', 'Scripts', 'python.exe')
+      const venvPy = venvPythonPath(stateDir)
       if (!existsSync(venvPy)) return { ok: false, error: '还没装运行环境', hint: '设置页点「装主依赖」' }
       if (!existsSync(cookiePath(stateDir))) return { ok: false, error: '还没有 Cookie', hint: '先扫码登录' }
       const argv = [join(pluginDir, 'tools', 'notice-read.py')]
@@ -2271,7 +2362,11 @@ export function apply(ctx, config) {
       const lines = text.split('\n')
       const head = lines.find((l) => /status_code=/.test(l)) || ''
       const items = lines.filter((l) => /^\s{2}cid=|^\s{6}└ /.test(l)).map((s) => s.replace(/^\s+/, ''))
-      if (r.status !== 0) return { ok: false, error: '拉评论失败', stderr: String(r.stderr || '').slice(0, 300), head }
+      if (r.status !== 0) {
+        // 结构化错误在 stdout（如「还没有登录」），别只读 stderr
+        const j = pickJson(r.stdout)
+        return { ok: false, error: String(j?.error || '拉评论失败'), hint: j?.hint, stderr: String(r.stderr || '').slice(0, 300), head }
+      }
       return {
         ok: true, aweme_id: id, head,
         count: items.filter((s) => s.startsWith('cid=')).length,
@@ -3183,7 +3278,11 @@ export function apply(ctx, config) {
     try {
       const max = Math.max(1, Math.min(Number(limit) || 12, 30))
       const r = await runPy('forward-pick.py', ['--limit', String(max)], { timeout: 300_000 })
-      if (r.status !== 0) return { ok: false, error: String(r.stderr || '').slice(0, 300) }
+      if (r.status !== 0) {
+        // 结构化错误在 stdout（如「还没有登录」），别只读 stderr
+        const j = pickJson(r.stdout)
+        return { ok: false, error: String(j?.error || r.stderr || '').slice(0, 300), hint: j?.hint }
+      }
       let picked = {}
       try { picked = JSON.parse(readFileSync(join(stateDir, 'forward-pick.json'), 'utf8')) } catch { picked = {} }
       const rows = (Array.isArray(picked.rows) ? picked.rows : []).slice(0, max)
@@ -4650,6 +4749,14 @@ export function apply(ctx, config) {
       /** ⭐ 登录的是哪个号（扫码/体检时记下来的；没有就 null） */
       account: readJson(join(stateDir, 'account.json'), null),
       venvReady: venvReadyNow(),
+      /**
+       * 🔴 2026-11-05：通知通道的平台支持情况。
+       *   Toast 只在 Windows 上可用；mac/Linux 用户默认 notifyMode='toast' 时
+       *   **什么都不会弹**，而面板/体检以前都不说 —— 用户以为插件没跑。
+       *   面板拿到这个字段后，在非 Windows 上标注「这个平台收不到」并建议换 webhook / 只写文件。
+       */
+      toastSupported: process.platform === 'win32',
+      platform: process.platform,
       installing,
       install: { ...install },
       environmentReady: setupFiles(stateDir).ready,

@@ -9,7 +9,7 @@
 
 1. **先跑预检**（不用装 DSH）：
    ```bash
-   node selfcheck.mjs          # 374 项
+   node selfcheck.mjs          # 402 项
    python tools/smoke.py       # 想先看见"判断长什么样"，跑这个（离线示例数据）
    ```
 2. **装插件**：`dsh plugin --profile web add link:<本目录绝对路径>`

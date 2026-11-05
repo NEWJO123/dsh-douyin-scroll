@@ -321,7 +321,7 @@ dsh-douyin-scroll/
 ├── index.js                          # 宿主半端：配置/工具/定时器/证据包/headless 跑一轮/HTTP
 ├── client.js                         # 设置页（非 ESM 自注册脚本）
 ├── AI-USAGE.md                       # ⭐ 给别的 AI 看的使用说明（MCP 接入 + 安全红线）
-├── selfcheck.mjs                     # 本地预检（374 项）
+├── selfcheck.mjs                     # 本地预检（402 项）
 ├── tools/
 │   ├── mcp-server.mjs                # ⭐ 标准 MCP server（stdio，零依赖）—— 别的 agent 工具接进来
 │   ├── panel-render-check.mjs        # ⭐ 设置页真渲染一遍（抓白屏，语法检查查不出）

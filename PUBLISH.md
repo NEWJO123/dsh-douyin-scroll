@@ -156,7 +156,7 @@ index.js  client.js  cordis.patch.yml  package.json  AI-USAGE.md
 lib/           14 个（state / credential / notify / toast / hostdeps / uvfetch / paths / chrome / memory / douyin-work / comment-publish-ui / pet-brain / pet-observe / pet-relay）
 prompts/       duty.md（值班章程）、persona.default.md（中性默认人设）、sample-candidates.json
 tools/         41 个（采集 / 评论 / 私信 / 发卡片 / 扫码 / 自检 / MCP server / 渲染检查）
-selfcheck.mjs  374 项预检，不用装 dsh 也能跑
+selfcheck.mjs  402 项预检，不用装 dsh 也能跑
 requirements.txt  只有 curl_cffi + httpx
 ```
 

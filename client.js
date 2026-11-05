@@ -22,7 +22,7 @@ window.__ModuleLoader__.load({
      *    面板看起来"没变化"，很难判断是代码错了还是没加载。
      *    对一下面板右上角显示的 `v<版本>·b<N>` 就知道。
      */
-    const PANEL_BUILD = 40
+    const PANEL_BUILD = 41
 
     const asJson = async (res) => {
       if (res.ok) return res.json()
@@ -1156,15 +1156,31 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
 
       React.useEffect(() => {
         let alive = true
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 12000)
+        let retryTimer = 0
+        let controller = new AbortController()
+        let timer = setTimeout(() => controller.abort(), 12000)
         setLoadError('')
-        ;(async () => {
+        /**
+         * 🔴 2026-11-05：面板一直停在「读设置中」的两个真口子（B 站有人反馈）。
+         *   ① 只试一次、没有重试：插件路由是等宿主 webServer 就绪才注册的，
+         *      面板比路由先加载时这一次必然失败，然后就永远停住。
+         *   ② 失败信息被 `if (alive)` 挡住：面板在加载途中被宿主重新挂载时 alive=false，
+         *      错误直接丢掉 —— 界面既不报错、也不出「重新读取」按钮，只能干等。
+         *   ⇒ 现在：失败自动重试（间隔递增，共 3 次），**每次重试换一个新的超时控制器**
+         *      （共用一个的话第一次 abort 后后面全废），并且错误一定落到状态里。
+         */
+        const attempt = async (n) => {
+          if (n > 0) {
+            controller = new AbortController()
+            timer = setTimeout(() => controller.abort(), 12000)
+          }
+          const signal = controller.signal
           try {
-            const [s, c] = await Promise.all([jget('/status', { signal: controller.signal }), jget('/config', { signal: controller.signal })])
-            clearTimeout(timer)
+            const [s, c] = await Promise.all([jget('/status', { signal }), jget('/config', { signal })])
             if (!alive) return
             if (!s?.ok || !c?.config) throw new Error('设置数据暂不可用')
+            clearTimeout(timer)
+            setLoadError('')
             setSt(s)
             setCfg(c.config)
             jget('/persona').then((r) => { if (alive && r?.ok) setPersona(personaData(r)) }).catch(() => {})
@@ -1178,10 +1194,19 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
               }
             }
           } catch (e) {
-            if (alive) setLoadError(e?.name === 'AbortError' ? '读取超时，请重试。' : String(e?.message || e))
+            if (!alive) return
+            const why = e?.name === 'AbortError' ? '读取超时' : String(e?.message || e)
+            // 还有次数就自动再试（宿主刚起来时路由可能晚到一两秒）
+            if (n < 2) {
+              setLoadError(`正在重试（第 ${n + 2}/3 次）：${why}`)
+              retryTimer = setTimeout(() => { if (alive) attempt(n + 1) }, 1200 * (n + 1))
+              return
+            }
+            setLoadError(`${why}（已自动重试 3 次仍失败）`)
           } finally { clearTimeout(timer) }
-        })()
-        return () => { alive = false; controller.abort(); clearTimeout(timer) }
+        }
+        attempt(0)
+        return () => { alive = false; clearTimeout(retryTimer); controller.abort(); clearTimeout(timer) }
       }, [loadVersion])
 
       const patch = async (p, label, feedbackArea) => {
@@ -2089,8 +2114,16 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
                   h('label', { 'data-dy-pref-field': '' }, h('span', null, '通知方式'),
                     h('select', { 'data-dy-input': '', value: String(cfg.notifyMode || 'toast'), disabled: Boolean(busy),
                       onChange: (e) => patch({ notifyMode: e.target.value }, '通知方式已保存') },
-                      h('option', { value: 'toast' }, 'Windows 通知'), h('option', { value: 'file' }, '仅保存文件'),
-                      h('option', { value: 'webhook' }, 'Webhook'), h('option', { value: 'both' }, 'Windows 通知与 Webhook'))))),
+                      h('option', { value: 'toast' }, st.toastSupported === false ? 'Windows 通知（这个平台收不到）' : 'Windows 通知'),
+                      h('option', { value: 'file' }, '仅保存文件'),
+                      h('option', { value: 'webhook' }, 'Webhook'), h('option', { value: 'both' }, 'Windows 通知与 Webhook')),
+                    /* 🔴 2026-11-05：mac/Linux 上 toast 根本弹不出来（lib/toast.mjs 直接跳过）——
+                       以前面板不提示，用户以为插件没跑。现在明说 + 给替代方案。 */
+                    st.toastSupported === false
+                      ? h('div', { 'data-dy-sub': '', 'data-dy-warn': '' },
+                        '这个平台没有 Windows 通知（当前是 ' + String(st.platform || '非 Windows') + '）。'
+                        + '选「Windows 通知」不会弹任何东西 —— 请改用「Webhook」或「仅保存文件」（报告一直都会写）。')
+                      : null))),
             ) : null),
 
         h('div', { 'data-dy-card': '', 'data-dy-area': 'help', 'data-dy-preferences': '' },

@@ -23,7 +23,7 @@ import sys
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, utf8_stdio  # noqa: E402
+from _home import home_str, utf8_stdio, read_cookie_text  # noqa: E402
 
 # ⚠️ 通知里必然有昵称 + emoji，GBK 控制台直接崩（Issue #7②）
 utf8_stdio()
@@ -33,7 +33,28 @@ import time
 from curl_cffi import requests as creq
 
 HOME = home_str()
-COOKIE = open(os.path.join(HOME, "douyin_cookie.txt"), encoding="utf-8").read().strip()
+
+
+def _require_cookie():
+    """
+    🔴 2026-11-05：没登录时给结构化错误，不许抛 FileNotFoundError 堆栈。
+    新用户装完还没扫码就点「读通知」⇒ 以前直接一大段 traceback，以为插件装坏了。
+    ⚠️ 必须走 read_cookie_text()：它剥 BOM —— 带 BOM 的 Cookie 塞进请求头会
+       UnicodeEncodeError（用户在 Windows 记事本里粘贴 Cookie 就会带 BOM）。
+    """
+    cookie = read_cookie_text()
+    if not cookie:
+        print(json.dumps({
+            "ok": False,
+            "error": "还没有登录（没有 douyin_cookie.txt）",
+            "hint": "先在设置页扫码登录（或粘一条 Cookie），再读通知",
+            "stage": "cookie",
+        }, ensure_ascii=False))
+        sys.exit(2)
+    return cookie
+
+
+COOKIE = _require_cookie()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 BASE = "https://www.douyin.com"

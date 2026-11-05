@@ -118,6 +118,13 @@ try {
   row('无头浏览器', 'warn', String(e?.message ?? e), '跑一次取候选或发私信时会自动拉起')
 }
 
+/* ── 7b. 通知通道的平台支持（🔴 2026-11-05） ──
+ *   Toast 只在 Windows 上可用；mac/Linux 上默认 notifyMode='toast' 时**什么都不会弹**，
+ *   以前体检和面板都不说，用户以为插件没跑。这里如实写一行 + 给替代方案。 */
+if (process.platform === 'win32') row('通知通道', 'ok', 'Windows 通知可用（默认）')
+else row('通知通道', 'warn', `当前平台是 ${process.platform}，Windows 通知在这里弹不出来`,
+  '设置页把「通知方式」改成 Webhook，或「仅保存文件」（报告一直都会写）')
+
 /* ── 8. 签名器运行时（读评论要用；Issue #2① / #4） ── */
 if (home) {
   const signerDir = process.env.DY_SIGNER_DIR || join(home, 'signer')

@@ -272,6 +272,23 @@ try {
 /* ── 4d. 人设分家：不许串门 ── */
 console.log('\n4d. 人设分家')
 try {
+  /**
+   * 🔴 2026-11-05：文档里写的「预检 N 项」必须三处一致。
+   *   以前 README / AGENTS / PUBLISH 三处容易各自写各自的数字（实际就出现过 110/59/198 三种）。
+   *   ⚠️ 这里**不跟 pass 比** —— 跑到这一段时 pass 只是"目前为止的条数"，不是最终总数。
+   *   只校验三处文档写的是同一个数（用户看到的就是这个数，三处对不上就会以为版本不对）。
+   */
+  {
+    const docs = [['README.md', /本地预检（(\d+) 项）/], ['AGENTS.md', /# (\d+) 项/], ['PUBLISH.md', /(\d+) 项预检/]]
+    const seen = []
+    for (const [file, re] of docs) {
+      const m = re.exec(readIf(join(here, file)))
+      if (m) seen.push(`${file}=${m[1]}`)
+    }
+    const nums = new Set(seen.map((s) => s.split('=')[1]))
+    if (seen.length && nums.size === 1) ok(`三个文档写的预检项数一致（${seen.join('、')}）`)
+    else bad(`文档里的预检项数三处不一致：${seen.join('、') || '（一处都没写）'}`)
+  }
   const idx = readFileSync(join(here, 'index.js'), 'utf8')
   if (/persona:/.test(idx) && /personaWarn/.test(idx)) {
     ok('runDuty 会校验人设文件第一行的 persona 标记')
@@ -1551,6 +1568,25 @@ try {
     ok('webhook 发之前先校验目的地址（回环 / link-local / 云元数据全拦）')
   } else bad('sendWebhook 又把地址直接丢给 fetch 了（CWE-918，Issue #5）')
 
+  /**
+   * 🔴 2026-11-05：webhook URL 进日志前必须脱敏 —— **Slack 的末段很短，原来漏了**。
+   *   实测旧规则（末段 ≥16 才打码）下：
+   *     https://hooks.slack.com/services/T00AAAAAA/B00BBBBBB/abcdefghijk → 原样进日志
+   *   Slack 的 webhook URL 本身就是 credential，必须打码。
+   */
+  if (/indexOf\('services'\)/.test(notifyText) && /maskUrl/.test(notifyText)) {
+    ok('maskUrl 认得 Slack 的 /services/ 形状（末段短也能脱敏，不把 bot key 写进日志）')
+  } else bad('maskUrl 只按末段长度判 token —— Slack webhook 会整条漏进日志（等于泄露凭证）')
+  // 真跑一遍：Slack 必须被打码
+  {
+    const { maskUrl } = await import('./lib/notify.mjs')
+    const slack = maskUrl('https://hooks.slack.com/services/T00AAAAAA/B00BBBBBB/abcdefghijk')
+    const generic = maskUrl('https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc123def456')
+    if (!/T00AAAAAA/.test(slack) && !/abcdefghijk/.test(slack) && /key=\*\*\*/.test(generic)) {
+      ok('maskUrl 实测：Slack 与企微 hook 都被打码（凭证不进日志）')
+    } else bad(`maskUrl 实测漏了：slack=${slack}`)
+  }
+
   // #3 关键词只能是软偏好，不能变硬筛
   const fpText = readFileSync(join(here, 'tools', 'forward-pick.py'), 'utf8')
   if (/kw_hits/.test(fpText) && /不参与采集、不硬筛/.test(fpText)) {
@@ -1580,6 +1616,115 @@ try {
   if (/未登录不自动值班/.test(idx) && /if \(!hasCredential\(stateDir\)\) return/.test(idx)) {
     ok('未登录时定时器不自动值班（新装机不再「装上去就卡死」）')
   } else bad('定时器没有未登录闸 —— 新装机到点就白跑一轮（还会冻宿主一次探针）')
+
+  /* ── 🔴 2026-11-05：跨平台 venv 路径 + 环境就绪口径（mac/Linux 装好也用不了的老坑） ── */
+  const pathsSrc = readIf(join(here, 'lib', 'paths.mjs'))
+  if (/export function venvPython\(/.test(pathsSrc) && /win32/.test(pathsSrc) && /'bin', 'python'/.test(pathsSrc)) {
+    ok('lib/paths.mjs 有跨平台的 venvPython（Windows Scripts / mac-Linux bin）')
+  } else bad('lib/paths.mjs 缺跨平台 venvPython —— 各处又会自己写死 Windows 路径')
+  // 除了 paths.mjs 里那唯一一处，别的文件不许再出现「写死 Scripts\python.exe」
+  const offenders = []
+  for (const f of ['tools/forward-run.mjs', 'tools/mcp-server.mjs', 'tools/forward-pick.mjs', 'lib/setup-health.mjs']) {
+    const t = readIf(join(here, f))
+    if (/\.venv', 'Scripts', 'python\.exe'/.test(t) && !/win32/.test(t)) offenders.push(f)
+  }
+  // index.js 只许通过 venvPythonPath() 拿路径，不许自己拼
+  const idxHardcode = (idx.match(/.venv', 'Scripts', 'python\.exe'/g) || []).length
+  if (!offenders.length && idxHardcode === 0) {
+    ok('没有文件再写死 Windows 的 venv python 路径（mac/Linux 装好不会误判成「没装环境」）')
+  } else bad(`这些文件又写死了 Windows venv 路径：${[...offenders, ...(idxHardcode ? [`index.js(${idxHardcode}处)`] : [])].join(', ')}`)
+  // 环境「就绪」必须跑真 import，不能只看目录存在
+  const healthSrc = readIf(join(here, 'lib', 'setup-health.mjs'))
+  if (/export function probeImports\(/.test(healthSrc) && /PY_IMPORT_PROBE/.test(healthSrc)) {
+    ok('setup-health 提供真实 import 探针（能识破「目录在、包是空壳」的半成品环境）')
+  } else bad('setup-health 只有静态目录检查 —— 装坏一半的环境会被判成「就绪」')
+  /**
+   * 🔴 两件事都要守住：
+   *   ① 环境就绪不能只看目录（要有真 import 校准）
+   *   ② 但那个校准**不许在宿主进程里同步跑** —— spawnSync 会冻宿主（0.5.7 就是这么卡死的；
+   *      实测同步探针要摁住事件循环 659ms，而它就挂在 /status 这种高频接口上）
+   *   ⇒ 正确形态：同步快速路径先给答案 + 后台异步探针校准。
+   */
+  if (/scheduleVenvProbe|venvProbe/.test(idx) && /venvReadyCache/.test(idx)) {
+    ok('venvReadyNow 用后台异步探针校准 + 缓存（既不只看目录，也不阻塞宿主）')
+  } else bad('venvReadyNow 没有后台异步校准 —— 要么只看目录（误判就绪），要么同步起进程（冻宿主）')
+  {
+    const fn = idx.slice(idx.indexOf('const venvReadyNow'), idx.indexOf('const venvReadyNow') + 900)
+    // probeImports 内部是 spawnSync —— 出现在这个同步函数体里就等于把宿主摁住
+    if (/spawnSync|probeImports\(/.test(fn)) bad('venvReadyNow 里同步跑了探针（spawnSync/probeImports）—— 它挂在 /status 上，会冻住整个宿主（0.5.7 的老坑）')
+    else ok('venvReadyNow 不阻塞宿主（真验走后台异步，函数体里没有同步探针）')
+  }
+  /**
+   * 🔴 装依赖用的 spawnTo 必须带超时（2026-11-05）。
+   *   没有超时的话：pip install 卡在镜像站/代理上 ⇒ Promise 永不 resolve ⇒
+   *   `installing` 永远 true ⇒ 面板永远「安装中…」、按钮全灰，用户只能重启赌一把。
+   */
+  {
+    const i = idx.indexOf('const spawnTo = ')
+    const fn = i >= 0 ? idx.slice(i, i + 1200) : ''
+    if (!fn) bad('找不到 spawnTo —— 装依赖的实现被大改过，需要人工确认')
+    // 必须真的把 timeoutMs 用在 setTimeout 里、并在超时时 kill 且 resolve（只写个默认值不算数）
+    else if (/setTimeout\(\s*\(\)\s*=>\s*\{[\s\S]{0,400}?timeoutMs/.test(fn) && /clearTimeout/.test(fn) && /kill\(/.test(fn) && /finish\(1,/.test(fn)) {
+      ok('装依赖的 spawnTo 带超时 + 超时会 kill 并结束（卡住的 pip install 不会让「安装中…」永久挂着）')
+    } else bad('spawnTo 的超时没有真正生效（timeoutMs 要用于 setTimeout，超时要 kill + 结束 Promise）—— pip 卡住时安装永远结束不了')
+  }
+  /**
+   * 🔴 writeJson 必须是**原子写**（2026-11-05）。
+   *   直接 writeFileSync 不是原子的：并发实测 2033 次读里有 16 次读到半截 JSON，
+   *   而 readJson 遇到坏 JSON 会返回 fallback ⇒ 用户配置静默变回默认值、
+   *   发送状态机被当成「没有记录」⇒ 可能重复发送（发出去了删不掉）。
+   */
+  {
+    const st = readIf(join(here, 'lib', 'state.mjs'))
+    const i = st.indexOf('export function writeJson')
+    const fn = i >= 0 ? st.slice(i, i + 900) : ''
+    if (!fn) bad('找不到 writeJson —— 状态写入实现被大改过，需要人工确认')
+    else if (/renameSync\(/.test(fn) && /tmp/.test(fn)) {
+      ok('writeJson 是原子写（写 tmp 再 rename，并发下读不到半截 JSON）')
+    } else bad('writeJson 又变回直接写 —— 并发读会拿到半截 JSON，配置会静默变回默认值')
+  }
+  /**
+   * 🔴 Python 脚本读 Cookie 不许裸奔（2026-11-05）。
+   *   新用户装完还没扫码就点工具 ⇒ 以前直接 FileNotFoundError 一大段堆栈，
+   *   用户以为插件装坏了。现在必须 try/except + 输出结构化 {ok:false, error, hint} + exit(2)。
+   */
+  {
+    const pyCookie = [
+      ['notice-read.py', '读通知'], ['api-comments.py', '读评论'],
+      ['api-reply.py', '回评论'], ['forward-pick.py', '取候选'],
+    ]
+    const naked = []
+    for (const [file, what] of pyCookie) {
+      const t = readIf(join(here, 'tools', file))
+      if (!t) continue
+      // 必须**真的用**兜底函数（只看有没有定义不算）；且不许再出现裸 open(cookie)
+      const usesGuard = /COOKIE = _require_cookie\(\)/.test(t) || /cookie = load_cookie\(\)/.test(t)
+      const nakedOpen = /COOKIE = open\(os\.path\.join\(HOME, "douyin_cookie\.txt"\)/.test(t)
+      if (!usesGuard || nakedOpen) naked.push(`${file}(${what})`)
+    }
+    if (!naked.length) ok('Python 脚本读 Cookie 都有兜底（没登录时给结构化错误，不抛堆栈）')
+    else bad(`这些脚本没登录时会抛 Python 堆栈而不是提示：${naked.join('、')}`)
+
+    /* 🔴 Cookie 必须剥 BOM（2026-11-05）：
+     *   用户在 Windows 记事本 / PowerShell `Set-Content -Encoding UTF8` 粘贴 Cookie 会带 BOM，
+     *   带 BOM 塞进 curl_cffi 请求头直接 UnicodeEncodeError（'latin-1' can't encode '\ufeff'），
+     *   报错完全不指向"文件带 BOM"，用户只会觉得插件坏了。实测 6 个脚本全中。 */
+    const homePy = readIf(join(here, 'tools', '_home.py'))
+    if (/def read_cookie_text\(/.test(homePy) && /lstrip\("\\ufeff"\)|lstrip\('\\ufeff'\)/.test(homePy)) {
+      ok('_home.py 的 read_cookie_text() 会剥 BOM（记事本粘的 Cookie 不再让请求头编码崩）')
+    } else bad('_home.py 没有剥 BOM 的 read_cookie_text —— 带 BOM 的 Cookie 会让 curl_cffi 报 UnicodeEncodeError')
+
+    // 所有读 cookie 的脚本都必须走这个统一入口，不许自己 open
+    const rawOpen = []
+    for (const file of ['notice-read.py', 'api-comments.py', 'api-reply.py', 'forward-pick.py', 'im-http.py', 'session-guard.py']) {
+      const t = readIf(join(here, 'tools', file))
+      if (!t) continue
+      if (/open\([^)]*douyin_cookie\.txt|open\(COOKIE_FILE/.test(t)) rawOpen.push(file)
+      if (!/read_cookie_text/.test(t)) rawOpen.push(file + '(没走统一入口)')
+    }
+    if (!rawOpen.length) ok('6 个脚本都走 read_cookie_text()（统一剥 BOM + 兜底，不再各自裸读）')
+    else bad(`这些脚本还在裸读 Cookie：${[...new Set(rawOpen)].join('、')}`)
+  }
 } catch (e) { bad(`宿主冻结防线检查失败：${e.message}`) }
 
 /* ── 4e. 采集门槛 / 跨天记账 ── */

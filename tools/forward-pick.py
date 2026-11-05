@@ -17,7 +17,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, read_cookie_text  # noqa: E402
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -51,8 +51,13 @@ CST = timezone(timedelta(hours=8))
 
 
 def load_cookie():
-    with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-        return f.read().strip()
+    """
+    🔴 2026-11-05：没登录时要给**结构化错误**，不许抛 traceback。
+    而且必须走 read_cookie_text() —— 它剥 BOM：用户在 Windows 记事本里粘贴 Cookie
+    会带 UTF-8 BOM，带 BOM 塞进 curl_cffi 请求头会直接
+    UnicodeEncodeError: 'latin-1' codec can't encode character '\\ufeff'。
+    """
+    return read_cookie_text()
 
 
 def walk_awemes(obj, bag):
@@ -162,6 +167,15 @@ def main():
     dropped = {"no_desc": 0, "too_short_video": 0, "short_and_quiet": 0}
 
     cookie = load_cookie()
+    # 🔴 2026-11-05：没登录 ⇒ 给结构化错误并干净退出（不再抛 FileNotFoundError 堆栈）
+    if not cookie:
+        print(json.dumps({
+            "ok": False,
+            "error": "还没有登录（没有 douyin_cookie.txt）",
+            "hint": "先在设置页扫码登录（或粘一条 Cookie），再来跑一轮",
+            "stage": "cookie",
+        }, ensure_ascii=False))
+        sys.exit(2)
     bag = {}
     meta = []
 

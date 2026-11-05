@@ -44,6 +44,30 @@ def cookie_file() -> Path:
     return home_dir() / "douyin_cookie.txt"
 
 
+def read_cookie_text() -> str:
+    """
+    🔴 2026-11-05：**读 Cookie 的唯一入口** —— 必须剥 BOM。
+
+    为什么：设置页支持「粘一条 Cookie」，而用户在 Windows 上用记事本 /
+    PowerShell `Set-Content -Encoding UTF8` 存文件时会带 UTF-8 BOM（U+FEFF）。
+    带 BOM 的 Cookie 塞进 curl_cffi 的请求头里会直接炸：
+
+        UnicodeEncodeError: 'latin-1' codec can't encode character '\\ufeff'
+
+    这个错看着完全不指向"文件带 BOM"，用户只会觉得插件坏了。
+    实测：6 个脚本全都中招（forward-pick / notice-read / api-comments /
+    api-reply / im-http / session-guard），因为都各自裸读这个文件。
+
+    返回空串表示「没有 Cookie / 读不出来」，由调用方给结构化提示。
+    """
+    try:
+        raw = cookie_file().read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+    # 剥 BOM（可能在文件最前面，也可能因为复制粘贴夹在开头空白里）
+    return raw.lstrip("\ufeff").strip()
+
+
 def plugin_dir() -> Path:
     """插件包根目录（tools/ 的上一层）"""
     return Path(__file__).resolve().parent.parent

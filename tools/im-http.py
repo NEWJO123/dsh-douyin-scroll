@@ -59,7 +59,7 @@ except Exception:
     pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, read_cookie_text  # noqa: E402
 
 try:
     from curl_cffi import requests as creq
@@ -266,9 +266,9 @@ def peer_uid_of(conv_id, my_uid):
 
 
 def read_cookie():
-    try:
-        raw = open(os.path.join(HOME, "douyin_cookie.txt"), encoding="utf-8").read().strip()
-    except OSError:
+    # 走 read_cookie_text()：剥 BOM（带 BOM 的 Cookie 会让请求头编码失败）
+    raw = read_cookie_text()
+    if not raw:
         return ""
     if raw.startswith("{"):
         try:

@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, node_bin, utf8_stdio  # noqa: E402
+from _home import home_str, node_bin, utf8_stdio, read_cookie_text  # noqa: E402
 
 # ⚠️ 必须在任何 print 之前 —— Windows 控制台是 GBK，emoji 一进去就 UnicodeEncodeError（Issue #7②）
 utf8_stdio()
@@ -25,7 +25,26 @@ PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Issue #7①：原来写死 `C:\Program Files\nodejs\node.exe`，绿色版/node 装在别处的机器直接 FileNotFoundError
 NODE = node_bin()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
-COOKIE = open(os.path.join(HOME, "douyin_cookie.txt"), encoding="utf-8").read().strip()
+
+
+def _require_cookie():
+    """
+    🔴 2026-11-05：没登录时给结构化错误，不许抛 FileNotFoundError 堆栈。
+    """
+    # 必须走 read_cookie_text()：它剥 BOM（带 BOM 的 Cookie 塞进请求头会 UnicodeEncodeError）
+    cookie = read_cookie_text()
+    if not cookie:
+        print(json.dumps({
+            "ok": False,
+            "error": "还没有登录（没有 douyin_cookie.txt）",
+            "hint": "先在设置页扫码登录（或粘一条 Cookie），再读评论",
+            "stage": "cookie",
+        }, ensure_ascii=False))
+        sys.exit(2)
+    return cookie
+
+
+COOKIE = _require_cookie()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 JAR = {}
