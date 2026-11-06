@@ -1,3 +1,38 @@
+## 未发布 — fix: 上游偶发「请重新发送」把一整轮白打死
+
+- 现象：同一批请求里，前一条回 `Illegal API invocation from an unapproved channel`、后一条正常；那一轮却直接 code=1 收场（`PI_AI_ERROR: buddy: 请求被拦截…`），其实重发一次就过。
+- 修法：识别这类错误（`TRANSIENT_RE`），**开跑 3 分钟内**被拦且没交出结果 ⇒ 20 秒后自动重来一轮，最多 2 次；跑久了（可能已经发过卡片）不重试，避免重复发送。
+- 自检：⑦l 三条（认得出 / 会重试 / 只限前 3 分钟）。
+## 未发布 — fix: 上游把流掐了，那一轮只能干等 15 分钟看门狗
+
+- 现象：round da56c777 最后一条输出之后 **12 分钟没有任何动静**，连接没断、模型那一步永远等不到；整轮只能等 15 分钟超时看门狗，日志里只剩一句「超时」，看不出是卡在模型那一步。另有一次（09:41 那轮）进程 16 秒就退出、**一个字都没吐**，日志里连 `dsh:` 报错都没有。
+- 修法①：连续 `DOUYIN_STALL_MIN`（默认 5，2–30）分钟没有任何输出 ⇒ 判定「上游卡住」，立刻结束并记 `stage: 'stall'`，不再白占满 15 分钟。
+- 修法②：进程非 0 退出且**整个 stdout/stderr 是空的**时，日志明说「这一轮没有任何输出就退出了」——免得下一次还以为是日志漏了。
+- 自检：⑦k 三条（卡死检测存在 / 定时器会清 / 静默退出留痕）。
+## 未发布 — change: `roundPermission` 留空时按平台自动（不再一律 danger-full-access）
+
+- 理由：Windows 上 headless 的沙箱后端 fail-closed，不给 danger-full-access 那一轮就没有 shell（写报告、核字数全靠 read/edit 硬扛）；但其它平台不该跟着放宽。
+- 现在：留空 = Windows 给 `danger-full-access`，mac/Linux 保持 `workspace-write`。
+## 未发布 — fix: 值班那一轮偷改插件设置（真的发生过）+ 文本设置清不掉
+
+- 现象：一轮跑完，`config.json` 里的 `autoSend`、`mentionName` 被改成「打开 / 某人」，下一轮就会照这个去发东西。
+- 修法①：`prompts/duty.md` 的「产物」一节明令只许写报告 / seen.md / submission.json，**不许改 config.json**。
+- 修法②：开跑前记下 `config.json` 原文（`cfgSnapshot()`），跑完比对（`reportCfgMutation()`）；改了就点名（敏感项 autoSend/autoComment/commentExecutor/mentionName/commentPerDay/chatWatch 会额外弹一次 Toast）。**不自动还原** —— 免得把主人这一轮在设置页改的东西一起回滚。
+- 修法③：`__clearKeys` 现在也能清文本字段（以前「空值保护」会把空串救回来，`mentionName` 填过就清不掉）。
+- 自检：⑦j 三条。
+## 未发布 — fix: 先失败后成功的那天，报告开头还是「这一轮没跑成」
+
+- 现象：占位报告只在当天没报告时写，成功那一轮的内容被追加在失败横幅下面，打开报告第一眼看到的是「没跑成」。
+- 修法：成功收尾（code=0 && phase=completed）时把旧横幅整段挪到文末「附：早先那轮没跑成时的诊断」，当前内容回到最上面；切分按 ` 围栏**配对**，不会把围栏里的日志尾巴切出去。
+- 自检：⑦i 两条（函数存在 / 只在成功时调用）；另做了一次带围栏日志尾的功能自测。
+
+## 未发布 — fix: 结果文件被写成两段拼接时，整轮会被误判成「没交作业」
+
+- 现象：报告明明写好了，Toast 却是「结果尚未确认」，phase=unknown。
+- 真因：小模型把 uns/<id>.submission.json 追加写了两遍（{...}{...}），JSON.parse 抛错，收尾认为没有提交结果。
+- 修法：新增 eadJsonLoose()（原样 parse 失败后扫第一个括号配平的 {...}，再失败取最后一个），收尾读 submission 改用它。
+- 自检：⑥h 一条（真写两段拼接、断言读出最后一份）。
+
 # 变更记录
 
 > 版本号只跟「**装插件的人会感觉到变化**」的东西走：工具行为、bug 修复、面板、配置项。
@@ -8,6 +43,97 @@
 > 等主人拍板发布时**统一抬到一个对外版本号**再推 —— 对外只看得见最终那一版。
 
 ---
+
+## 未发布 — feat: 直连的 key 欠费时，改走桌面版的本地网关
+
+> 2026-11-05 实测：本机 baomiao 的 key 直连 401「该令牌额度已用尽」，
+> deepseek-account 是 Insufficient Balance，免费渠道全 throttled ——
+> 但桌面版自带一个本地网关（`dsh-our-free-model` 的 chan-relay，默认 `127.0.0.1:8326`），
+> 换到 `buddy/*` / `minimax/*` 渠道就能出话（额度由宿主那边轮换）。
+
+- `probeGateway()`：读 `~/.dsh/openai-gateway/api-key`、问一句 `/v1/models`，挑一条实测能跑的渠道模型。
+- 选路失败（`ROUTE_FAIL_RE` 命中）时**先试网关**，再试直连备选；网关能跑就在 overlay 里补
+  `douyin-gateway` 这个 `openai-completions` provider（key 走环境变量 `DOUYIN_GATEWAY_KEY`，
+  不进日志、不落盘）。
+- 也可以手动钉死：`headlessRoute: "douyin-gateway/buddy/hy3"`。
+- ⚠️ 网关只在桌面版开着时存在；拿不到就当没有，行为与以前一致。
+
+## 未发布 — fix: headless 那一轮没有 shell（权限档没传进去）
+
+> 2026-11-05 实测：headless profile 的 `sandbox-policy` 默认 `workspace-write`，而本机 Windows
+> 的 ACL 受限令牌后端是 **fail-closed** 的（探测不过）⇒ 那一轮的 `pwsh` 直接报
+> 「sandbox mode requested but no backend usable」。模型只能改用 read/edit 硬扛：
+> 核字数、跑脚本、核对 JSON 全做不了，日志里就是那句「The pwsh sandbox fails」。
+
+- 新配置 `roundPermission`（默认 `danger-full-access`，对齐桌面版 `permission.defaultPreset`）：
+  spawn 那一轮时注入 `DSH_PERMISSION_MODE`，探测那一跑也带（两边环境要一致）。
+- 机器上沙箱好后端的，把它改成 `workspace-write` / `read-only` 就回到受限模式。
+
+## 未发布 — fix: 账户没余额时也自动换道；新增 `headlessRoute` 钉死模型
+
+> 2026-11-05 实测：探测一句「ok」能过（短请求不触发计费校验），真跑到第 3 分钟才蹦
+> `dsh: ACCOUNT_QUOTA: Insufficient Balance (request_id: …)` —— 报告全空、只弹「本轮异常结束」。
+> 而桌面版 `agent-default-model` 只是**默认值**，GUI 里换了模型它不一定跟着改
+> （本机配置写着 deepseek-account，实际在跑 baomiao-oneapi，那个账户余额用完了）。
+
+- 失败判定从只认 `NO_ADAPTER` 扩成 `ROUTE_FAIL_RE`：额度不足 / 欠费也算这条路跑不了，退到备选。
+- 备选列表换成真的能跑的两条：`baomiao-oneapi / DeepSeek-V4.1-Flash 1017(1.20x)`、
+  `baomiao-oneapi / GLM-5.3-Flash (0.32x)`（原来那条 `deepseek / deepseek-flash` 实测是 NO_ADAPTER，已删）。
+- 新配置 `headlessRoute`（`provider/model`）：留空 = 跟随桌面版；填了就先探测它、跑不通再退备选。
+- 缓存键带上来源（`pin:` / `desk:`），改配置不会被旧结论顶掉；`fallback` 结论也会缓存。
+
+## 未发布 — fix: IPv6 先到且不通时，读评论每条要卡 200 秒（证据包里 0 条评论）
+
+> 2026-11-05 实测（Windows 11 + 家宽）：www.douyin.com 的 DNS **先返回 10 个 AAAA**，
+> 而这台机器 IPv6 不通（connect 5 秒 TimeoutError，同域名 IPv4 45ms 就连上）。
+> httpx 没有 happy-eyeballs，按 getaddrinfo 顺序逐个连 ⇒ 每个地址吃满系统 SYN 重试。
+
+**症状**：那一轮"准备候选"卡住十几分钟，uns/<id>.json 一直停在 phase: preparing，
+duty.log 一行都不记；pi-comments.py 每个作品耗满 200 秒超时，证据包里**评论全是空的**
+（判断只剩文案/标签，质量明显下降）。pi-reply.py 同样会卡。
+
+**修法**：	ools/_home.py 新增 prefer_ipv4() —— 在 getaddrinfo 外面套一层，只要
+amily 是 AF_UNSPEC 就把 AAAA 过滤掉（DOUYIN_FORCE_IPV4=0 可关）；pi-comments.py
+和 pi-reply.py 在第一次请求前调用它。curl_cffi（推荐流那条）本来就自己做 IPv4 回退，不受影响。
+
+**实测**：同一台机器、同一条作品，修前 200 秒超时 0 条；修后 **13 秒返回 20 条**（含楼中楼）。
+
+---
+
+## 未发布 — fix: 桌面版换成「插件型 provider」后，每一轮 3 秒就失败（NO_ADAPTER）
+
+> 2026-11-05 实测（Windows + 桌面版 DSH）。症状很迷惑：插件本身没报错、也没报「没登录」，
+> 只在 `duty.log` 里留一行 `dsh: NO_ADAPTER: ...`，报告是空的，用户只看到一条「本轮异常结束」。
+
+**症状**：桌面版把模型切成插件型 provider（实测 `buddy`、`codearts`）后，定时那一轮从一开始就不干活 ——
+`dsh --profile headless` 启动约 3 秒退出（`code=1`），`duty.log` 里是：
+
+```
+dsh: NO_ADAPTER: no adapter registered for provider "buddy"
+```
+
+把桌面版模型切回 `deepseek-account / deepseek-flash` 后同一台机器立刻正常 ——
+所以看起来像「玄学」，其实是 provider 选错了层。
+
+**机制**：`ensureOverlay()` 会把桌面版 `agent-default-model` 的 `provider / model` **原样抄进**
+`headless-overlay.yml`。但 headless profile 只装 `dsh-base` / `dsh-headless` 那一套 llm 插件
+（`deepseek-account`、`llm-pi-ai` 里配的那几个）；`buddy` / `codearts` 这类 provider 的 adapter
+是**桌面 profile 的插件**装的，headless 根本没有 ⇒ overlay 一写下去，那一轮就注定起不来。
+
+**修法**：新增 `resolveHeadlessRoute()` —— 跑之前先用临时 overlay **真跑一句**（`只回复两个字：ok`）：
+
+- 能跑通 ⇒ 照旧跟随桌面版模型（行为不变）；
+- 输出命中 `NO_ADAPTER` ⇒ 依次试 `FALLBACK_ROUTES`（`deepseek-account / deepseek-flash`、
+  `deepseek / deepseek-flash`），第一条跑通就用它，并把结论按 `provider/model` 缓存在
+  `douyin-duty/headless-route.json`（同一个模型只真探测一次，不会每轮白烧时间）；
+- 探测超时 / 别的错 ⇒ 不猜，仍按桌面版模型跑，日志写清「探测没得出结论」。
+
+探测轮用 `opts.probe` 跳过 MCP 挂载 —— 只为问一句「有没有 adapter」，没必要拉 python / 无头浏览器。
+日志沿用 `overlay: 模型跟随桌面版 = <provider> / <model>`，换道时在后面缀「（…没有 adapter，已自动退回）」。
+
+**验证**：`node selfcheck.mjs` 399 通过 / 0 失败（新增 4 条守卫；拿未修改的 0.7.3 源码跑，
+这 4 条**全红**，负向验证过）；`node --check index.js` 通过；本机实测
+`NO_ADAPTER` 复现 1 次、退回后 `deepseek-account / deepseek-flash` 跑通 1 次。
 
 ## 0.7.3 — 2026-11-05（批量修复：17 个隐藏 bug，含 3 个隐私/凭证问题）
 
