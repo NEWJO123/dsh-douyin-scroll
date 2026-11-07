@@ -1632,6 +1632,30 @@ try {
     }
   } catch (e) { bad('读不到 tools/_home.py 或 httpx 脚本：' + (e?.message || e)) }
 
+  /* ── ⑦m 探测也在满权限下跑真模型：偷改设置的快照必须先于探测拍下 ──
+   * 🔴 2026-11-07 收审 PR #18 时发现：cfgSnapshot() 原来拍在 resolveHeadlessRoute() 之后，
+   *    而 probe 那一步同样带满权限跑真模型 —— probe 阶段改的 config.json 会被当成
+   *    「跑前原文」，偷改检测整个漏掉一段窗口。
+   */
+  {
+    const snap = idx.indexOf('const cfgBeforeSpawn = cfgSnapshot()')
+    const probe = idx.indexOf('await resolveHeadlessRoute(dsh)')
+    if (snap !== -1 && probe !== -1 && snap < probe) ok('偷改设置的快照先于选路探测拍下（probe 也动得了 config.json）')
+    else bad('快照晚于选路探测 —— probe 阶段偷改 config.json 会漏检')
+  }
+  /* ── ⑦n 偶发拦截（transient）不误删选路缓存 ──
+   * 🔴 2026-11-07 收审时发现：「请求被拦截」同时命中 ROUTE_FAIL_RE 与 TRANSIENT_RE，
+   *    轮次重试的同时把能走的路的缓存删了 ⇒ 下一轮白花一次探测。
+   */
+  if (/if \(code !== 0 && !timedOut && ROUTE_FAIL_RE\.test\(outTail\) && !TRANSIENT_RE\.test\(outTail\)\)/.test(idx)) ok('偶发拦截（请重新发送类）不会误删选路缓存')
+  else bad('缓存作废不排除 transient —— 偶发拦截会白删能走的路')
+  /* ── ⑦o 选路全失败的最后一招：不写模型段，用 headless 原生默认 ──
+   * 🔴 2026-11-07 收审时发现：FALLBACK_ROUTES 收窄后兜底变薄 —— 全部备选都失败时，
+   *    原来只能硬跑必死的原模型。现在多一层：不塞 overlay 的模型段，用 profile 原生默认。
+   */
+  if (/native: true/.test(idx) && /跳过模型段/.test(idx)) ok('选路全失败时还有最后一招：不写模型段、用 headless 原生默认')
+  else bad('选路全失败只能硬跑原模型 —— 没有 native 兜底')
+
   /* ── ⑧ 通知正文要能从报告里解析出真内容 ──
    * 🔴 2026-10-22 真 bug：toastSummary 只认旧格式（`- **文案摘要**：`），
    *    但 duty.md 现在写成 `**《标题》** · @作者` ⇒ 通知正文变成"（第 1 条）"。

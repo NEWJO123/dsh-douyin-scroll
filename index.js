@@ -2930,8 +2930,8 @@ const TRANSIENT_RE = /请求被拦截|Illegal API invocation|unapproved channel|
       }
       log(`route: 备选 ${cand.provider} / ${cand.model} 也不行（${r.timedOut ? '超时' : r.error || 'code=' + r.code}）`)
     }
-    log('⚠️ route: 所有备选模型都跑不通 ⇒ 这一轮仍按原模型启动（大概率还是会失败）')
-    return target
+    log('⚠️ route: 所有备选都跑不通 ⇒ 最后一招：这一轮不写模型段，让 headless 用它 profile 自己的默认模型')
+    return { native: true }
   }
 
   const ensureOverlay = (roundId = '', route = null, opts = {}) => {
@@ -2997,7 +2997,11 @@ const TRANSIENT_RE = /请求被拦截|Illegal API invocation|unapproved channel|
         '',
       )
     }
-    if (modelRoute?.provider && modelRoute?.model) {
+    if (modelRoute?.native) {
+      // ⭐ 2026-11-07：选路全失败的最后一招 —— 不写模型段，headless 用 profile 里自己那份默认。
+      //    （原生默认历史上 429 过，但那是「所有能挑的路都死了」之后的最小兜底，比硬跑必死的原模型强。）
+      log('overlay: 跳过模型段 —— 这一轮用 headless profile 自己的默认模型')
+    } else if (modelRoute?.provider && modelRoute?.model) {
       yml.push('- id: agent-default-model', "  name: '@deepseek-ai/dsh-agent-default-model'", '  config:',
         `    provider: '${modelRoute.provider}'`, `    model: '${modelRoute.model}'`,
         ...(modelRoute.effort ? [`    reasoningEffort: '${modelRoute.effort}'`] : []), '')
@@ -3729,7 +3733,10 @@ let transientRetries = 0
            * ⭐ 2026-11-05：先确认桌面版当前模型在 headless 里有没有 adapter，
            *    没有就自动退到能跑的（见 resolveHeadlessRoute 上面的长注释）。
            *    同一条模型只探测一次，结论缓存在 headless-route.json。
+           * ⭐ 2026-11-07：探测那一步也在满权限下跑真模型 —— 「偷改设置」的比对快照
+           *    必须先于它拍，否则 probe 阶段改的 config.json 会被当成「跑前原文」漏检。
            */
+          const cfgBeforeSpawn = cfgSnapshot()
           const route = await resolveHeadlessRoute(dsh)
           const overlay = ensureOverlay(round.id, route)
           const args = [...dsh.args, '--profile', cfg.headlessProfile || 'headless']
@@ -3738,7 +3745,6 @@ let transientRetries = 0
           const cwd = stateDir
           log(`刷抖音开跑（${why}）：${dsh.command} ${args.slice(0, 3).join(' ')} …  cwd=${cwd}`)
           petSay('开工开工～鱼一条条挑，马上回来')
-          const cfgBeforeSpawn = cfgSnapshot()
           const child = spawn(dsh.command, args, {
             cwd,
             shell: dsh.shell,
@@ -3806,8 +3812,10 @@ let transientRetries = 0
             /**
              * ⭐ 2026-11-05：短探测能过、真跑却死在额度/拦截上（探测那句太短，不触发计费校验；
              *    或者上游偶发风控）。这时**必须把缓存判死**，否则下一轮还会捡起这条死路。
+             * ⭐ 2026-11-07：排除 transient（「请重新发送」类偶发拦截）—— 那种错路本身能走，
+             *    删了缓存下一轮又要白花一次探测。词表和 TRANSIENT_RE 有重叠，误删就是这么来的。
              */
-            if (code !== 0 && !timedOut && ROUTE_FAIL_RE.test(outTail)) {
+            if (code !== 0 && !timedOut && ROUTE_FAIL_RE.test(outTail) && !TRANSIENT_RE.test(outTail)) {
               try {
                 rmSync(join(stateDir, 'headless-route.json'), { force: true })
                 log('route: 这一轮死在上游（额度/拦截）⇒ 已经作废选路缓存，下一轮会重新挑一条能跑的')
