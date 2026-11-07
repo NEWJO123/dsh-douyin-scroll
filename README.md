@@ -226,6 +226,8 @@ node selfcheck.mjs
 | pythonPath / dshBin | 自动 | 一般不用改 |
 | 发私信给谁（昵称 / 稳定 ID） | 空 | `dmTo` 只显示；`dmToId` 才决定发给谁 |
 | 更新地址 `updateUrl` | 空 | 留空 = 自动查 npm / GitHub；填了就只查这一个 |
+| 值班用哪个模型 `headlessRoute` | 空 | `provider/model`（如 `deepseek-account/deepseek-flash`）。**留空 = 跟随桌面版**；桌面版换成了 headless 认不得的插件型 provider 时，插件会自己探测并退回能跑的，这里可以钉死 |
+| 值班权限档 `roundPermission` | 空 | 留空 = **Windows 给 `danger-full-access`**（对齐桌面版；部分机器的受限沙箱后端不可用，不给就没有 shell），mac / Linux 保持 `workspace-write`。想收紧就填 `workspace-write` / `read-only` |
 
 > 2026-10-21 删掉了「采集来源」和「工作区」两项：前者只剩一条路（只读推荐流），
 > 后者是"读外部 AGENTS.md 当人设"的口子，已封死 —— 人设只读插件自带的 `prompts/persona.md`。
@@ -321,7 +323,7 @@ dsh-douyin-scroll/
 ├── index.js                          # 宿主半端：配置/工具/定时器/证据包/headless 跑一轮/HTTP
 ├── client.js                         # 设置页（非 ESM 自注册脚本）
 ├── AI-USAGE.md                       # ⭐ 给别的 AI 看的使用说明（MCP 接入 + 安全红线）
-├── selfcheck.mjs                     # 本地预检（402 项）
+├── selfcheck.mjs                     # 本地预检（430 项）
 ├── tools/
 │   ├── mcp-server.mjs                # ⭐ 标准 MCP server（stdio，零依赖）—— 别的 agent 工具接进来
 │   ├── panel-render-check.mjs        # ⭐ 设置页真渲染一遍（抓白屏，语法检查查不出）
