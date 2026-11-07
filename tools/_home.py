@@ -127,3 +127,39 @@ def utf8_stdio() -> None:
             s.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def prefer_ipv4(force: bool | None = None) -> bool:
+    """让 httpx 只连 IPv4（默认开，`DOUYIN_FORCE_IPV4=0` 可关）。
+
+    2026-11-05 实测（本机必现，读评论每条约 200 秒才超时）：
+      www.douyin.com 的 DNS **先返回 10 个 AAAA**（2409:8c6a:…），而这条网络
+      **IPv6 不通**（`connect` 5 秒 TimeoutError，同域名 IPv4 45ms 连上）。httpx
+      没有 happy-eyeballs，会按 getaddrinfo 顺序逐个连 ⇒ 每个地址吃满系统 SYN
+      重试，看起来就是「卡住不动」：`api-comments.py` 200 秒超时、`api-reply.py`
+      同理，最后只剩 CDP 兜底（无头浏览器没开会再等 180 秒）。
+    ⇒ 把 AAAA 过滤掉，只留 A。curl_cffi（推荐流那条）自己做 IPv4 回退，不受影响。
+    """
+    import socket
+
+    if force is None:
+        raw = (os.environ.get("DOUYIN_FORCE_IPV4") or "1").strip().lower()
+        force = raw not in ("0", "false", "off", "no")
+    if not force:
+        return False
+    if getattr(socket, "_douyin_ipv4_patch", False):
+        return True
+
+    orig = socket.getaddrinfo
+
+    def _gai(host, port, family=0, type=0, proto=0, flags=0):
+        infos = orig(host, port, family, type, proto, flags)
+        if family in (0, socket.AF_UNSPEC):
+            v4 = [i for i in infos if i[0] == socket.AF_INET]
+            if v4:
+                return v4
+        return infos
+
+    socket.getaddrinfo = _gai  # type: ignore[assignment]
+    socket._douyin_ipv4_patch = True  # type: ignore[attr-defined]
+    return True

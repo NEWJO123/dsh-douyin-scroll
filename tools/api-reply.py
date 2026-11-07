@@ -18,10 +18,12 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, node_bin, utf8_stdio, read_cookie_text  # noqa: E402
+from _home import home_str, node_bin, prefer_ipv4, utf8_stdio, read_cookie_text  # noqa: E402
 
 # ⚠️ 必须在任何 print 之前 —— GBK 控制台遇到 emoji 会崩（Issue #7②）
 utf8_stdio()
+# ⚠️ 必须在第一次 httpx 请求之前 —— 见 _home.prefer_ipv4() 的注释（IPv6 先到且不通 ⇒ 每次卡满重试）
+prefer_ipv4()
 
 import time
 import urllib.parse

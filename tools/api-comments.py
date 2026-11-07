@@ -11,10 +11,13 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, node_bin, utf8_stdio, read_cookie_text  # noqa: E402
+from _home import home_str, node_bin, prefer_ipv4, utf8_stdio, read_cookie_text  # noqa: E402
 
 # ⚠️ 必须在任何 print 之前 —— Windows 控制台是 GBK，emoji 一进去就 UnicodeEncodeError（Issue #7②）
 utf8_stdio()
+# ⚠️ 必须在第一次 httpx 请求之前 —— 这个域名 DNS 先给 10 个 AAAA，IPv6 不通就会卡满 SYN 重试
+#    （2026-11-05 实测：每条评论 200 秒超时 ⇒ 证据包全部没评论）
+prefer_ipv4()
 
 import urllib.parse
 

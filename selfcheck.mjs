@@ -9,7 +9,7 @@
  * ⚠️ 它**不**启动 DSH、**不**启动浏览器、**不**联网。
  * ============================================================================
  */
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -1489,6 +1489,148 @@ try {
   else bad('模型跟随的正则不接受 `# 注释` —— overlay 会漏写模型，headless 用错通道')
   if (/overlay: 模型跟随桌面版/.test(idx)) ok('overlay 会记"模型跟随桌面版"')
   else bad('overlay 没记录模型跟随')
+
+  /* ── ⑦b headless 没有 adapter 的 provider 必须能自动退回 ──
+   * 🔴 2026-11-05 真 bug：overlay 把桌面版模型原样抄下去，桌面版换成插件型 provider
+   *    （buddy / codearts）后 headless 里没有对应 adapter ⇒
+   *    `dsh: NO_ADAPTER: no adapter registered for provider "buddy"` ⇒ 这一轮 3 秒就死、
+   *    报告为空，只弹一条「本轮异常结束」。桌面版模型换回去就正常，所以极难自己看出来。
+   *    修法：真跑一句探测，NO_ADAPTER 就退到 headless 自带的那条（deepseek-account）。
+   */
+  if (/NO_ADAPTER/.test(idx) && /no adapter registered for provider/.test(idx)) ok('会识别 headless 的 NO_ADAPTER（provider 没有 adapter）')
+  else bad('没有识别 NO_ADAPTER —— 桌面版换成插件型 provider 后每轮都会 3 秒失败')
+  if (/const resolveHeadlessRoute\s*=/.test(idx) && /FALLBACK_ROUTES/.test(idx)) ok('有一条"探测 + 退回备选"的决策函数')
+  else bad('没有 resolveHeadlessRoute / FALLBACK_ROUTES —— 模型换不了道')
+  if (/const route = await resolveHeadlessRoute\(dsh\)/.test(idx) && /ensureOverlay\(round\.id, route\)/.test(idx)) ok('跑之前先选路（route 传进 overlay）')
+  else bad('runDuty 没有先选路 —— 还是会照抄桌面版 provider')
+  if (/cfg\.autoSend && !opts\.probe/.test(idx)) ok('探测轮不挂 douyin MCP（只问一句，不拉 python）')
+  else bad('探测轮会挂 MCP —— 探测变重，还可能动状态')
+
+  /* ── ⑦d 账户没余额也是一种「这条路跑不了」──
+   * 🔴 2026-11-05 真 bug：探测一句「ok」能过（短请求没触发计费校验），真跑到第 3 分钟才蹦
+   *    `dsh: ACCOUNT_QUOTA: Insufficient Balance (request_id: …)` ⇒ 报告全空、只弹「本轮异常结束」。
+   *    修法：失败判定里带上额度错误；另给一个 `headlessRoute` 配置，能把这一轮钉死在能跑的模型上。
+   */
+  if (/ACCOUNT_QUOTA/.test(idx) && /Insufficient Balance/.test(idx)) ok('会识别账户额度不足（ACCOUNT_QUOTA / Insufficient Balance）')
+  else bad('没识别额度不足 —— 余额花完时每轮都白跑到一半才死')
+  if (/const ROUTE_FAIL_RE\s*=/.test(idx) && /ROUTE_FAIL_RE\.test\(blob\)/.test(idx)) ok('选路时用 ROUTE_FAIL_RE 判失败')
+  else bad('选路没按 ROUTE_FAIL_RE 判失败 —— 退回逻辑会漏')
+  if (/headlessRoute:\s*z\.string\(\)/.test(idx) && /headlessRoute:\s*''/.test(idx)) ok('有 headlessRoute 配置（provider/model 钉死一条路）')
+  else bad('没有 headlessRoute 配置 —— 桌面版默认值过期时没法钉死模型')
+  if (/const parseRouteSpec\s*=/.test(idx) && /cached\.verdict === 'fallback'/.test(idx) && /parseRouteSpec\(cfg\.headlessRoute\)/.test(idx)) ok('配置里钉的模型会先解析成 provider/model 再探测')
+  else bad('没有 parseRouteSpec 或没读回 fallback 缓存 —— 钉死的模型会时灵时不灵')
+
+  /* ── ⑦e 这一轮必须有 shell（权限档要传进子进程）──
+   * 🔴 2026-11-05 真 bug：headless profile 的 sandbox-policy 默认 workspace-write，而本机 Windows
+   *    的 ACL 受限令牌后端 fail-closed（探测不过）⇒ 那一轮的 pwsh 直接报
+   *    「sandbox mode requested but no backend usable」，模型只能改用 read/edit 硬扛（写报告、核字数都做不了）。
+   *    修法：`roundPermission` 配置（默认 danger-full-access，对齐桌面版），spawn 时注入 DSH_PERMISSION_MODE；
+   *    探测那一跑也要带，否则探测结果和正式轮的环境不一致。
+   */
+  if (/roundPermission:\s*z\.string\(\)\.default\(''\)/.test(idx) && /roundPermission:\s*'',/.test(idx)) ok('有 roundPermission 配置（留空 = 按平台自动）')
+  else bad('没有 roundPermission 配置 —— headless 轮的 pwsh 会因沙箱后端不可用而废掉')
+  if (/const effectiveRoundPermission = \(\) =>/.test(idx) && /process\.platform === 'win32' \? 'danger-full-access' : 'workspace-write'/.test(idx)) ok('权限档留空时按平台给：Windows 给 shell，其它平台保持 workspace-write（不替别人放宽）')
+  else bad('权限档不会按平台自动选 —— 要么 Windows 没 shell，要么平白把别的平台放宽成 danger-full-access')
+  {
+    const hits = (idx.match(/DSH_PERMISSION_MODE:\s*effectiveRoundPermission\(\)/g) || []).length
+    if (hits >= 2) ok(`探测轮和正式轮都带上了 DSH_PERMISSION_MODE（${hits} 处）`)
+    else bad(`只有 ${hits} 处注入 DSH_PERMISSION_MODE —— 探测或正式轮会缺 shell`)
+    // overlay 是最后叠加的一层：模式写死 workspace-write 会把环境变量那份盖掉（2026-11-05 实测踩过）
+    if (/mode: '\$\{effectiveRoundPermission\(\)\}'/.test(idx) && !/mode: 'workspace-write',/.test(idx)) ok('overlay 里的 sandbox 模式跟着配置走（没写死）')
+    else bad("overlay 把 sandbox 模式写死成 workspace-write —— 那一轮 pwsh 会因后端不可用而废掉")
+  }
+
+  /* ── ⑦f 直连的 key 欠费时，要能改走桌面版的本地网关 ──
+   * 🔴 2026-11-05 实测：baomiao 直连 401「该令牌额度已用尽」，而桌面版本地网关
+   *    （dsh-our-free-model 的 chan-relay，默认 127.0.0.1:8326）换到 buddy/minimax 就能出话。
+   *    修法：探测失败且原因是额度时，先问网关（probeGateway），能跑就在 overlay 里
+   *    补一个 openai-completions 的 provider，key 从 ~/.dsh/openai-gateway/api-key 读进环境变量。
+   */
+  if (/const probeGateway\s*=/.test(idx) && /GATEWAY_MODELS/.test(idx)) ok('有一条"改走桌面版本地网关"的路（probeGateway）')
+  else bad('没有 probeGateway —— 直连 key 欠费时这一轮只能白死')
+  if (/do apiKeyEnv DOUYIN_GATEWAY_KEY|apiKeyEnv: DOUYIN_GATEWAY_KEY/.test(idx) && /DOUYIN_GATEWAY_KEY: readGatewayKey\(\)/.test(idx)) ok('网关的 key 从 api-key 文件读进环境变量（不落盘、不进日志）')
+  else bad('网关 provider 没拿到 key —— 请求会 401')
+  if (/api: openai-completions/.test(idx) && /provider === 'douyin-gateway'/.test(idx)) ok('overlay 里会补 douyin-gateway 这个 provider')
+  else bad('overlay 没补 douyin-gateway provider —— 网关路线走不通')
+
+  /* ── ⑦g 这一轮死在上游时，要把选路缓存作废 ──
+   * 🔴 2026-11-05 实测：短探测（只回复两个字：ok）能过，真跑几分钟才 401「该令牌额度已用尽」；
+   *    或者 buddy 偶发「请求被拦截，请重新发送」⇒ 缓存里的 ok 是假的，下一轮继续捡死路。
+   *    ⇒ 收尾时若 code!=0 且输出命中 ROUTE_FAIL_RE，删掉 headless-route.json。
+   */
+  if (/额度已用尽/.test(idx) && /unapproved channel/.test(idx)) ok('ROUTE_FAIL_RE 认得出「额度已用尽」和「请求被拦截」（不只是 NO_ADAPTER）')
+  else bad('ROUTE_FAIL_RE 认不出上游的额度/拦截报错 —— 那这一轮会白白记住一条死路')
+  if (/rmSync\(join\(stateDir, 'headless-route\.json'/.test(idx)) ok('这一轮死在上游时会作废选路缓存（下一轮重新挑）')
+  else bad('失败后不作废缓存 —— 下一轮还会用同一条死路')
+
+  /* ── ⑦j 值班那一轮不许改设置（改了就点名） + 文本字段能被明确清空 ──
+   * 🔴 2026-11-06 真事：那一轮的模型直接改了 config.json（autoSend/mentionName）。
+   */
+  if (/const reportCfgMutation = /.test(idx) && /reportCfgMutation\(cfgBeforeSpawn\)/.test(idx)) ok('一轮跑完会比对该轮有没有偷改设置（改了在日志里点名）')
+  else bad('不比对该轮有没有改设置 —— 模型悄悄打开 autoSend 也不会有人知道')
+  if (/const cfgBeforeSpawn = cfgSnapshot\(\)/.test(idx)) ok('开跑前先记下 config.json 原文（不然无从比对）')
+  else bad('开跑前没记 config.json —— 比对会永远"没变"')
+  if (/!next\.trim\(\) && prev\.trim\(\) && !cleared\.includes\(k\)/.test(idx)) ok('__clearKeys 点名的文本字段能被真清空（mentionName 这类不再填过就清不掉）')
+  else bad('文本字段清不掉 —— 面板传空串会被"空值保护"救回来')
+  /* ── ⑦l 上游偶发「请重新发送」：自动重来一次，别把人晾在那儿 ──
+   * 🔴 2026-11-06 真事：同一批请求前一条被拦「Illegal API invocation from an unapproved channel」、
+   *    后一条正常 ⇒ 这一轮直接 code=1，其实重发一次就过。
+   */
+  if (/const TRANSIENT_RE = /.test(idx)) ok('认出「偶发、让重发」这类错误（请求被拦截 / Illegal API invocation）')
+  else bad('不认「请重新发送」类错误 —— 上游偶发拦一次，那一轮就白死')
+  if (/transientRetries < 2/.test(idx) && /runDuty\(why\)/.test(idx)) ok('被偶发拦掉时自动重来一轮（最多 2 次）')
+  else bad('偶发拦掉不重试 —— 只能等下一轮')
+  if (/180_000/.test(idx)) ok('只在开跑 3 分钟内被拦才重试（跑久了可能已经发过东西，重跑会重复）')
+  else bad('不区分早晚就重试 —— 可能把已经发出去的卡片再发一遍')
+  /* ── ⑦k 上游把流掐了：不能干等 15 分钟看门狗 ──
+   * 🔴 2026-11-06 真事：round da56c777 最后一条输出之后 12 分钟没动静，只能等 15 分钟
+   *    超时看门狗，日志里只剩一句「超时」，看不出是卡在模型那一步。
+   */
+  if (/DOUYIN_STALL_MIN/.test(idx) && /stallTimer/.test(idx)) ok('连续几分钟没有任何输出就判「上游卡住」并强制结束（不等 15 分钟看门狗）')
+  else bad('没有卡死检测 —— 上游掐流那一轮会白占 15 分钟，日志还看不出原因')
+  if (/clearInterval\(stallTimer\)/.test(idx)) ok('这一轮结束时会把卡死检测的定时器停掉（不会串到下一轮）')
+  else bad('卡死检测定时器没清 —— 上一轮的计时会继续杀下一轮')
+  if (/没有任何输出就退出了/.test(idx)) ok('进程没吐一个字就退出时，日志会明说（不是"日志漏了"）')
+  else bad('静默退出不留痕 —— 下一次只能靠猜')
+  /* ── ⑦i 一天里先失败后成功：旧横幅要挪到文末 ──
+   * 🔴 2026-11-06 真事：占位报告只在当天没报告时写，成功那轮的内容被追加在
+   *    「这一轮没跑成」横幅**下面** ⇒ 打开报告第一眼是"没跑成"。
+   */
+  if (/const demoteStaleFailureBanner = /.test(idx)) ok('成功收尾时会把「没跑成」的旧横幅挪到文末（报告第一眼是真结果）')
+  else bad('旧失败横幅不会被挪走 —— 先失败后成功的那天，报告开头还是"没跑成"')
+  if (/code === 0 && outcome\.phase === 'completed'\) demoteStaleFailureBanner\(\)/.test(idx)) ok('只在「code=0 且 phase=completed」时才挪横幅（失败的那轮不动报告）')
+  else bad('挪横幅的条件不对 —— 失败那轮也会被改，或者压根没调用')
+  /* ── ⑦h 结果文件被写成两段拼接时要能读出来 ──
+   * 🔴 2026-11-06 真事：小模型把 submission.json 写了两遍（`{...}{...}`）⇒ JSON.parse 抛错
+   *    ⇒ 收尾以为"没交作业" ⇒ phase=unknown、Toast「结果尚未确认」，其实报告早写好了。
+   */
+  try {
+    const { readJsonLoose } = await import('./lib/state.mjs')
+    const tmp = new URL('./.tmp-selfcheck-loose.json', import.meta.url)
+    writeFileSync(tmp, JSON.stringify({ roundId: 'a', picks: [{ id: '1' }] }) + JSON.stringify({ roundId: 'a', picks: [{ id: '2' }] }))
+    const got = readJsonLoose(tmp, null)
+    rmSync(tmp, { force: true })
+    if (Array.isArray(got?.picks) && got.picks[0]?.id === '2') ok('结果文件写成两段拼接时也能读出最后一份（不再当成没交作业）')
+    else bad('两段拼接的 JSON 读不出来 —— 那这一轮会被判成"没交作业"')
+  } catch (e) { bad(`容错读 JSON 自测失败：${e?.message || e}`) }
+
+  /* ── ⑦c httpx 脚本必须先把 IPv6 关掉 ──
+   * 🔴 2026-11-05 真 bug：www.douyin.com 的 DNS **先返回 10 个 AAAA**，而这台机器 IPv6 不通
+   *    （connect 5 秒 TimeoutError，同域名 IPv4 45ms）。httpx 没有 happy-eyeballs，会按
+   *    getaddrinfo 顺序一个个连 ⇒ 每个地址吃满系统 SYN 重试：api-comments.py 每条约 200 秒
+   *    才超时（证据包里 0 条评论），api-reply.py 同理，最后只剩 CDP 兜底（没开无头浏览器再等 180 秒）。
+   *    修法：`_home.prefer_ipv4()` 过滤掉 AAAA，两个 httpx 脚本在第一次请求前调用。
+   */
+  try {
+    const homePy = readFileSync(join(here, 'tools', '_home.py'), 'utf8')
+    if (/def prefer_ipv4\(/.test(homePy) && /_douyin_ipv4_patch/.test(homePy)) ok('_home.py 有 prefer_ipv4（只留 A 记录）')
+    else bad('_home.py 没有 prefer_ipv4 —— IPv6 先到且不通的网络上读评论会卡满超时')
+    for (const py of ['api-comments.py', 'api-reply.py']) {
+      const src = readFileSync(join(here, 'tools', py), 'utf8')
+      if (/prefer_ipv4\(\)/.test(src) && /from _home import[^\n]*prefer_ipv4/.test(src)) ok(`${py} 在请求前关掉 IPv6`)
+      else bad(`${py} 没调 prefer_ipv4() —— 这条会卡 200 秒才超时`)
+    }
+  } catch (e) { bad('读不到 tools/_home.py 或 httpx 脚本：' + (e?.message || e)) }
 
   /* ── ⑧ 通知正文要能从报告里解析出真内容 ──
    * 🔴 2026-10-22 真 bug：toastSummary 只认旧格式（`- **文案摘要**：`），

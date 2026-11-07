@@ -36,7 +36,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, redactCookie } from './lib/state.mjs'
+import { WINDOWS, stateDirOf, readJson, readJsonLoose, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, redactCookie } from './lib/state.mjs'
 import { saveCookie, readCookie, hasCredential, credentialInfo, clearCredential, cookiePath } from './lib/credential.mjs'
 import { venvPython as venvPythonPath } from './lib/paths.mjs'
 import { sendWebhook, condense, maskUrl } from './lib/notify.mjs'
@@ -284,6 +284,23 @@ export const Config = !z ? undefined : z.object({
   /** dsh 的 bin.js（不填就试自动探测） */
   dshBin: z.string().default('').extra('volatile', true),
   headlessProfile: z.string().default('headless').extra('volatile', true),
+  /**
+   * 这一轮固定用哪个模型（`provider/model`），留空 = 跟随桌面版。
+   * ⭐ 2026-11-05 加：桌面版的 agent-default-model 只是「默认值」，GUI 里换了模型
+   *    它不一定会跟着改 —— 本机就出现过「配置写着 deepseek-account，实际在跑
+   *    baomiao-oneapi」，而那个账户余额用完了（`ACCOUNT_QUOTA: Insufficient Balance`），
+   *    探测一句 ok 能过、真跑几分钟就断。这时候就在这里钉死一条能跑的路。
+   */
+  headlessRoute: z.string().default('').extra('volatile', true),
+  /**
+   * 这一轮子进程的权限档（`DSH_PERMISSION_MODE`）：`danger-full-access` / `workspace-write` / `read-only`。
+   * 🔴 2026-11-05 实测：headless profile 的 sandbox 默认是 `workspace-write`，而本机 Windows
+   *    的 ACL 受限令牌后端是 fail-closed 的（探测不过）⇒ 那一轮的 `pwsh` 直接报
+   *    「sandbox mode requested but no backend usable」，模型只能改用 read/edit 硬扛。
+   *    桌面版本体跑的就是 danger-full-access（cordis.patch.yml 的 defaultPreset），
+   *    这里对齐它；机器上沙箱好用的，把它改成 workspace-write 就回到受限模式。
+   */
+  roundPermission: z.string().default('').extra('volatile', true),
   /** 给那一轮叠一份插件自己的 patch */
   overlayMcp: z.boolean().default(true).extra('volatile', true),
   // ⚠️ 2026-10-21 删掉了 `workspace`：它原来是"读那个目录下的 AGENTS.md 当人设"，
@@ -379,6 +396,9 @@ export function apply(ctx, config) {
     //       但**面板上先不显示这个开关**（见 client.js 的 HIDE_PET_LINK）。
     petLinkTo: true,
     reportLevel: 'full', pythonPath: 'python', dshBin: '', headlessProfile: 'headless',
+    headlessRoute: '',
+    // ⚠️ DEFAULTS / zod 必须同步（这插件漏改过一次，开关点了没反应）
+    roundPermission: '',
     overlayMcp: true,
   }
   // ⭐ 哪些数组字段装的是**对象**（不能按字符串过滤）
@@ -475,6 +495,16 @@ export function apply(ctx, config) {
     return p
   }
 
+  /**
+   * 这一轮子进程的权限档。
+   * 留空 = 自动：Windows 上给 danger-full-access（受限令牌沙箱后端在本机 fail-closed，
+   * 不给就没有 shell，值班一半的活干不了）；其它平台留 workspace-write（别平白放宽）。
+   */
+  const effectiveRoundPermission = () => {
+    const asked = String(cfg.roundPermission || '').trim()
+    if (asked) return asked
+    return process.platform === 'win32' ? 'danger-full-access' : 'workspace-write'
+  }
   const CFG_SIG = ['perDay', 'maxPerRun', 'mentionName', 'commentExecutor']
   let settingsRow = { at: 0, row: null }
   const settingsDesc = (fresh = false) => {
@@ -693,7 +723,9 @@ export function apply(ctx, config) {
       if (typeof DEFAULTS[k] !== 'string') continue
       const next = String(cfg[k] ?? '')
       const prev = String(onDisk[k] ?? '')
-      if (!next.trim() && prev.trim()) {
+      // ⭐ 2026-11-06：__clearKeys 点名的字段是「主人特意清空」，不许再被救回来。
+      //    否则 mentionName 这种文本字段一旦填过就永远清不掉（面板传空串 = 静默无效）。
+      if (!next.trim() && prev.trim() && !cleared.includes(k)) {
         cfg[k] = onDisk[k]
         rescued.push(k)
       }
@@ -2697,7 +2729,209 @@ export function apply(ctx, config) {
    *    发评论那条链路只该在用户显式打开时才给 ⇒ 用 env 在**注册层**拦掉。
    *    扫码登录（`douyin_login_interactive`）**永远不给** —— 那是给人做的。
    */
-  const ensureOverlay = (roundId = '') => {
+  /**
+   * ⭐ 2026-11-05 修的真 bug（本机实测）：overlay 会把**桌面版当前选的模型**原样写进
+   *    headless 那一轮 —— 但 headless profile 只认得它自己那套 provider
+   *    （dsh-base / dsh-headless 带的 llm-* 插件：`deepseek-account`、`llm-pi-ai` 里配的那些）。
+   *    桌面版装的是插件型 provider（实测出现过 `codearts`、`buddy`），headless 里**没有 adapter**，
+   *    于是 `dsh` 一启动就：
+   *      `dsh: NO_ADAPTER: no adapter registered for provider "buddy"`
+   *    ⇒ 这一轮 3 秒结束（code=1）、报告空、只弹一条「本轮异常结束」。
+   *    ✅ 修法：跑之前先**真跑一句**确认桌面版那个 provider 在 headless 里跑不跑得通；
+   *       跑不通就自动退到能跑的（默认 `deepseek-account / deepseek-flash`），并写进日志。
+   */
+  const readDesktopRoute = () => {
+    try {
+      const deskPatch = join(dirname(stateDir), 'profiles', 'desktop', 'cordis.patch.yml')
+      if (!existsSync(deskPatch)) return null
+      const dlines = readFileSync(deskPatch, 'utf8').split(/\r?\n/)
+      let start = -1
+      for (let i = 0; i < dlines.length; i++) {
+        // 允许 `- id: agent-default-model # 注释`（2026-10-22 修过同一个坑）
+        if (/^-\s+id:\s*agent-default-model\s*(?:#.*)?$/.test(dlines[i])) { start = i; break }
+      }
+      if (start < 0) return null
+      let end = dlines.length
+      for (let j = start + 1; j < dlines.length; j++) {
+        if (/^-\s+id:/.test(dlines[j])) { end = j; break }
+      }
+      const block = dlines.slice(start + 1, end).join('\n')
+      const grab = (k) => {
+        const m = new RegExp('^\\s+' + k + ':\\s*(.+?)\\s*$', 'm').exec(block)
+        return m ? m[1].replace(/^['"]|['"]$/g, '').trim() : ''
+      }
+      const provider = grab('provider'); const model = grab('model'); const effort = grab('reasoningEffort')
+      if (!provider || !model) return null
+      return { provider, model, ...(effort ? { effort } : {}) }
+    } catch (e) {
+      log(`读桌面版模型配置失败（不影响跑）：${e?.message ?? e}`)
+      return null
+    }
+  }
+
+  /** 备选：headless profile 自带、一定能解析的模型（按顺序试） */
+  const FALLBACK_ROUTES = [
+    { provider: 'deepseek-account', model: 'deepseek-flash' },
+    { provider: 'baomiao-oneapi', model: 'DeepSeek-V4.1-Flash 1017(1.20x)' },
+    { provider: 'baomiao-oneapi', model: 'GLM-5.3-Flash (0.32x)' },
+  ]
+  /**
+   * 什么算「这条路跑不了」：除了 NO_ADAPTER，**账户没余额/欠费也算**。
+   * 2026-11-05 本机实测：探测一句「ok」能过（短请求不触发计费校验），真跑三分钟才蹦
+   * `dsh: ACCOUNT_QUOTA: Insufficient Balance (request_id: …)`，那一轮白跑、报告全空。
+   */
+  const ROUTE_FAIL_RE = /NO_ADAPTER|no adapter registered for provider|ACCOUNT_QUOTA|Insufficient Balance|insufficient_quota|quota exceeded|余额不足|额度已用尽|AUTH: 401|Authentication Fails|PI_AI_ERROR|Illegal API invocation|unapproved channel|请求被拦截/i
+/** 「偶发、让重发」这一类：命中就自动重跑这一轮（见 close 里的 transientRetries）。 */
+const TRANSIENT_RE = /请求被拦截|Illegal API invocation|unapproved channel|请重新发送|PI_AI_ERROR: .*请求被拦截/i
+  const NO_ADAPTER_RE = /NO_ADAPTER|no adapter registered for provider/i
+  const PROBE_PROMPT = '只回复两个字：ok'
+
+  /**
+   * ⭐ 桌面版自带一个**本地网关**（`dsh-our-free-model` 的 chan-relay，默认 `127.0.0.1:8326`）：
+   *   OpenAI 兼容；密钥在 `~/.dsh/openai-gateway/api-key`；模型名带渠道前缀
+   *   （`buddy/hy3`、`minimax/MiniMax-M3.1-Flash`…），**额度由宿主那边在几个账号之间轮换**。
+   *
+   * 🔴 2026-11-05 实测：直连 baomiao 的那把 key 已经「该令牌额度已用尽」，
+   *    而同一个网关换到 buddy / minimax 渠道就能出话 ⇒ 轮次走网关比直连更耐活。
+   *    ⚠️ 网关只在桌面版开着时存在（插件本来就跑在桌面版里，跑轮次时它在）。
+   */
+  const gatewayKeyFile = () => join(dirname(stateDir), 'openai-gateway', 'api-key')
+  const readGatewayKey = () => {
+    try { return String(readFileSync(gatewayKeyFile(), 'utf8')).trim() } catch { return '' }
+  }
+  const gatewayPort = () => {
+    const p = Number.parseInt(String(process.env.DSH_OPENAI_GATEWAY_PORT || ''), 10)
+    return Number.isInteger(p) && p >= 1 && p <= 65535 ? p : 8326
+  }
+  const gatewayBaseURL = () => `http://127.0.0.1:${gatewayPort()}/v1`
+  /** 网关里优先用的渠道模型（2026-11-05 实测这两个渠道能出话；baomiao 已欠费不要放前面） */
+  const GATEWAY_MODELS = ['buddy/deepseek-v4.1-flash', 'buddy/hy3', 'minimax/MiniMax-M3.1-Flash']
+  /** 问一句网关：活着吗、有没有我们要的模型。拿不到就 null（当这台机器没有网关） */
+  const probeGateway = async () => {
+    const key = readGatewayKey()
+    if (!key) return null
+    try {
+      const ac = new AbortController()
+      const t = setTimeout(() => ac.abort(), 1500)
+      const r = await fetch(`${gatewayBaseURL()}/models`, { headers: { authorization: `Bearer ${key}` }, signal: ac.signal })
+      clearTimeout(t)
+      if (!r.ok) return null
+      const j = await r.json()
+      const ids = (j?.data || []).map((m) => String(m?.id || ''))
+      const model = GATEWAY_MODELS.find((m) => ids.includes(m))
+      return model ? { provider: 'douyin-gateway', model } : null
+    } catch { return null }
+  }
+
+  /** `provider/model` → {provider, model}；格式不对就别猜 */
+  const parseRouteSpec = (s) => {
+    const t = String(s || '').trim()
+    if (!t) return null
+    const i = t.indexOf('/')
+    if (i <= 0 || i === t.length - 1) return null
+    const provider = t.slice(0, i).trim()
+    const model = t.slice(i + 1).trim()
+    return provider && model ? { provider, model } : null
+  }
+
+  /** 拿一个临时 overlay 真跑一句 —— 只为确认这个 provider 在 headless 里有没有 adapter */
+  const runHeadlessProbe = (dsh, overlay) => new Promise((resolve) => {
+    let out = ''
+    let settled = false
+    const done = (r) => { if (!settled) { settled = true; resolve(r) } }
+    let child
+    try {
+      child = spawn(dsh.command, [...(dsh.args || []), '--profile', String(cfg.headlessProfile || 'headless'),
+        '--patch', overlay, PROBE_PROMPT], {
+        cwd: stateDir, shell: dsh.shell, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        // 探测也要带上权限档：headless 的 sandbox-policy 在**加载时**读这个环境变量，
+        // 不给就落到 workspace-write —— 本机 Windows 那个后端 fail-closed，pwsh 直接不可用。
+        env: pyEnv({ DOUYIN_DUTY_HOME: stateDir, DOUYIN_GATEWAY_KEY: readGatewayKey(), DSH_PERMISSION_MODE: effectiveRoundPermission(), ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
+      })
+    } catch (e) { done({ ok: false, error: String(e?.message || e), out }); return }
+    const cap = Math.max(20_000, Math.min(Number(process.env.DOUYIN_ROUTE_PROBE_MS) || 90_000, 180_000))
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* 已经没了 */ }
+      done({ ok: false, timedOut: true, out })
+    }, cap)
+    timer.unref?.()
+    const take = (b) => { out += String(b); if (out.length > 200_000) out = out.slice(-100_000) }
+    child.stdout?.on('data', take)
+    child.stderr?.on('data', take)
+    child.on('error', (e) => { clearTimeout(timer); done({ ok: false, error: String(e?.message || e), out }) })
+    child.on('close', (code, signal) => { clearTimeout(timer); done({ ok: code === 0, code, signal, out }) })
+  })
+
+  /**
+   * 决定这一轮用哪条模型：桌面版能用就用桌面版；headless 里没有 adapter 就退回备选。
+   * 结论按 `provider/model` 缓存在 `headless-route.json`，同一个模型只真探测一次
+   * （否则每轮都白烧一次探测调用的时间）。
+   */
+  const resolveHeadlessRoute = async (dsh) => {
+    const pinned = parseRouteSpec(cfg.headlessRoute)
+    if (String(cfg.headlessRoute || '').trim() && !pinned) {
+      log(`⚠️ route: 配置 headlessRoute=「${cfg.headlessRoute}」格式不对（要 provider/model）⇒ 当作没填`)
+    }
+    const target = pinned || readDesktopRoute()
+    if (!target) return null
+    // 钉死走本地网关时不用探测：网关自己会在渠道之间换，key 由 spawn 时注入环境变量
+    if (target.provider === 'douyin-gateway') {
+      return { ...target, note: '走桌面版本地网关（额度由宿主那边轮换）' }
+    }
+    const key = `${pinned ? 'pin' : 'desk'}:${target.provider}/${target.model}`
+    const cacheFile = join(stateDir, 'headless-route.json')
+    const cached = readJson(cacheFile, null)
+    const why = pinned
+      ? `配置里钉死的模型 ${target.provider} / ${target.model}`
+      : `桌面版模型 ${target.provider} / ${target.model}`
+    if (cached && cached.key === key) {
+      if (cached.verdict === 'ok') return target
+      if (cached.verdict === 'fallback' && cached.fallback?.provider) {
+        return { ...cached.fallback, note: `${why} 在 headless 里跑不了（${cached.reason || '探测失败'}），已自动退回` }
+      }
+    }
+    log(`route: 检查${why}能不能在 headless 里跑（真跑一句，约 5–20 秒）…`)
+    const probe = await runHeadlessProbe(dsh, ensureOverlay('probe', target, { probe: true }))
+    if (probe.ok) {
+      try { writeJson(cacheFile, { key, verdict: 'ok', at: new Date().toISOString() }) } catch { /* 不影响跑 */ }
+      return target
+    }
+    const blob = String(probe.out || '') + ' ' + String(probe.error || '')
+    if (!ROUTE_FAIL_RE.test(blob)) {
+      log(`route: 探测没得出结论（${probe.timedOut ? '超时' : probe.error || 'code=' + probe.code}）⇒ 仍按${why}跑`)
+      return target
+    }
+    const reason = NO_ADAPTER_RE.test(blob) ? 'NO_ADAPTER' : '账户额度不足（ACCOUNT_QUOTA）'
+    log(`⚠️ route: ${why} 在 headless 里跑不了（${reason}）⇒ 换一条能跑的`)
+    // ⭐ 先试**桌面版的本地网关**：它会把请求摊到几个账号/免费渠道上，
+    //    直连那把 key 欠费时它往往还能出话（实测 2026-11-05）。
+    const gw = await probeGateway()
+    if (gw) {
+      const gr = await runHeadlessProbe(dsh, ensureOverlay('probe', gw, { probe: true }))
+      if (gr.ok) {
+        try { writeJson(cacheFile, { key, verdict: 'fallback', fallback: gw, reason, at: new Date().toISOString() }) } catch { /* 不影响跑 */ }
+        log(`route: 改用本地网关 ${gw.model}（这一轮可以正常跑了）`)
+        return { ...gw, note: `${why} 跑不了（${reason}），已自动改走桌面版本地网关` }
+      }
+      log(`route: 本地网关也不行（${gr.timedOut ? '超时' : gr.error || 'code=' + gr.code}）`)
+    } else {
+      log('route: 这台机器上没有可用的桌面版本地网关 ⇒ 只试直连的备选')
+    }
+    for (const cand of FALLBACK_ROUTES) {
+      if (cand.provider === target.provider && cand.model === target.model) continue
+      const r = await runHeadlessProbe(dsh, ensureOverlay('probe', cand, { probe: true }))
+      if (r.ok) {
+        try { writeJson(cacheFile, { key, verdict: 'fallback', fallback: cand, reason, at: new Date().toISOString() }) } catch { /* 不影响跑 */ }
+        log(`route: 改用 ${cand.provider} / ${cand.model}（这一轮可以正常跑了）`)
+        return { ...cand, note: `${why} 跑不了（${reason}），已自动退回` }
+      }
+      log(`route: 备选 ${cand.provider} / ${cand.model} 也不行（${r.timedOut ? '超时' : r.error || 'code=' + r.code}）`)
+    }
+    log('⚠️ route: 所有备选模型都跑不通 ⇒ 这一轮仍按原模型启动（大概率还是会失败）')
+    return target
+  }
+
+  const ensureOverlay = (roundId = '', route = null, opts = {}) => {
     const file = join(stateDir, 'headless-overlay.yml')
     const posix = (p) => String(p).replace(/\\/g, '/')
     const yml = []
@@ -2725,48 +2959,48 @@ export function apply(ctx, config) {
       `    defaultDirectory: '${posix(stateDir)}'`,
       '',
       // ⭐ 再显式钉一次 sandbox 工作区：两道都设，避免哪一层被 profile 自己那份覆盖掉。
+      //    🔴 2026-11-05：这里的 mode **必须是配置项**，不能写死 workspace-write ——
+      //    overlay 是最后叠加的一层，它一写死就把环境变量那份盖掉了；本机 Windows 的
+      //    受限令牌后端 fail-closed，写死 workspace-write ⇒ 那一轮 pwsh 直接不可用。
       '- id: sandbox-policy',
       '  config:',
-      "    mode: 'workspace-write'",
+      `    mode: '${effectiveRoundPermission()}'`,
       `    workspaceRoot: '${posix(stateDir)}'`,
       '',
     )
-    // ⭐ 让那一轮跟随桌面版当前选的模型（overlay 是最后叠加的一层 ⇒ 它赢）
-    try {
-      const deskPatch = join(dirname(stateDir), 'profiles', 'desktop', 'cordis.patch.yml')
-      if (existsSync(deskPatch)) {
-        const dlines = readFileSync(deskPatch, 'utf8').split(/\r?\n/)
-        let start = -1
-        for (let i = 0; i < dlines.length; i++) {
-          /**
-           * 🔴 2026-10-22 修的真 bug：这一行结尾**带注释** —— `- id: agent-default-model # magpie`
-           *    旧正则 `/^-\s+id:\s*agent-default-model\s*$/` 要求 id 后面直接行尾，
-           *    遇到 `# 注释` 就永远匹配不到 ⇒ overlay 里从来没写过模型
-           *    ⇒ headless 一直用它自己 profile 里那份**错的** `workbuddy-ai/...`
-           *    ⇒ 每轮一启动就 429（那条通道被限流），而桌面版用的 `workbuddy/...` 是好的。
-           *    修法：允许 id 后面跟 ` # 注释`。
-           */
-          if (/^-\s+id:\s*agent-default-model\s*(?:#.*)?$/.test(dlines[i])) { start = i; break }
-        }
-        if (start >= 0) {
-          let end = dlines.length
-          for (let j = start + 1; j < dlines.length; j++) {
-            if (/^-\s+id:/.test(dlines[j])) { end = j; break }
-          }
-          const block = dlines.slice(start + 1, end).join('\n')
-          const grab = (k) => {
-            const m = new RegExp('^\\s+' + k + ':\\s*(.+?)\\s*$', 'm').exec(block)
-            return m ? m[1].replace(/^['"]|['"]$/g, '').trim() : ''
-          }
-          const provider = grab('provider'); const model = grab('model'); const effort = grab('reasoningEffort')
-          if (provider && model) {
-            yml.push('- id: agent-default-model', "  name: '@deepseek-ai/dsh-agent-default-model'", '  config:',
-              `    provider: '${provider}'`, `    model: '${model}'`, ...(effort ? [`    reasoningEffort: '${effort}'`] : []), '')
-            log(`overlay: 模型跟随桌面版 = ${provider} / ${model}`)
-          }
-        }
-      }
-    } catch (e) { log(`读桌面版模型配置失败（不影响跑）：${e?.message ?? e}`) }
+    /**
+     * ⭐ 让那一轮跟随桌面版当前选的模型（overlay 是最后叠加的一层 ⇒ 它赢），
+     *    **但只跟到 headless 真能跑的那条** —— 传入的 route 已经由 resolveHeadlessRoute()
+     *    探测过（没有就现读桌面版，跑不跑得通交给 dsh 自己报）。
+     *    2026-11-05：原来这里把桌面版的 provider 原样写下去，桌面版换成插件型
+     *    provider（buddy / codearts）后 headless 直接 `NO_ADAPTER` —— 见上面那段注释。
+     */
+    const modelRoute = route || readDesktopRoute()
+    // ⭐ 走本地网关时，先声明这个 provider（headless 的 profile 里没有它，得我们在 overlay 里补上）
+    if (modelRoute?.provider === 'douyin-gateway') {
+      const gwModels = [...new Set([modelRoute.model, ...GATEWAY_MODELS])]
+      yml.push(
+        '- id: llm-pi-ai',
+        '  config:',
+        '    providers:',
+        '      douyin-gateway:',
+        '        api: openai-completions',
+        '        displayName: 桌面版本地网关',
+        `        baseURL: '${gatewayBaseURL()}'`,
+        '        apiKeyEnv: DOUYIN_GATEWAY_KEY',
+        '        headers: {}',
+        '        models:',
+        ...gwModels.flatMap((id) => [`          - id: '${id}'`, '            input:', '              - text', '              - image']),
+        '',
+      )
+    }
+    if (modelRoute?.provider && modelRoute?.model) {
+      yml.push('- id: agent-default-model', "  name: '@deepseek-ai/dsh-agent-default-model'", '  config:',
+        `    provider: '${modelRoute.provider}'`, `    model: '${modelRoute.model}'`,
+        ...(modelRoute.effort ? [`    reasoningEffort: '${modelRoute.effort}'`] : []), '')
+      // 日志前半句保持原样（selfcheck 按这个断言，别改），换路时把原因缀在后面
+      log(`overlay: 模型跟随桌面版 = ${modelRoute.provider} / ${modelRoute.model}${modelRoute.note ? `（${modelRoute.note}）` : ''}`)
+    }
 
     /**
      * ⭐⭐ **给那一轮挂上 douyin 工具**（2026-10-22 修）
@@ -2782,7 +3016,9 @@ export function apply(ctx, config) {
      * ⚠️ 只在 `autoSend` 开着的时候挂：
      *    关着的时候连工具都不给，从**能力层**保证"发不出去"，比靠提示词约束更硬。
      */
-    if (cfg.autoSend) {
+    // ⚠️ 探测轮（opts.probe）不挂 MCP：只为问一句「这个 provider 有没有 adapter」，
+    //    没必要起一套 douyin 工具（那要拉 python / 无头浏览器，反而拖慢、还可能动状态）。
+    if (cfg.autoSend && !opts.probe) {
       try {
         const mcpServer = join(pluginDir, 'tools', 'mcp-server.mjs')
         if (existsSync(mcpServer)) {
@@ -3125,6 +3361,75 @@ export function apply(ctx, config) {
     } catch (e) { log(`补占位报告失败：${e?.message ?? e}`) }
   }
 
+  /**
+   * ⭐ 2026-11-06：占位报告只在「当天还没有报告」时才写。所以同一天里先失败、后成功时，
+   *    成功那一轮的内容会被**追加在失败横幅下面** —— 打开报告第一眼看到的是
+   *    「这一轮没跑成」，其实底下才是真结果。成功收尾时把那段旧横幅挪到文末留档。
+   */
+  const demoteStaleFailureBanner = () => {
+    try {
+      const f = join(outDir, `${dayKey()}.md`)
+      if (!existsSync(f)) return
+      const lines = readFileSync(f, 'utf8').split('\n')
+      if (!/^# 刷抖音 · .+ —— 这一轮没跑成$/.test(lines[0] || '')) return
+      // ⚠️ 不能拿正则找「第一个 ``` 结尾」—— 横幅自己带一个 ``` 开围栏（尾巴日志），
+      //    那样会把围栏里的内容切出去。必须配对：找开围栏，再找它的闭围栏。
+      let open = -1
+      let close = -1
+      for (let i = 1; i < lines.length; i++) {
+        if (lines[i].trim() !== '```') continue
+        if (open === -1) { open = i; continue }
+        close = i; break
+      }
+      const end = close === -1 ? open : close
+      if (end === -1) return
+      const rest = lines.slice(end + 1).join('\n').replace(/^\s+/, '').replace(/\s+$/, '')
+      if (!rest) return
+      const banner = lines.slice(0, end + 1).join('\n').trim()
+      writeFileSync(f, [
+        rest,
+        '',
+        '---',
+        '',
+        '## 附：早先那轮没跑成时的诊断',
+        '',
+        banner,
+        '',
+      ].join('\n'), 'utf8')
+      log('报告：上面那段“没跑成”的横幅已经挪到文末留档（后面这一轮是成的）')
+    } catch (e) { log(`整理报告失败（不影响这一轮）：${e?.message ?? e}`) }
+  }
+
+  /**
+   * ⭐ 2026-11-06 真事：那一轮的模型在 `danger-full-access` 下**直接把 config.json 改了**
+   *    （autoSend/autoComment 打开、mentionName 写成某人）——它想发东西的时候，下一轮就真发了。
+   *    duty.md 里已经明令"不许改 config.json"，但模型不一定听话 ⇒ 这里再兜一层：
+   *    开跑前记下磁盘原文，跑完比对；改了就在日志里点名 + 弹一次 Toast（**不自动还原**，
+   *    免得把主人这一轮在设置页里改的东西一起回滚）。
+   */
+  const SENSITIVE_CFG = ['autoSend', 'autoComment', 'commentExecutor', 'mentionName', 'commentPerDay', 'chatWatch']
+  const cfgSnapshot = () => { try { return readFileSync(cfgFile, 'utf8') } catch { return null } }
+  const reportCfgMutation = (before) => {
+    try {
+      if (before == null) return
+      const now = cfgSnapshot()
+      if (now == null || now === before) return
+      const a = readJson(cfgFile, {}) || {}
+      let b = {}
+      try { b = JSON.parse(before) || {} } catch { b = {} }
+      const changed = Object.keys({ ...a, ...b }).filter((k) => JSON.stringify(a[k]) !== JSON.stringify(b[k]))
+      if (!changed.length) return
+      const hot = changed.filter((k) => SENSITIVE_CFG.includes(k))
+      log(`⚠️ 设置被这一轮改动了：${changed.join('、')}${hot.length ? `（敏感：${hot.join('、')}）` : ''} —— 已保留现状，主人看一眼`)
+      if (hot.length) {
+        Promise.resolve(notifyRoundEnd(-1, {
+          phase: 'unknown',
+          summary: { text: `这一轮的模型改了插件设置（${hot.join('、')}），请确认是否要保留` },
+        })).catch(() => {})
+      }
+    } catch (e) { log(`比对设置是否被改时出错（不影响这一轮）：${safeLog(e?.message || e)}`) }
+  }
+
   const rotateLogIfBig = (limit = 2 * 1024 * 1024) => {
     try {
       if (!existsSync(logFile) || statSync(logFile).size < limit) return
@@ -3137,6 +3442,12 @@ export function apply(ctx, config) {
 
   /* ⭐ 防双开：内存标记 + 落盘标记（改配置会重新挂载插件，内存标记会丢） */
   let dutyRunning = false
+/**
+ * ⭐ 2026-11-06：上游对 buddy 那条渠道偶发回「请求被拦截，请重新发送 Illegal API invocation
+ *    from an unapproved channel」——它自己就写着「请重新发送」，同一批请求里前一条被拦、后一条正常。
+ *    ⇒ 这种死法不算真失败：自动重试这一轮（最多 2 次），别的失败照旧不重试。
+ */
+let transientRetries = 0
   /**
    * 一轮的"陈旧"阈值。
    * 🔴 2026-10-22 实测事故：夜间那轮被 429 打断后 `roundActive` 没清，
@@ -3402,19 +3713,27 @@ export function apply(ctx, config) {
               log(`   dsh plugin --profile ${prof} add link:${pluginDir || '<本插件目录>'}`)
             }
           } catch { /* 查不到就算了，别挡着跑 */ }
-          const overlay = ensureOverlay(round.id)
+          /**
+           * ⭐ 2026-11-05：先确认桌面版当前模型在 headless 里有没有 adapter，
+           *    没有就自动退到能跑的（见 resolveHeadlessRoute 上面的长注释）。
+           *    同一条模型只探测一次，结论缓存在 headless-route.json。
+           */
+          const route = await resolveHeadlessRoute(dsh)
+          const overlay = ensureOverlay(round.id, route)
           const args = [...dsh.args, '--profile', cfg.headlessProfile || 'headless']
           if (overlay) args.push('--patch', overlay)
           args.push(promptFor(why, round))
           const cwd = stateDir
           log(`刷抖音开跑（${why}）：${dsh.command} ${args.slice(0, 3).join(' ')} …  cwd=${cwd}`)
           petSay('开工开工～鱼一条条挑，马上回来')
+          const cfgBeforeSpawn = cfgSnapshot()
           const child = spawn(dsh.command, args, {
             cwd,
             shell: dsh.shell,
             windowsHide: true,
             stdio: ['ignore', 'pipe', 'pipe'],
-            env: pyEnv({ DOUYIN_DUTY_HOME: stateDir, DOUYIN_ROUND_ID: round.id, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
+            // 这一轮的权限档（见 Config.roundPermission 的注释）。不给 ⇒ 那一轮没有 shell。
+            env: pyEnv({ DOUYIN_DUTY_HOME: stateDir, DOUYIN_ROUND_ID: round.id, DOUYIN_GATEWAY_KEY: readGatewayKey(), DSH_PERMISSION_MODE: effectiveRoundPermission(), ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
           })
           round.phase = 'running'; round.childPid = child.pid || 0
           try {
@@ -3431,6 +3750,7 @@ export function apply(ctx, config) {
            */
           const timeoutMin = Math.max(3, Math.min(Number(process.env.DOUYIN_ROUND_TIMEOUT_MIN) || 15, 120))
           let timedOut = false
+          let stalled = false
           let spawnError = ''
           const watchdog = setTimeout(() => {
             try {
@@ -3444,13 +3764,46 @@ export function apply(ctx, config) {
           }, timeoutMin * 60_000)
           watchdog.unref?.()
           // ⚠️ 这里是 stream 的 data 回调 —— 抛异常会**杀掉整个宿主进程** ⇒ rawWrite 内部已全包 try/catch
-          child.stdout?.on('data', (b) => rawWrite(String(b)))
-          child.stderr?.on('data', (b) => rawWrite(String(b)))
+          // 同时留一段尾巴：这一轮如果是"路走不通"（欠费 / 没有 adapter / 上游拦截）死的，要能把缓存判死
+          let outTail = ''
+          let lastByteAt = Date.now()
+          const keepTail = (b) => { outTail = (outTail + String(b)).slice(-8000); lastByteAt = Date.now() }
+          child.stdout?.on('data', (b) => { keepTail(b); rawWrite(String(b)) })
+          child.stderr?.on('data', (b) => { keepTail(b); rawWrite(String(b)) })
+          /**
+           * ⭐ 2026-11-06：上游把流掐了但连接不断 ⇒ 模型那一步永远等不到，整轮只能等 15 分钟看门狗，
+           *    日志里只剩一句「超时」，看不出卡在哪。实测（round da56c777）：最后一条输出之后 12 分钟没动静。
+           *    ⇒ 连续 stallMin 分钟没有任何输出就判「上游卡住」，杀掉并明确记账。
+           */
+          const stallMin = Math.max(2, Math.min(Number(process.env.DOUYIN_STALL_MIN) || 5, 30))
+          const stallTimer = setInterval(() => {
+            if (stalled || child.exitCode !== null) return
+            if (Date.now() - lastByteAt < stallMin * 60_000) return
+            stalled = true
+            try {
+              log(`⚠️ 这一轮 ${stallMin} 分钟没有任何输出 ⇒ 判定上游卡住，强制结束`)
+              child.kill()
+              setTimeout(() => { try { child.kill('SIGKILL') } catch { /* 已经没了 */ } }, 10_000).unref?.()
+              recordEvent(stateDir, round.id, { stage: 'stall', level: 'error', message: `本轮 ${stallMin} 分钟无输出，已请求停止` })
+            } catch (e) { log(`stall 杀手失败：${e?.message ?? e}`) }
+          }, 30_000)
+          stallTimer.unref?.()
           child.on('close', (code, signal) => {
             clearTimeout(watchdog)
+            clearInterval(stallTimer)
+            /**
+             * ⭐ 2026-11-05：短探测能过、真跑却死在额度/拦截上（探测那句太短，不触发计费校验；
+             *    或者上游偶发风控）。这时**必须把缓存判死**，否则下一轮还会捡起这条死路。
+             */
+            if (code !== 0 && !timedOut && ROUTE_FAIL_RE.test(outTail)) {
+              try {
+                rmSync(join(stateDir, 'headless-route.json'), { force: true })
+                log('route: 这一轮死在上游（额度/拦截）⇒ 已经作废选路缓存，下一轮会重新挑一条能跑的')
+              } catch (e) { log(`route: 作废缓存失败（不影响结果）：${safeLog(e?.message || e)}`) }
+            }
             let finishedResult = null
             try {
-            const submitted = readJson(join(stateDir, 'runs', `${round.id}.submission.json`), null)
+            const submitted = readJsonLoose(join(stateDir, 'runs', `${round.id}.submission.json`), null)
             if (submitted?.roundId === round.id) {
               const validated = submitRoundResult(stateDir, round.id, submitted)
               if (!validated.ok) recordEvent(stateDir, round.id, { stage: 'result', level: 'warning', message: `本轮结果未通过检查：${validated.error}` })
@@ -3458,8 +3811,11 @@ export function apply(ctx, config) {
             const outcome = finishRound(stateDir, round.id, { code, signal, error: spawnError, timedOut, reportText: reportTextOfDay(round.day) })
             finishedResult = outcome
             log(`刷抖音结束（${why}，code=${code}）`)
+            if (code !== 0 && !timedOut && !stalled && !outTail.trim()) log('⚠️ 这一轮没有任何输出就退出了（上游把流掐掉 / 进程被收走）—— 日志里不会有 dsh: 报错，别以为日志漏了')
             petSay(outcome.phase === 'completed' ? '这轮挑完啦，结果已经记下了～' : '这轮结果还没有全部确认，主人看一下记录呀')
             stubReportIfMissing(code)
+            if (code === 0 && outcome.phase === 'completed') demoteStaleFailureBanner()
+            reportCfgMutation(cfgBeforeSpawn)
             rotateLogIfBig()
             try {
               const st = readJson(dutyStateFile, {})
@@ -3480,6 +3836,29 @@ export function apply(ctx, config) {
                     ...(finishedResult?.result?.validated ? { lastResultRoundId: round.id } : {}) })
                 }
               } catch (e) { log(`运行标记保存失败：${safeLog(e?.message || e)}`) }
+            }
+            /**
+             * ⭐ 2026-11-06：上游「请求被拦截，请重新发送」这种死法不是真失败 —— 它自己让重发，
+             *    实测同一批请求里前一条被拦、后一条正常。⇒ 自动重跑这一轮（最多 2 次），
+             *    并且只在确实一个字都没干成时重试（怕重跑的已经把卡片发出去了）。
+             */
+            const transient = code !== 0 && !timedOut && !stalled && TRANSIENT_RE.test(outTail)
+              && !finishedResult?.result?.validated
+              // 只在「开跑没几秒就被拦」时重来：跑了很久的那种说明已经动过手（可能发过卡片），重跑会重复
+              && (Date.now() - Number(round.startedAt || Date.now())) < 180_000
+            if (transient) {
+              if (transientRetries < 2) {
+                transientRetries += 1
+                log(`route: 上游说「请重新发送」⇒ 20 秒后自动重来一轮（第 ${transientRetries} 次重试）`)
+                setTimeout(() => {
+                  if (!dutyRunning) Promise.resolve(runDuty(why)).catch((e) => log('自动重试失败：' + (e?.message ?? e)))
+                }, 20_000).unref?.()
+              } else {
+                log('route: 上游连续拦了 3 次 ⇒ 这次不重试了，等下一轮换个渠道再试')
+                transientRetries = 0
+              }
+            } else if (code === 0) {
+              transientRetries = 0
             }
           })
           child.on('error', (e) => { spawnError = String(e?.message || e); log(`刷抖音起不来：${spawnError}`) })
