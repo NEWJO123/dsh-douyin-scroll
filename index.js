@@ -2769,11 +2769,14 @@ export function apply(ctx, config) {
     }
   }
 
-  /** 备选：headless profile 自带、一定能解析的模型（按顺序试） */
+  /**
+   * 备选：headless profile 自带、一定能解析的模型（按顺序试）。
+   * ⭐ 2026-11-07（收 PR #18 时的跟进修正）：原名单里还有作者机器私有的
+   *    baomiao-oneapi 两条渠道 —— 别人机器上根本没有这个 provider，公开仓库
+   *    也不该带私人配置，收窄成 headless 自带的一条。
+   */
   const FALLBACK_ROUTES = [
     { provider: 'deepseek-account', model: 'deepseek-flash' },
-    { provider: 'baomiao-oneapi', model: 'DeepSeek-V4.1-Flash 1017(1.20x)' },
-    { provider: 'baomiao-oneapi', model: 'GLM-5.3-Flash (0.32x)' },
   ]
   /**
    * 什么算「这条路跑不了」：除了 NO_ADAPTER，**账户没余额/欠费也算**。
@@ -3422,10 +3425,19 @@ const TRANSIENT_RE = /请求被拦截|Illegal API invocation|unapproved channel|
       const hot = changed.filter((k) => SENSITIVE_CFG.includes(k))
       log(`⚠️ 设置被这一轮改动了：${changed.join('、')}${hot.length ? `（敏感：${hot.join('、')}）` : ''} —— 已保留现状，主人看一眼`)
       if (hot.length) {
-        Promise.resolve(notifyRoundEnd(-1, {
-          phase: 'unknown',
-          summary: { text: `这一轮的模型改了插件设置（${hot.join('、')}），请确认是否要保留` },
-        })).catch(() => {})
+        /**
+         * ⭐ 2026-11-07（收 PR #18 时的跟进修正）：这里不能走 notifyRoundEnd ——
+         *    它对「非完成」的轮只读 outcome.warnings，传 summary 根本读不到
+         *    ⇒ 弹出来的 Toast 标题是「结果尚未确认」、正文是空的。
+         *    设置被改是独立事件，直接发一条说真话的 Toast。
+         */
+        try {
+          const r = toastSend({
+            title: '刷抖音 · 设置被值班那一轮改了',
+            body: `${hot.join('、')} 被改动，请到设置页确认要不要保留（详情见 duty.log）`,
+          })
+          log(`通知：Toast ${r?.sent ? '已弹出' : '失败'}｜标题=设置被值班那一轮改了｜正文=${hot.join('、')} 被改动`)
+        } catch { /* 弹不出就算了，日志里已经点名 */ }
       }
     } catch (e) { log(`比对设置是否被改时出错（不影响这一轮）：${safeLog(e?.message || e)}`) }
   }
