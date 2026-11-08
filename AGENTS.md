@@ -9,7 +9,7 @@
 
 1. **先跑预检**（不用装 DSH）：
    ```bash
-   node selfcheck.mjs          # 433 项
+   node selfcheck.mjs          # 441 项
    python tools/smoke.py       # 想先看见"判断长什么样"，跑这个（离线示例数据）
    ```
 2. **装插件**：`dsh plugin --profile web add link:<本目录绝对路径>`
@@ -75,7 +75,7 @@
 - `lib/` —— `hostdeps` / `state` / `credential` / `notify` / `toast`（**默认通知方式**）/ `uvfetch`
 - `prompts/persona.md` —— **我的人设（插件自带，第一行 `<!-- persona: douyin-scroll -->`）**。
   `runDuty` 只从这里读身份与口吻，**插件外面任何目录都不读**
-- `prompts/duty.md` —— 一轮的章程（判据 + 红线 + **报告必须 `### <纯数字ID>`**）。章程只写"怎么干活"，不写人设
+- `prompts/duty.md` —— 一轮的章程（判据 + 红线 + **交作业靠 `runs/<roundId>.submission.json`**；报告 `### <纯数字ID>` 只是给人看的导航）。章程只写"怎么干活"，不写人设
 - `requirements.txt` —— 只有 `curl_cffi` + `httpx`
 
 ## 约定与红线
@@ -99,4 +99,4 @@
 - **发东西三道闸**：`confirm` 参数 + 设置里的开关 + 使用者当场点头
 - **消息必须真能到用户眼前**：默认 `notifyMode=toast`（Windows 通知，零配置）
 - 定时器回调里的异常**必须自己兜住** —— 未捕获异常会杀掉整个宿主进程
-- `PICK_RE = /^#{2,3}[ \t]*(\d{15,25})/gm` —— 报告里 `### <19位ID>` 的行数 = 今天挑了几条
+- 报告（`out/<日期>.md`）是**给人看的**；宿主记账只信 `runs/<roundId>.submission.json`（结构化 receipt）——通知、配额、面板计数全部来自它，报告格式不影响数据

@@ -9,6 +9,28 @@
 
 ---
 
+## 未发布 — refactor: 数据和展示分家（报告退回「给人看」，机器只认结构化 receipt）
+
+> 老根子：`out/<日期>.md` 一个文件同时当日报、失败日志、占位符、数据源四个用 ——
+> 「今天挑了几条」靠数报告里的 `### ID` 行、通知正文靠从报告文本反向解析（2026-10-22
+> 因为只认旧格式炸过一次）、先失败后成功还得写「挪横幅」的补丁。这次把数据和展示彻底分开：
+> **宿主记账只信 `runs/<roundId>.submission.json`（结构化 receipt），报告纯粹给人看。**
+
+- **计数只信 ledger**：`recommendationCounts` / `dayRecommendations` 不再扫报告文本；
+  「模型没交作业」就老实显示 0（不再拿「报告里提到过」凑 unknown）。报告扫描只剩
+  `importLegacyPicks` 一处（升级当天的显式迁移，named legacy）。
+- **通知正文从 receipt 构造**：`toastSummary`（报告反向解析）退役，新增 `picksBody` ——
+  completed 的通知列出《标题》·@作者（author 由 submitRoundResult 从证据包补存进 receipt）；
+  0 条明说「没有挑出」。
+- **失败记录独立化**：失败诊断写 `out/failed-<日期>.md`（一天多轮追加），日报永远是干净的；
+  成功但没报告时补**中性**短日报。「补横幅 + 挪横幅」的补丁整个删除。
+- **面板构建标识自动化**：手写「改完 client.js 记得 +1」的 `PANEL_BUILD` 常量退役 ——
+  宿主 /status 返回 `panelJsMtime`（client.js 文件时间），页面记下第一眼的值，变了就提示刷新。
+- **Python 样板收敛**：`_home.bootstrap()` 一键开工（utf8 + IPv4 + Cookie 闸），6 个入口脚本
+  全部改走它；`forward-pick` 顺手补上一直缺失的 utf-8 钉死。新脚本忘了调会被 selfcheck 点名。
+- 文档同步：README / AGENTS / duty.md 里「宿主数报告的 `###` 行算配额」的旧说法全部更正
+  （记账只认 submission.json）；预检计数见下方三处一致断言。
+
 ## 0.7.5 — 2026-11-07（0.7.4 收审跟进：三处加固）
 
 > 0.7.4 收进主线后，把 PR #18 的新代码跟老代码的接缝又挖了一遍，修掉三处收审时发现的问题。

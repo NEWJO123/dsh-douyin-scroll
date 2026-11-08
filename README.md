@@ -173,8 +173,8 @@ Cookie 只落在本机 `<家目录>/douyin_cookie.txt`（Windows 上 ACL 收不�
 - 7401234567890123457 · 文案只有「嗯」，评论 1 条 —— **没有判断依据，不硬猜**
 ```
 
-⚠️ **`### <纯数字视频ID>` 这一行是宿主数配额用的** —— 这一行数 = 今天挑了几条。
-「顺带一提」「判断不了」里**不要**加这种标题，加了会吃掉当天额度。
+⚠️ **宿主记账只认 `runs/<roundId>.submission.json`**（值班交作业的结构化结果）—— 报告是给人看的，
+`### <纯数字视频ID>` 行是导航，格式不影响额度；但作业里漏了就是真没挑。
 
 ---
 
@@ -323,7 +323,7 @@ dsh-douyin-scroll/
 ├── index.js                          # 宿主半端：配置/工具/定时器/证据包/headless 跑一轮/HTTP
 ├── client.js                         # 设置页（非 ESM 自注册脚本）
 ├── AI-USAGE.md                       # ⭐ 给别的 AI 看的使用说明（MCP 接入 + 安全红线）
-├── selfcheck.mjs                     # 本地预检（433 项）
+├── selfcheck.mjs                     # 本地预检（441 项）
 ├── tools/
 │   ├── mcp-server.mjs                # ⭐ 标准 MCP server（stdio，零依赖）—— 别的 agent 工具接进来
 │   ├── panel-render-check.mjs        # ⭐ 设置页真渲染一遍（抓白屏，语法检查查不出）
