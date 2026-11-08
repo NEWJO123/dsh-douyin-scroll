@@ -40,7 +40,7 @@ import { WINDOWS, stateDirOf, readJson, readJsonLoose, writeJson, ensureHomeFile
 import { saveCookie, readCookie, hasCredential, credentialInfo, clearCredential, cookiePath } from './lib/credential.mjs'
 import { venvPython as venvPythonPath } from './lib/paths.mjs'
 import { sendWebhook, condense, maskUrl } from './lib/notify.mjs'
-import { sendToast, toastSummary } from './lib/toast.mjs'
+import { sendToast, picksBody } from './lib/toast.mjs'
 import { readRunProgress, reportPicks } from './lib/run-status.mjs'
 import { ALL_DAYS, autoEnabled, scheduleDays, scheduledWindows, schedulePatchError, remapUsedWindows } from './lib/schedule.mjs'
 import { beginRound, readRecord, writeRecord, recordEvent, finishRound, submitRoundResult,
@@ -3522,14 +3522,21 @@ let transientRetries = 0
         let title, body
         if (outcome) {
           title = outcome.phase === 'completed' ? '刷抖音 · 本轮已完成' : outcome.phase === 'failed' ? '刷抖音 · 本轮异常结束' : '刷抖音 · 结果尚未确认'
-          body = outcome.phase === 'completed' ? `本轮新增推荐 ${outcome.result?.recommendations || 0} 条。${outcome.result?.reportUpdated ? '报告已更新。' : '本轮没有更新报告。'}` : (outcome.warnings || []).join('；')
+          /**
+           * ⭐ 2026-11-08（数据和展示分家）：正文从**结构化 receipt**（result.picks）构造 ——
+           *    《标题》·@作者 直接来自 receipt（author 由 submitRoundResult 从证据包存入）。
+           *    旧实现只有条数没有内容；从报告文本反向解析的那条路（toastSummary）已删。
+           */
+          body = outcome.phase === 'completed'
+            ? picksBody(outcome.result?.picks || [], { recommendations: outcome.result?.recommendations || 0, reportUpdated: outcome.result?.reportUpdated })
+            : (outcome.warnings || []).join('；')
         } else if (lastFailure) {
           title = `刷抖音 · ${lastFailure.title}`
           body = String(lastFailure.fix || lastFailure.detail || '').slice(0, 200)
         } else {
-          const s = toastSummary(text || fallback, { day: dayKey() })
-          title = s.title
-          body = s.body
+          // 轮次记录都丢了（极端兜底）：不再从报告解析格式，直接给报告原文开头
+          title = '刷抖音 · 结果尚未确认'
+          body = String(text || fallback).replace(/```[\s\S]*?```/g, '').trim().slice(0, 200) || fallback
         }
         const r = toastSend({ title, body })
         /**

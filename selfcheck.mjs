@@ -1674,31 +1674,36 @@ try {
   if (/native: true/.test(idx) && /跳过模型段/.test(idx)) ok('选路全失败时还有最后一招：不写模型段、用 headless 原生默认')
   else bad('选路全失败只能硬跑原模型 —— 没有 native 兜底')
 
-  /* ── ⑧ 通知正文要能从报告里解析出真内容 ──
-   * 🔴 2026-10-22 真 bug：toastSummary 只认旧格式（`- **文案摘要**：`），
-   *    但 duty.md 现在写成 `**《标题》** · @作者` ⇒ 通知正文变成"（第 1 条）"。
+  /* ── ⑧ 通知正文从结构化 receipt 构造（数据和展示分家，2026-11-08）──
+   * 🔴 2026-10-22 真 bug：旧版 toastSummary 从报告文本反向解析，只认旧格式 ⇒
+   *    通知正文变成"（第 1 条）"。改格式还会再炸一次 —— 所以整条解析路退役，
+   *    通知正文改从 receipt.picks（结构化）构造：picksBody()。
    */
   try {
     const toast = readFileSync(join(here, 'lib', 'toast.mjs'), 'utf8')
-    const sample = [
-      '## 值得看',
-      '### 7676464210544570726',
-      '**《烟火里的江西》家常美食「香辣鸡爪」** · @烟火里的江西 · 39.6 秒',
-      '**一句话**：一个能照着做的鸡爪方子。',
-      '',
-      '### 7691197955269956233',
-      '**星星之火，可以燎原** · @方面面 · 57.6 秒',
-      '**一句话**：一张纸烧完露出底下的画。',
-    ].join('\n')
+    if (!/function toastSummary/.test(toast)) ok('报告反向解析的 toastSummary 已退役（通知正文不再依赖报告格式）')
+    else bad('toastSummary 又回来了 —— 报告格式一变通知就会变成"（第 1 条）"')
+    if (/export function picksBody/.test(toast)) ok('通知正文改由 picksBody() 从 receipt 构造')
+    else bad('toast.mjs 里没有 picksBody —— 通知正文没有结构化数据源')
+    const picks = [
+      { id: '7676464210544570726', title: '**《烟火里的江西》家常美食「香辣鸡爪」**', author: '@烟火里的江西' },
+      { id: '7691197955269956233', title: '星星之火，可以燎原', author: '方面面' },
+      { id: '7000000000000000003', title: '第三条', author: '' },
+    ]
     const r = spawnSync(process.execPath, ['--input-type=module', '-e',
-      `import { toastSummary } from ${JSON.stringify(new URL('./lib/toast.mjs', import.meta.url).href)};`
-      + `const s = toastSummary(${JSON.stringify(sample)}, {day:'x'});`
-      + `console.log(JSON.stringify({title:s.title,body:s.body,picked:s.picked}))`], { encoding: 'utf8', timeout: 30_000 })
-    const j = JSON.parse(String(r.stdout || '{}').trim() || '{}')
-    if (j.picked === 2 && /烟火里的江西/.test(j.body) && /星星之火/.test(j.body)) {
-      ok('通知正文能从新格式报告里解析出真标题（不再是"（第 1 条）"）')
-    } else bad(`通知解析失败：${JSON.stringify(j).slice(0, 200)}`)
-  } catch (e) { bad(`通知解析测试失败：${e.message}`) }
+      `import { picksBody } from ${JSON.stringify(new URL('./lib/toast.mjs', import.meta.url).href)};`
+      + `console.log(picksBody(${JSON.stringify(picks)}, {recommendations: 2, reportUpdated: true}))`],
+      { encoding: 'utf8', timeout: 30_000 })
+    const body = String(r.stdout || '')
+    if (/烟火里的江西/.test(body) && /星星之火/.test(body) && /还有 1 条/.test(body) && /新增推荐 2 条/.test(body)) {
+      ok('通知正文带真标题 / 作者 / 条数（不再从报告解析，receipt 有什么显示什么）')
+    } else bad(`picksBody 正文不符合预期：${JSON.stringify(body.slice(0, 200))}`)
+    const empty = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import { picksBody } from ${JSON.stringify(new URL('./lib/toast.mjs', import.meta.url).href)};`
+      + `console.log(picksBody([], {recommendations: 0}))`], { encoding: 'utf8', timeout: 30_000 })
+    if (/没有挑出/.test(String(empty.stdout || ''))) ok('0 条时通知明说「没有挑出」（不装作有内容）')
+    else bad(`0 条时的正文不对：${JSON.stringify(String(empty.stdout || '').slice(0, 120))}`)
+  } catch (e) { bad(`通知正文测试失败：${e.message}`) }
 } catch (e) { bad(`自动发送/跑一轮检查失败：${e.message}`) }
 
 /* ── 4p. 这几个坑不许再回来（2026-10-30，Issue #3 / #5 / #6 / #7 / #8） ── */
