@@ -1960,6 +1960,22 @@ try {
       bad('recommendationCounts / dayRecommendations 又收 reportText 了 —— 展示层数据漏进数据源')
     }
   } catch (e) { bad(`数据分家守卫失败：${e.message}`) }
+
+  /* ⭐ 2026-11-08：模拟新用户安装启用时坐实的四个坑（自检防回归） */
+  try {
+    const mcp = readFileSync(join(here, 'tools', 'mcp-server.mjs'), 'utf8')
+    const cred = readFileSync(join(here, 'lib', 'credential.mjs'), 'utf8')
+    const homePy = readFileSync(join(here, 'tools', '_home.py'), 'utf8')
+    if (/开跑前两道闸/.test(idx) && /setup\.pythonReady/.test(idx) && /hasCredential\(stateDir\)/.test(idx)) {
+      ok('值班开跑前有环境/登录前置闸（没就绪弹人话，不再「新增推荐 0 条」）')
+    } else bad('开跑前的前置闸丢了 —— 没装依赖时到点照跑，通知只有一句「0 条」')
+    if (/DEPS_BROKEN_RE/.test(mcp) && /pyFail\(/.test(mcp)) ok('MCP 工具认得出「环境装了一半」（ModuleNotFoundError → 人话）')
+    else bad('MCP 的依赖损坏包装丢了 —— 半成品 venv 会让工具吐堆栈')
+    if (/startsWith\('\{'\)/.test(cred) && /cookies/.test(cred)) ok('粘 JSON 形状的 Cookie 也认（F12 Cookies 面板复制党不再卡死）')
+    else bad('parseCookie 又不认 JSON 形状了 —— 粘 JSON 的用户会卡在「复制得不完整」')
+    if (/家目录不可写/.test(homePy) && /stage.*home|"home"/.test(homePy)) ok('家目录不可写时给人话（OneDrive / 网络盘不再全程懵）')
+    else bad('_home.py 的家目录不可写处理丢了 —— 又要抛 OSError 堆栈')
+  } catch (e) { bad(`安装坑守卫失败：${e.message}`) }
 } catch (e) { bad(`采集门槛检查失败：${e.message}`) }
 
 /* ── 5. Python 能否编译 + 判断层能否跑 ── */

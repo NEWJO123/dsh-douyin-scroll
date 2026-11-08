@@ -3670,6 +3670,28 @@ let transientRetries = 0
         log(`自动额度已满：今天自动已推荐 ${picked} 条（上限 ${quota}），这一轮不跑`)
         return { started: false, why, quotaFull: true, picked, quota, error: `今天自动额度已用完（${picked} / ${quota}），仍可手动运行` }
       }
+      /**
+       * ⭐ 2026-11-08：开跑前两道闸（模拟新用户安装启用时坐实的坑）——
+       *    原来到点就照跑：环境没装 ⇒ forward-pick 裸 traceback ⇒ 通知「新增推荐 0 条」，
+       *    真因埋在 duty.log；没登录同理。改成 fail-fast：没就绪就不跑，弹一句人话。
+       *    用 setupFiles 的 pythonReady（venv python 存在 + httpx / curl_cffi 都在），
+       *    同步 0ms；签名器缺失**不挡** —— 只影响评论质量，那一轮自己会降级。
+       */
+      const setup = setupFiles(stateDir)
+      if (!setup.pythonReady) {
+        const msg = '运行环境还没装好 —— 打开设置页「刷抖音」，点「装主依赖」，装完就能跑'
+        log(`开跑前检查：${msg}`)
+        petSay('环境还没装好呀，先点「装主依赖」～')
+        if (!manual) Promise.resolve(toastSend({ title: '刷抖音 · 这轮先不跑', body: msg })).catch(() => {})
+        return { started: false, why, error: msg, hint: '设置页点「装主依赖」' }
+      }
+      if (!hasCredential(stateDir)) {
+        const msg = '还没登录 —— 先在设置页扫码登录（或粘一条 Cookie），再跑'
+        log(`开跑前检查：${msg}`)
+        petSay('还没登录呢，先扫码呀～')
+        if (!manual) Promise.resolve(toastSend({ title: '刷抖音 · 这轮先不跑', body: msg })).catch(() => {})
+        return { started: false, why, error: msg, hint: '设置页扫码登录' }
+      }
       // ⭐ 先把闸拉上（防双开），再去异步准备证据包 + 起那一轮 —— 准备证据要十几秒，
       //    同步做会把宿主卡住（HTTP 请求和定时器都在这条线程上）。
       dutyRunning = true

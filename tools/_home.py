@@ -32,7 +32,18 @@ def home_dir(create: bool = True) -> Path:
         dsh = (os.environ.get("DSH_HOME") or "").strip()
         p = (Path(dsh) if dsh else Path.home() / ".dsh") / "douyin-duty"
     if create:
-        p.mkdir(parents=True, exist_ok=True)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # ⭐ 2026-11-08：DOUYIN_HOME 指到 OneDrive 同步盘 / 网络盘 / 没权限的目录时，
+            #    原来直接抛 OSError 堆栈 —— 用户全程懵。这里给人话 + 结构化退出。
+            print(json.dumps({
+                "ok": False,
+                "error": f"插件家目录不可写：{p}",
+                "hint": f"检查这个路径的磁盘/权限（{e}）；OneDrive / 网络盘目录不适合，把 DOUYIN_HOME 指到本地磁盘再试",
+                "stage": "home",
+            }, ensure_ascii=False))
+            raise SystemExit(2)
     return p
 
 

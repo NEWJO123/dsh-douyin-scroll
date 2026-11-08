@@ -117,7 +117,23 @@ const pickJson = (s) => {
 const stderrTail = (r, lines = 3) => String(r?.stderr || '')
   .trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(-lines).join(' | ').slice(0, 400)
 
+/**
+ * ⭐ 2026-11-08：venv 装到一半（pip 中途断网）时，子脚本会在顶层 import 处裸抛
+ *    ModuleNotFoundError / ImportError traceback —— 这不是「工具坏了」，是环境装了一半。
+ *    识出来给人话，别让使用者对着堆栈猜（面板侧 0.7.3 修过同款，这里是 MCP 半端）。
+ */
+const DEPS_BROKEN_RE = /ModuleNotFoundError|ImportError|No module named/i
+const depsHint = (r) => (DEPS_BROKEN_RE.test(String(r?.stderr || '')) || DEPS_BROKEN_RE.test(String(r?.stdout || ''))
+  ? { ok: false,
+      error: 'Python 依赖不完整 —— 环境可能装到一半断了。回设置页「刷抖音」再点一次「装主依赖」就好',
+      stderr_tail: stderrTail(r) }
+  : null)
+/** 子脚本失败（非 0 退出 / 没吐 JSON）时的统一出口：依赖坏了优先给人话，其余维持原样 */
+const pyFail = (r, fallback) => depsHint(r) || { ok: false, error: fallback, stderr_tail: stderrTail(r) }
+
 const explain = (j, r) => {
+  const deps = depsHint(r)
+  if (deps) return deps
   const out = {}
   const err = String(j?.error || j?.err || '').trim()
   const tail = stderrTail(r)
@@ -233,7 +249,7 @@ const TOOLS = [
       if (bad) return bad
       const top = Math.max(1, Math.min(Number(args?.top) || 10, 30))
       const r = runPy('forward-pick.py', ['--limit', String(top)], 300_000)
-      if (r.status !== 0) return { ok: false, error: '取候选失败', stderr: String(r.stderr || '').slice(0, 400) }
+      if (r.status !== 0) return pyFail(r, '取候选失败')
       const picked = readJson(join(HOME, 'forward-pick.json'), {}) || {}
       const rows = (Array.isArray(picked.rows) ? picked.rows : []).slice(0, top)
       return {
@@ -275,7 +291,7 @@ const TOOLS = [
       const r = runPy('api-comments.py', [id], 300_000)
       const lines = String(r.stdout || '').split('\n')
       const items = lines.filter((l) => /^\s{2}cid=|^\s{6}└ /.test(l)).map((s) => s.replace(/^\s+/, ''))
-      if (r.status !== 0) return { ok: false, error: '拉评论失败', stderr_tail: stderrTail(r) }
+      if (r.status !== 0) return pyFail(r, '拉评论失败')
       return {
         ok: true,
         aweme_id: id,
@@ -300,7 +316,7 @@ const TOOLS = [
       if (args?.raw) argv.push('--raw')
       const r = run(venvPython(), argv, 150_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '没读到通知', stderr_tail: stderrTail(r) }
+      if (!j) return pyFail(r, '没读到通知')
       return j
     },
   },
@@ -421,7 +437,7 @@ const TOOLS = [
       argv.push('--text', text)
       if (args?.dry) argv.push('--dry')
       const r = runNode('im-send.mjs', argv, 240_000)
-      return pickJson(r.stdout) || { ok: false, error: '发送器没返回可解析结果', stderr_tail: stderrTail(r) }
+      return pickJson(r.stdout) || pyFail(r, '发送器没返回可解析结果')
     },
   },
   {
@@ -479,7 +495,7 @@ const TOOLS = [
       if (rootCid) argv.push('--root', rootCid)
       const r = runNode('comment-api.mjs', argv, 260_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '发送器没返回可解析结果', stderr_tail: stderrTail(r) }
+      if (!j) return pyFail(r, '发送器没返回可解析结果')
       if (j.need_root) {
         return {
           ok: false, need_root: true, ...j,
@@ -522,7 +538,7 @@ const TOOLS = [
       if (toId) argv.push('--to-id', toId)
       const r = runNode('im-send.mjs', argv, 240_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '读不到会话', stderr_tail: stderrTail(r) }
+      if (!j) return pyFail(r, '读不到会话')
       if (!j.ok) return j
       const all = Array.isArray(j.messages) ? j.messages : []
       const limit = Math.max(1, Math.min(Number(args?.limit) || 30, 60))
@@ -553,7 +569,7 @@ const TOOLS = [
       const argv = [join(ROOT, 'tools', 'notice-read.py'), '--raw']
       const r = run(venvPython(), argv, 150_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '没读到通知', stderr_tail: stderrTail(r) }
+      if (!j) return pyFail(r, '没读到通知')
       const ats = (Array.isArray(j.items) ? j.items : []).filter((x) => x && (x.type === 45 || x.type === 46))
       const limit = Math.max(1, Math.min(Number(args?.limit) || 10, 30))
       return {
@@ -623,7 +639,7 @@ const TOOLS = [
       if (args?.dry === true) argv.push('--dry')
       const r = runNode('comment-mention-ui.mjs', argv, 300_000)
       const j = pickJson(r.stdout)
-      if (!j) return { ok: false, error: '真 @ 执行器没返回可解析结果', stdout: String(r.stdout || '').slice(0, 400), stderr_tail: stderrTail(r) }
+      if (!j) return pyFail(r, '真 @ 执行器没返回可解析结果')
       return j
     },
   },
