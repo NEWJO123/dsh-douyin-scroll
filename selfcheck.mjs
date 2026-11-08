@@ -104,6 +104,23 @@ try {
   }
 } catch (e) { bad(`检查 client.js 状态引用失败：${e.message}`) }
 
+/* ── 4a-2. 面板构建标识自动化（2026-11-08）──
+ * 手写的「改完 client.js 手动 +1」靠记性，忘了浏览器就一直用旧 bundle，面板看起来"没变化"。
+ * 现在宿主 /status 返回 panelJsMtime（client.js 文件修改时间），页面挂载时记下第一眼的值，
+ * 变了就在角标提示「请刷新」—— 手写常量退役，守卫防它回来。
+ */
+try {
+  const c = readFileSync(join(here, 'client.js'), 'utf8')
+  const i = readFileSync(join(here, 'index.js'), 'utf8')
+  if (!/const PANEL_BUILD\s*=\s*\d+/.test(c)) ok('client.js 不再有手写的 PANEL_BUILD 常量（构建标识自动化了）')
+  else bad('client.js 又出现手写 PANEL_BUILD 常量 —— 「改面板靠记性 +1」的笨日子回来了')
+  if (/panelJsMtime/.test(i) && /panelJsMtime/.test(c) && /panelJsMtimeSeen/.test(c)) {
+    ok('面板构建标识走 panelJsMtime 比对（宿主文件一变就提示刷新）')
+  } else {
+    bad('panelJsMtime 比对链断了（index.js /status 或 client.js 的记忆逻辑缺失）—— 改了 client.js 面板不会提示刷新')
+  }
+} catch (e) { bad(`检查面板构建标识失败：${e.message}`) }
+
 /* ── 4b. 私信「谁发的」判据不能被退回去 ── */
 console.log('\n4b. 私信发送方判据')
 try {

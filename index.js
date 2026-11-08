@@ -5163,13 +5163,12 @@ let transientRetries = 0
       installTail: tail(installLogFile),
       report: reportFileOf(new Date()),
       version: myVersion(),
-      // ⭐ 0.5.9c：面板构建号 —— 浏览器里跑的是哪份 client.js（排障盲区：面板角标只有主人看得见）
-      panelBuild: (() => {
-        try {
-          const c = readFileSync(join(pluginDir, 'client.js'), 'utf8')
-          const m = /PANEL_BUILD\s*=\s*(\d+)/.exec(c)
-          return m ? Number(m[1]) : 0
-        } catch { return 0 }
+      // ⭐ 2026-11-08：面板构建标识自动化 —— 不再手写递增的 PANEL_BUILD 常量（靠记性的活迟早忘）。
+      //    panelJsMtime = client.js 文件修改时间：页面挂载时记下第一眼，变了就提示「请刷新」。
+      //    panelBuild 恒 0 只为兼容旧面板：旧 client.js 靠数字比对，拿到 0（falsy）会安静不提示。
+      panelBuild: 0,
+      panelJsMtime: (() => {
+        try { return statSync(join(pluginDir, 'client.js')).mtimeMs } catch { return 0 }
       })(),
       cookieFile: cookiePath(stateDir),
     }

@@ -49,9 +49,9 @@ console.log('  修改:', st.mtime.toLocaleString('zh-CN'))
 console.log('  rev :', rev)
 console.log('')
 
-// 面板构建号（client.js 里的 PANEL_BUILD）
-const b = /const PANEL_BUILD = (\d+)/.exec(src)
-console.log('面板构建号: b' + (b ? b[1] : '?'))
+// 面板构建标识已自动化（2026-11-08）：不再有手写 PANEL_BUILD 常量，
+// 面板 /status 用 client.js 的文件修改时间当构建号（mtime 尾 6 位）。
+console.log('面板构建标识: b' + String(st.mtimeMs).slice(-6) + '（client.js mtime，自动生成）')
 console.log('')
 
 // 关键特征自检（确认源码里真有这些块）

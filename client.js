@@ -17,12 +17,13 @@ window.__ModuleLoader__.load({
     const API = '/api/douyin-duty'
 
     /**
-     * ⭐ 面板构建号 —— **每次改完 client.js 就 +1**。
-     *    为什么需要它：改 client.js 后如果不重启/刷新，浏览器会一直用缓存的旧 bundle，
-     *    面板看起来"没变化"，很难判断是代码错了还是没加载。
-     *    对一下面板右上角显示的 `v<版本>·b<N>` 就知道。
+     * ⭐ 面板构建标识已自动化（2026-11-08）：不再手写「每次改完 +1」的 PANEL_BUILD 常量 ——
+     *    靠记性的活迟早忘（忘了浏览器就一直用旧 bundle，面板看起来"没变化"）。
+     *    现在的判断依据是宿主 /status 里的 `panelJsMtime`（client.js 文件修改时间）：
+     *    页面挂载时记下第一眼的值，之后宿主文件一变（git pull / 改代码）⇒ 值变了
+     *    ⇒ 页面里跑的就是旧代码 ⇒ 角标提示「请刷新页面」。
      */
-    const PANEL_BUILD = 41
+    let panelJsMtimeSeen = null
 
     const asJson = async (res) => {
       if (res.ok) return res.json()
@@ -1266,7 +1267,11 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
       const refresh = async () => {
         try {
           const [s, c] = await Promise.all([jget('/status'), jget('/config')])
-          if (s) setSt(s)
+          if (s) {
+            // 首次看到的面板代码时间 = 「页面正在跑的版本」；之后变了就是该刷新了
+            if (panelJsMtimeSeen == null && s.panelJsMtime) panelJsMtimeSeen = s.panelJsMtime
+            setSt(s)
+          }
           if (c && c.config) setCfg(c.config)
           if (s && s.loggedIn) {
             const okAcc = await loadAccount(0)
@@ -1801,8 +1806,8 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
               h('div', { 'data-dy-sub': '' }, '挑出值得看的内容，整理成今日推荐。')),
             h('div', { 'data-dy-run-actions': '' },
             h('button', { 'data-dy-mini': '', 'aria-haspopup': 'dialog', onClick: () => setGuideOpen(true) }, '使用指南'),
-            h('span', { 'data-dy-caption': '', title: '面板构建版本' }, 'v' + (st.version || '?') + '·b' + PANEL_BUILD
-              + (st.panelBuild && st.panelBuild !== PANEL_BUILD ? `（宿主 b${st.panelBuild}，请刷新页面）` : '')))),
+            h('span', { 'data-dy-caption': '', title: '面板构建标识（宿主 client.js 修改时间，自动生成）' }, 'v' + (st.version || '?') + '·b' + (st.panelJsMtime ? String(st.panelJsMtime).slice(-6) : '?')
+              + (st.panelJsMtime && panelJsMtimeSeen != null && st.panelJsMtime !== panelJsMtimeSeen ? '（面板代码已更新，请刷新页面）' : '')))),
           h('div', { 'data-dy-row': '' },
             h('span', { 'data-dy-badge': '', 'data-on': st.loggedIn ? '' : undefined, 'data-off': !st.loggedIn ? '' : undefined }, st.loggedIn ? '已登录' : '未登录'),
             st.loggedIn && acc?.nick ? h('span', { 'data-dy-account': '' }, acc.nick) : null,
@@ -2224,7 +2229,7 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
           h('div', { 'data-dy-row': '' },
             h('h2', { 'data-dy-title': '', 'data-dy-grow': '' }, '关于'),
             h('button', { 'data-dy-mini': '', disabled: busy === 'update', onClick: () => onCheckUpdate(true) }, busy === 'update' ? '检查中…' : '检查更新')),
-          h('p', { 'data-dy-pref-note': '' }, '刷抖音 · v' + (st.version || '?') + ' · b' + PANEL_BUILD),
+          h('p', { 'data-dy-pref-note': '' }, '刷抖音 · v' + (st.version || '?') + ' · b' + (st.panelJsMtime ? String(st.panelJsMtime).slice(-6) : '?')),
           h('div', { 'data-dy-update-result': '', 'aria-live': 'polite' },
             updateError ? h('p', { 'data-dy-pref-error': '' }, updateError) : upd?.checked ? h('p', null, upd.hasUpdate ? '有新版本 v' + upd.latest : '已是最新版本') : h('p', { 'data-dy-pref-note': '' }, upd?.note || '可检查插件新版本。'),
             upd?.checked && upd.hasUpdate && upd.how ? h('p', { 'data-dy-update-how': '' }, upd.how) : null),
