@@ -144,15 +144,8 @@ const cookieOk = () => {
   try { return existsSync(join(HOME, 'douyin_cookie.txt')) && readFileSync(join(HOME, 'douyin_cookie.txt'), 'utf8').trim().length > 0 } catch { return false }
 }
 
-const PICK_RE = /^#{2,3}[ \t]*(\d{15,25})/gm
-const countPicks = (file) => {
-  try {
-    const text = readFileSync(file, 'utf8').replace(/```[\s\S]*?```/g, '')
-    const ids = new Set()
-    for (const m of text.matchAll(PICK_RE)) ids.add(m[1])
-    return ids.size
-  } catch { return 0 }
-}
+// ⭐ 2026-11-08：原来这里有一份扫报告数 `### ID` 的 countPicks/PICK_RE（死代码）+ 计数
+//    传报告文本 —— 数据和展示分家后，计数只信 ledger（recommendations.json），已删。
 
 /* ─────────────────────────── 工具实现 ─────────────────────────── */
 
@@ -176,8 +169,8 @@ const TOOLS = [
     handler: () => {
       const cfg = config()
       const st = readJson(join(HOME, 'state.json'), {}) || {}
+      const counts = recommendationCounts(HOME, dayKey())
       const report = join(HOME, 'out', `${dayKey()}.md`)
-      const counts = recommendationCounts(HOME, dayKey(), existsSync(report) ? readFileSync(report, 'utf8') : '')
       return {
         ok: true,
         home: HOME,

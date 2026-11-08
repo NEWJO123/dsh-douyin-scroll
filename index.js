@@ -2542,22 +2542,14 @@ export function apply(ctx, config) {
   rollDay()
 
   /**
-   * ⭐ 「每天最多挑几条」承诺的是**全天总量** ⇒ 数**今天报告里那些 `### <视频ID>` 标题行**。
-   *    围栏 ``` 里的内容一律不看（兜底报告会把日志尾部贴进去，那里的 ID 是"看过的"不是"挑中的"）。
+   * ⭐ 2026-11-08（数据和展示分家）：「每天最多挑几条」数的是**结构化 receipt**（ledger），
+   *    不再数报告里的 `### <视频ID>` 标题行 —— 报告是给人看的，格式写歪数字就错（修过多次）。
+   *    原来这里还有一份扫报告的 countPicks/PICK_RE，是死代码，已删。
    *    数不出来就当 0 条 —— 宁可少算，也别把"提到过"算成"挑中"。
    */
-  const PICK_RE = /^#{2,3}[ \t]*(\d{15,25})/gm
   const reportFileOf = (now = new Date()) => join(outDir, `${dayKey(now)}.md`)
-  const countPicks = (file) => {
-    try {
-      const text = readFileSync(file, 'utf8').replace(/```[\s\S]*?```/g, '')
-      const ids = new Set()
-      for (const m of text.matchAll(PICK_RE)) ids.add(m[1])
-      return ids.size
-    } catch { return 0 }
-  }
   const reportTextOfDay = (day = dayKey()) => { try { return readFileSync(join(outDir, `${day}.md`), 'utf8') } catch { return '' } }
-  const countsToday = (now = new Date()) => recommendationCounts(stateDir, dayKey(now), reportTextOfDay(dayKey(now)))
+  const countsToday = (now = new Date()) => recommendationCounts(stateDir, dayKey(now))
   const countPickedToday = (now = new Date()) => countsToday(now).total
   const roundsToday = (now = new Date()) => {
     const st = readJson(dutyStateFile, {})
@@ -5966,9 +5958,9 @@ let transientRetries = 0
       let text = ''
       let exists = false
       try { exists = existsSync(file); if (exists) text = readFileSync(file, 'utf8').slice(0, 200000) } catch { /* 读不到就给空 */ }
-      const picks = scope === 'recent' ? recent?.result?.picks || [] : dayRecommendations(stateDir, day, text)
+      const picks = scope === 'recent' ? recent?.result?.picks || [] : dayRecommendations(stateDir, day)
       if (scope === 'recent') { text = recent?.reportText || ''; exists = Boolean(text) }
-      return sendJson(res, 200, { ok: true, scope, day, exists, file, text: safeLog(text), picks, roundId: recent?.id || '', counts: recommendationCounts(stateDir, day, reportTextOfDay(day)) })
+      return sendJson(res, 200, { ok: true, scope, day, exists, file, text: safeLog(text), picks, roundId: recent?.id || '', counts: recommendationCounts(stateDir, day) })
     }
     if (req.method === 'POST' && path === '/api/douyin-duty/open') {
       const body = await readBody(req)

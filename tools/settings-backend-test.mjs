@@ -34,7 +34,8 @@ test('daily ledger deduplicates first source and preserves unknown legacy histor
   const auto = prepared(home, 'window:noon', [OTHER, THIRD])
   assert.equal(submitRoundResult(home, auto.id, { picks: [{ id: OTHER }, { id: THIRD }] }).added, 1)
   assert.deepEqual(recommendationCounts(home, DAY), { auto: 1, manual: 1, unknown: 1, total: 3 })
-  assert.deepEqual(recommendationCounts(home, DAY, `### ${OTHER}\nrepeat`), { auto: 1, manual: 1, unknown: 1, total: 3 })
+  // ⭐ 2026-11-08：计数只信 ledger —— 传报告文本不再被接受（签名里根本没有这个参数了）
+  assert.deepEqual(recommendationCounts(home, DAY), { auto: 1, manual: 1, unknown: 1, total: 3 })
   writeFileSync(join(home, 'state.json'), JSON.stringify({ day: DAY, picked: 5 }))
   assert.deepEqual(recommendationCounts(home, DAY), { auto: 1, manual: 1, unknown: 3, total: 5 })
 }))

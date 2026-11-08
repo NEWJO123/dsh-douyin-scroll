@@ -1933,6 +1933,25 @@ try {
   if (/const rollDay/.test(idx) && /rollDay\(\)/.test(idx) && /dayKey\(\)/.test(idx)) {
     ok('state.json 跨天会自己翻篇（不再停在旧日期）')
   } else bad('没有跨天翻篇 —— 长时间挂着插件时 state.json 会一直停在旧日期')
+
+  /* ⭐ 2026-11-08（数据和展示分家）：计数只信 ledger（结构化 receipt）——
+   *    报告是给人看的，格式写歪数字就错（因此修过多次）。报告文本的扫描只许活在
+   *    importLegacyPicks（升级当天的显式迁移，named legacy），别的路径都不许再读报告。
+   */
+  try {
+    const rr = readFileSync(join(here, 'lib', 'run-record.mjs'), 'utf8')
+    const hits = (rr.match(/reportPicks/g) || []).length
+    if (hits === 2 && /function importLegacyPicks/.test(rr)) {
+      ok('计数只信 ledger：报告扫描只剩 importLegacyPicks 一处（升级迁移，named legacy）')
+    } else {
+      bad(`run-record.mjs 里 reportPicks 出现 ${hits} 次（应为 2：import + legacy 迁移）—— 又有路径开始从报告抠数字了`)
+    }
+    if (/function recommendationCounts\(home, day = dayKey\(\)\)/.test(rr) && /function dayRecommendations\(home, day = dayKey\(\)\)/.test(rr)) {
+      ok('recommendationCounts / dayRecommendations 签名干净（不再收报告文本）')
+    } else {
+      bad('recommendationCounts / dayRecommendations 又收 reportText 了 —— 展示层数据漏进数据源')
+    }
+  } catch (e) { bad(`数据分家守卫失败：${e.message}`) }
 } catch (e) { bad(`采集门槛检查失败：${e.message}`) }
 
 /* ── 5. Python 能否编译 + 判断层能否跑 ── */
