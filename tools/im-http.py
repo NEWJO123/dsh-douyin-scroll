@@ -51,15 +51,12 @@ import sys
 import time
 from datetime import datetime, timezone
 
-# Windows 控制台默认 GBK：消息文本里有 emoji（🍜 等）会 UnicodeEncodeError。
-# 宿主跑会设 PYTHONUTF8=1，这里再把 stdout 兜一道，命令行直跑也不炸。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, read_cookie_text  # noqa: E402
+from _home import bootstrap, home_str, read_cookie_text  # noqa: E402
+
+# ⭐ 一键开工：utf-8 输出（不再手写 reconfigure）。cookie=False —— 这里是体检员，
+#    没 Cookie 要活着返回 ok:false，不许在门口退出（见 _home.bootstrap）
+bootstrap(cookie=False)
 
 try:
     from curl_cffi import requests as creq

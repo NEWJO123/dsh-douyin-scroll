@@ -11,13 +11,10 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, node_bin, prefer_ipv4, utf8_stdio, read_cookie_text  # noqa: E402
+from _home import bootstrap, home_str, node_bin  # noqa: E402
 
-# ⚠️ 必须在任何 print 之前 —— Windows 控制台是 GBK，emoji 一进去就 UnicodeEncodeError（Issue #7②）
-utf8_stdio()
-# ⚠️ 必须在第一次 httpx 请求之前 —— 这个域名 DNS 先给 10 个 AAAA，IPv6 不通就会卡满 SYN 重试
-#    （2026-11-05 实测：每条评论 200 秒超时 ⇒ 证据包全部没评论）
-prefer_ipv4()
+# ⭐ 一键开工：utf-8 输出 + IPv4 偏好 + Cookie 闸（缺失给结构化错误并 exit 2）—— 见 _home.bootstrap
+COOKIE = bootstrap(hint="先在设置页扫码登录（或粘一条 Cookie），再读评论")
 
 import urllib.parse
 
@@ -29,25 +26,6 @@ PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NODE = node_bin()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 
-
-def _require_cookie():
-    """
-    🔴 2026-11-05：没登录时给结构化错误，不许抛 FileNotFoundError 堆栈。
-    """
-    # 必须走 read_cookie_text()：它剥 BOM（带 BOM 的 Cookie 塞进请求头会 UnicodeEncodeError）
-    cookie = read_cookie_text()
-    if not cookie:
-        print(json.dumps({
-            "ok": False,
-            "error": "还没有登录（没有 douyin_cookie.txt）",
-            "hint": "先在设置页扫码登录（或粘一条 Cookie），再读评论",
-            "stage": "cookie",
-        }, ensure_ascii=False))
-        sys.exit(2)
-    return cookie
-
-
-COOKIE = _require_cookie()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 JAR = {}

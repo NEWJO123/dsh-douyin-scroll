@@ -1627,8 +1627,9 @@ try {
     else bad('_home.py 没有 prefer_ipv4 —— IPv6 先到且不通的网络上读评论会卡满超时')
     for (const py of ['api-comments.py', 'api-reply.py']) {
       const src = readFileSync(join(here, 'tools', py), 'utf8')
-      if (/prefer_ipv4\(\)/.test(src) && /from _home import[^\n]*prefer_ipv4/.test(src)) ok(`${py} 在请求前关掉 IPv6`)
-      else bad(`${py} 没调 prefer_ipv4() —— 这条会卡 200 秒才超时`)
+      // ⭐ 2026-11-08：ipv4 偏好收进 _home.bootstrap()（cookie=True 时默认带上）—— 调 bootstrap 即算调
+      if (/prefer_ipv4\(\)/.test(src) || /bootstrap\(/.test(src)) ok(`${py} 在请求前关掉 IPv6（走 bootstrap 或显式 prefer_ipv4）`)
+      else bad(`${py} 没调 prefer_ipv4()/bootstrap() —— 这条会卡 200 秒才超时`)
     }
   } catch (e) { bad('读不到 tools/_home.py 或 httpx 脚本：' + (e?.message || e)) }
 
@@ -1711,9 +1712,10 @@ try {
   const needUtf8 = ['api-comments.py', 'api-reply.py', 'notice-read.py', 'session-guard.py', 'doctor.py', 'forward-pick.py', 'im-http.py']
   const missUtf8 = needUtf8.filter((f) => {
     const t = readFileSync(join(here, 'tools', f), 'utf8')
-    return !/utf8_stdio\(\)|reconfigure\(encoding/.test(t)
+    // ⭐ 2026-11-08：utf8 钉死也收进 _home.bootstrap() 了 —— 调 bootstrap 即算钉
+    return !/utf8_stdio\(\)|reconfigure\(encoding|bootstrap\(/.test(t)
   })
-  if (!missUtf8.length) ok('会打昵称 / emoji 的 Python 脚本都钉了 utf-8')
+  if (!missUtf8.length) ok('会打昵称 / emoji 的 Python 脚本都钉了 utf-8（bootstrap 或显式 utf8_stdio）')
   else bad(`这些脚本没钉 utf-8：${missUtf8.join(', ')} —— UnicodeEncodeError 会吃掉真因（Issue #7②）`)
 
   // #8① 「进程根本没起来」和「CDP 连不上」必须分开报
@@ -1855,21 +1857,21 @@ try {
    *   用户以为插件装坏了。现在必须 try/except + 输出结构化 {ok:false, error, hint} + exit(2)。
    */
   {
-    const pyCookie = [
+    const pyEntry = [
       ['notice-read.py', '读通知'], ['api-comments.py', '读评论'],
       ['api-reply.py', '回评论'], ['forward-pick.py', '取候选'],
+      ['im-http.py', '读私信'], ['session-guard.py', '会话体检'],
     ]
     const naked = []
-    for (const [file, what] of pyCookie) {
+    for (const [file, what] of pyEntry) {
       const t = readIf(join(here, 'tools', file))
       if (!t) continue
-      // 必须**真的用**兜底函数（只看有没有定义不算）；且不许再出现裸 open(cookie)
-      const usesGuard = /COOKIE = _require_cookie\(\)/.test(t) || /cookie = load_cookie\(\)/.test(t)
-      const nakedOpen = /COOKIE = open\(os\.path\.join\(HOME, "douyin_cookie\.txt"\)/.test(t)
-      if (!usesGuard || nakedOpen) naked.push(`${file}(${what})`)
+      // ⭐ 2026-11-08：样板收敛进 _home.bootstrap() —— 入口脚本必须调它（cookie=True 的
+      //    缺 Cookie 给结构化错误 exit(2)；体检员 cookie=False 活着返回）。忘了调在这里红。
+      if (!/bootstrap\(/.test(t)) naked.push(`${file}(${what})`)
     }
-    if (!naked.length) ok('Python 脚本读 Cookie 都有兜底（没登录时给结构化错误，不抛堆栈）')
-    else bad(`这些脚本没登录时会抛 Python 堆栈而不是提示：${naked.join('、')}`)
+    if (!naked.length) ok('Python 入口脚本都走 _home.bootstrap() 一键开工（utf8 + IPv4 + Cookie 闸收成一行）')
+    else bad(`这些入口脚本没走 _home.bootstrap() 样板 —— BOM/GBK/IPv6 的坑又会各修各的：${naked.join('、')}`)
 
     /* 🔴 Cookie 必须剥 BOM（2026-11-05）：
      *   用户在 Windows 记事本 / PowerShell `Set-Content -Encoding UTF8` 粘贴 Cookie 会带 BOM，
@@ -1886,7 +1888,8 @@ try {
       const t = readIf(join(here, 'tools', file))
       if (!t) continue
       if (/open\([^)]*douyin_cookie\.txt|open\(COOKIE_FILE/.test(t)) rawOpen.push(file)
-      if (!/read_cookie_text/.test(t)) rawOpen.push(file + '(没走统一入口)')
+      // bootstrap() 内部走 read_cookie_text() —— 入口只要二选一出现即算走了统一入口
+      if (!/read_cookie_text|bootstrap\(/.test(t)) rawOpen.push(file + '(没走统一入口)')
     }
     if (!rawOpen.length) ok('6 个脚本都走 read_cookie_text()（统一剥 BOM + 兜底，不再各自裸读）')
     else bad(`这些脚本还在裸读 Cookie：${[...new Set(rawOpen)].join('、')}`)

@@ -17,20 +17,15 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, read_cookie_text  # noqa: E402
+from _home import bootstrap, home_str, read_cookie_text  # noqa: E402
 import time
 from datetime import datetime, timezone, timedelta
 
 from curl_cffi import requests as creq
 
-# ⚠️ 2026-10-21 实测：Windows 上 stdout 默认 GBK，遇到标题里的 𝓋 / emoji 这类字符
-#    直接 UnicodeEncodeError 崩掉（这一轮就是崩在最后打印清单那一步）。
-#    插件是 spawnSync 抓管道的，崩了就等于「取候选失败」—— 一律强制 utf-8，编不出的替换掉。
-for _s in (sys.stdout, sys.stderr):
-    try:
-        _s.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+# ⭐ 一键开工：utf-8 输出（cookie=False —— Cookie 的闸在 main() 里 load_cookie()，
+#    要走 argparse 之后的结构化出口，见 _home.bootstrap）
+bootstrap(cookie=False)
 
 HOME = home_str()
 COOKIE_FILE = os.path.join(HOME, "douyin_cookie.txt")

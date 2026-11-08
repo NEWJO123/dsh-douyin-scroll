@@ -18,12 +18,10 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, node_bin, prefer_ipv4, utf8_stdio, read_cookie_text  # noqa: E402
+from _home import bootstrap, home_str, node_bin  # noqa: E402
 
-# ⚠️ 必须在任何 print 之前 —— GBK 控制台遇到 emoji 会崩（Issue #7②）
-utf8_stdio()
-# ⚠️ 必须在第一次 httpx 请求之前 —— 见 _home.prefer_ipv4() 的注释（IPv6 先到且不通 ⇒ 每次卡满重试）
-prefer_ipv4()
+# ⭐ 一键开工：utf-8 输出 + IPv4 偏好 + Cookie 闸（缺失给结构化错误并 exit 2）—— 见 _home.bootstrap
+COOKIE = bootstrap(hint="先在设置页扫码登录（或粘一条 Cookie），再回评论")
 
 import time
 import urllib.parse
@@ -39,23 +37,6 @@ SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 VENVPY = os.path.join(HOME, ".venv", "Scripts" if os.name == "nt" else "bin",
                       "python.exe" if os.name == "nt" else "python")
 GUARD = os.path.join(PLUGIN, "tools", "session-guard.py")
-
-
-def _require_cookie():
-    """
-    🔴 2026-11-05：没登录时给结构化错误，不许抛 FileNotFoundError 堆栈。
-    """
-    # 必须走 read_cookie_text()：它剥 BOM（带 BOM 的 Cookie 塞进请求头会 UnicodeEncodeError）
-    cookie = read_cookie_text()
-    if not cookie:
-        print(json.dumps({
-            "ok": False,
-            "error": "还没有登录（没有 douyin_cookie.txt）",
-            "hint": "先在设置页扫码登录（或粘一条 Cookie），再回评论",
-            "stage": "cookie",
-        }, ensure_ascii=False))
-        sys.exit(2)
-    return cookie
 
 
 COOKIE = _require_cookie()

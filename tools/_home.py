@@ -163,3 +163,35 @@ def prefer_ipv4(force: bool | None = None) -> bool:
     socket.getaddrinfo = _gai  # type: ignore[assignment]
     socket._douyin_ipv4_patch = True  # type: ignore[attr-defined]
     return True
+
+
+def bootstrap(cookie: bool = True, ipv4: bool = True,
+              hint: str = "先在设置页扫码登录（或粘一条 Cookie）"):
+    """入口脚本的**一键开工**（2026-11-08 设计收敛）。
+
+    utf-8 输出 → IPv4 偏好 →（可选）Cookie 闸，一行办完。
+    为什么要有它：BOM、GBK、node 路径、IPv6 卡死这类坑，以前每个脚本各修各的，
+    修一个漏一个（Issue #4、#7，BOM 一次修 6 个脚本）—— 根因是「样板长在每个脚本里」。
+    现在样板收在这里：入口脚本第一行 `COOKIE = bootstrap(hint=...)`，
+    新脚本忘了调会被 selfcheck 点名。
+
+    cookie=True：返回剥好 BOM 的 Cookie 文本；缺失/为空 ⇒ 打印结构化 JSON
+        错误并 exit(2)（把各脚本自己的 _require_cookie() 语义收进来，hint 按脚本传）。
+    cookie=False：只做 utf8 + ipv4，返回 ""。给 session-guard / im-http 这种
+        「体检员」用 —— 没 Cookie 要活着返回 alive:false，不许在这里退出。
+    """
+    utf8_stdio()
+    if ipv4:
+        prefer_ipv4()
+    if not cookie:
+        return ""
+    text = read_cookie_text()
+    if not text:
+        print(json.dumps({
+            "ok": False,
+            "error": "还没有登录（没有 douyin_cookie.txt）",
+            "hint": hint,
+            "stage": "cookie",
+        }, ensure_ascii=False))
+        sys.exit(2)
+    return text

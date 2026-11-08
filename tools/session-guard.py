@@ -28,10 +28,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str, utf8_stdio, read_cookie_text  # noqa: E402
+from _home import bootstrap, home_str, read_cookie_text  # noqa: E402
 
-# 体检输出里带昵称（可能含 emoji）—— 被 api-reply.py 读 stdout，崩了整条链就断（Issue #7②）
-utf8_stdio()
+# ⭐ 一键开工：utf-8 输出（cookie=False —— 这是体检员，没 Cookie 要活着返回 alive:false，
+#    不许在门口退出；_cookies() 自己兜 —— 见 _home.bootstrap）
+bootstrap(cookie=False)
 
 import time
 
