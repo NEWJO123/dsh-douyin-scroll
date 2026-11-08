@@ -30,7 +30,13 @@ window.__ModuleLoader__.load({
       const why = res.status === 401 ? '（未登录 / 没权限）' : res.status === 403 ? '（被宿主拦了）' : ''
       throw new Error('HTTP ' + res.status + why)
     }
-    const jget = async (p, options = {}) => asJson(await fetch(API + p, { credentials: 'same-origin', ...options }))
+    const jget = async (p, options = {}) => {
+      const r = await asJson(await fetch(API + p, { credentials: 'same-origin', ...options }))
+      // ⭐ 面板构建标识：任何一条 /status 回来都记「页面正在跑的版本」（refresh / 挂载
+      //    初始化 / installing 轮询都走这里，不会漏）；之后宿主文件一变，角标提示刷新
+      if (p === '/status' && panelJsMtimeSeen == null && r?.panelJsMtime) panelJsMtimeSeen = r.panelJsMtime
+      return r
+    }
     const jpost = async (p, body) => asJson(await fetch(API + p, {
       method: 'POST',
       credentials: 'same-origin',
@@ -1100,7 +1106,7 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
               requestRef.current = null
               say('未确认启动，可以重试。', 'warn')
             }
-            setSt((s) => s ? { ...s, ...(r.counts ? { counts: r.counts } : {}) } : s)
+            setSt((s) => s ? { ...s, ...(r.counts ? { counts: r.counts } : {}), ...(r.panelJsMtime ? { panelJsMtime: r.panelJsMtime } : {}) } : s)
             if (openedLog.current && typeof r.tail === 'string') setRunLog(redactLog(r.tail))
             const stamp = `${r.report?.stamp || ''}:${r.round.id || ''}:${r.round.phase}`
             if (reportStamp.current !== stamp) {
@@ -1267,11 +1273,7 @@ button[data-dy-groupbtn][data-open]{color:var(--dsw-alias-label-secondary,#c9ccd
       const refresh = async () => {
         try {
           const [s, c] = await Promise.all([jget('/status'), jget('/config')])
-          if (s) {
-            // 首次看到的面板代码时间 = 「页面正在跑的版本」；之后变了就是该刷新了
-            if (panelJsMtimeSeen == null && s.panelJsMtime) panelJsMtimeSeen = s.panelJsMtime
-            setSt(s)
-          }
+          if (s) setSt(s)
           if (c && c.config) setCfg(c.config)
           if (s && s.loggedIn) {
             const okAcc = await loadAccount(0)

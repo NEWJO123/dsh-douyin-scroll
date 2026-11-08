@@ -108,7 +108,7 @@ function harness(options = {}) {
       response = { ok: true, version: '9.9.9', home: 'H:/dy', ...state, counts: data.counts, pickedToday: data.counts.total, report: 'H:/dy/out/today.md', nextWindow: { startsAt: EPOCH + 86_400_000, endsAt: EPOCH + 90_000_000, label: '中午' } }
     } else if (path === '/progress') {
       if (data.progressError) throw new Error('状态读取失败')
-      response = { ok: true, round: clone(data.round), counts: data.counts, running: data.running ?? ['preparing', 'running', 'unknown'].includes(data.round.phase), report: { exists: true, stamp: data.reportStamp }, ...(url.searchParams.has('log') ? { tail: data.tail } : {}) }
+      response = { ok: true, round: clone(data.round), counts: data.counts, running: data.running ?? ['preparing', 'running', 'unknown'].includes(data.round.phase), report: { exists: true, stamp: data.reportStamp }, panelJsMtime: state.panelJsMtime, ...(url.searchParams.has('log') ? { tail: data.tail } : {}) }
       if (data.progress) response = await data.progress(clone(response))
     } else if (path === '/report') {
       if (data.reportError) throw new Error('结果读取失败')
@@ -839,3 +839,6 @@ await scenario('桌宠隔离与真 @ 工具约定继续有效', async () => {
 })
 
 console.log(`\n渲染检查：${passed} 个场景通过${process.exitCode ? '，存在失败' : ''}`)
+
+// 供补充场景脚本复用（_scratch 里的回归测试 import 它；直接执行时 42 场景照常先跑）
+export { harness, scenario, round, emptySends }

@@ -119,6 +119,14 @@ try {
   } else {
     bad('panelJsMtime 比对链断了（index.js /status 或 client.js 的记忆逻辑缺失）—— 改了 client.js 面板不会提示刷新')
   }
+  // ⭐ 2026-11-08 面板回归测试抓出来的：/status 有 panelJsMtime 但面板平时轮询的是
+  //    /progress（4s）—— 那里不带的话提示永远不会出现。两处都要带。
+  const mtimeHits = (i.match(/panelJsMtime/g) || []).length
+  if (mtimeHits >= 2 && /panelJsMtime: state\.panelJsMtime/.test(readFileSync(join(here, 'tools', 'panel-render-check.mjs'), 'utf8'))) {
+    ok('panelJsMtime 在 /status 和 /progress 都有返回（4 秒轮询就能发现面板代码更新）')
+  } else {
+    bad(`panelJsMtime 只在 /status 里（出现 ${mtimeHits} 次）—— 平时走 /progress 轮询，提示刷新永远不会出现`)
+  }
 } catch (e) { bad(`检查面板构建标识失败：${e.message}`) }
 
 /* ── 4b. 私信「谁发的」判据不能被退回去 ── */

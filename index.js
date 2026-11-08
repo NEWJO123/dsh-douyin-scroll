@@ -5198,6 +5198,8 @@ let transientRetries = 0
       const progress = readRunProgress(stateDir, dayKey())
       if (url.searchParams.get('log') !== '1') delete progress.tail
       return sendJson(res, 200, { ok: true, ...progress, running, today: dayKey(),
+        // ⭐ 面板构建标识走这里轮询（4s 一次）：client.js 一更新，面板 4 秒内提示刷新
+        panelJsMtime: (() => { try { return statSync(join(pluginDir, 'client.js')).mtimeMs } catch { return 0 } })(),
         pickedToday: countPickedToday(), perDay: Number(cfg.perDay || 0) })
     }
     if (req.method === 'GET' && path === '/api/douyin-duty/config') {
