@@ -3327,16 +3327,24 @@ const TRANSIENT_RE = /请求被拦截|Illegal API invocation|unapproved channel|
       : null
   }
 
-  const stubReportIfMissing = (code) => {
+  /**
+   * ⭐ 2026-11-08（数据和展示分家 3/4）：失败轮次的诊断写**独立文件** out/failed-<日期>.md，
+   *    不再往日报里写「这一轮没跑成」的横幅。旧设计让一个文件同时当日报 + 失败日志 + 占位符：
+   *    先失败后成功时，成功内容压在横幅下面，还得专门写代码把横幅挪走（挪横幅那段已删）。
+   *    日报只由轮次在有真内容时自己写；成功但没写报告时补一份**中性**短日报（ensureDailyReport）。
+   */
+  const writeFailureRecord = (code) => {
     try {
+      const diag = diagnoseFailure(code)
+      // 诊断结果留在内存里，通知兜底（outcome 丢失）时也能说人话
+      lastFailure = diag
       if (String(cfg.reportLevel || 'full') === 'off') return
-      const f = join(outDir, `${dayKey()}.md`)
-      if (existsSync(f)) return
+      const f = join(outDir, `failed-${dayKey()}.md`)
       let tail = ''
       try { tail = readFileSync(logFile, 'utf8').slice(-1500) } catch { /* 读不到就算了 */ }
-      const diag = diagnoseFailure(code)
-      writeFileSync(f, [
-        `# 刷抖音 · ${dayKey()} —— 这一轮没跑成`,
+      const stamp = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      appendFileSync(f, [
+        `## ${stamp} —— 一轮没跑成`,
         '',
         diag
           ? [
@@ -3353,50 +3361,28 @@ const TRANSIENT_RE = /请求被拦截|Illegal API invocation|unapproved channel|
         String(tail).trim(),
         '```',
         '',
-      ].join('\n'), 'utf8')
-      log(`这一轮没写报告 ⇒ 已补占位报告${diag ? `（原因：${diag.title}）` : ''}`)
-      // 把诊断结果留在内存里，通知那边也能用
-      lastFailure = diag
-    } catch (e) { log(`补占位报告失败：${e?.message ?? e}`) }
+      ].join('\n') + '\n', 'utf8')
+      log(`失败轮次诊断已记到 failed-${dayKey()}.md${diag ? `（原因：${diag.title}）` : ''} —— 不占用日报文件`)
+    } catch (e) { log(`写失败记录失败：${e?.message ?? e}`) }
   }
 
-  /**
-   * ⭐ 2026-11-06：占位报告只在「当天还没有报告」时才写。所以同一天里先失败、后成功时，
-   *    成功那一轮的内容会被**追加在失败横幅下面** —— 打开报告第一眼看到的是
-   *    「这一轮没跑成」，其实底下才是真结果。成功收尾时把那段旧横幅挪到文末留档。
-   */
-  const demoteStaleFailureBanner = () => {
+  /** 成功收尾但当天还没有日报 ⇒ 补一份**中性**短日报（不是失败横幅），保住「当天有报告」的不变量。 */
+  const ensureDailyReport = (outcome) => {
     try {
+      if (String(cfg.reportLevel || 'full') === 'off') return
       const f = join(outDir, `${dayKey()}.md`)
-      if (!existsSync(f)) return
-      const lines = readFileSync(f, 'utf8').split('\n')
-      if (!/^# 刷抖音 · .+ —— 这一轮没跑成$/.test(lines[0] || '')) return
-      // ⚠️ 不能拿正则找「第一个 ``` 结尾」—— 横幅自己带一个 ``` 开围栏（尾巴日志），
-      //    那样会把围栏里的内容切出去。必须配对：找开围栏，再找它的闭围栏。
-      let open = -1
-      let close = -1
-      for (let i = 1; i < lines.length; i++) {
-        if (lines[i].trim() !== '```') continue
-        if (open === -1) { open = i; continue }
-        close = i; break
-      }
-      const end = close === -1 ? open : close
-      if (end === -1) return
-      const rest = lines.slice(end + 1).join('\n').replace(/^\s+/, '').replace(/\s+$/, '')
-      if (!rest) return
-      const banner = lines.slice(0, end + 1).join('\n').trim()
+      if (existsSync(f)) return
+      const n = outcome?.result?.recommendations || 0
       writeFileSync(f, [
-        rest,
+        `# 刷抖音 · ${dayKey()}`,
         '',
-        '---',
+        `本轮已完成：结构化结果 ${n} 条（通知里已带清单）。`,
         '',
-        '## 附：早先那轮没跑成时的诊断',
-        '',
-        banner,
+        '> 报告正文由值班那一轮生成；本段只是占位 —— 那一轮没有产出报告正文。',
         '',
       ].join('\n'), 'utf8')
-      log('报告：上面那段“没跑成”的横幅已经挪到文末留档（后面这一轮是成的）')
-    } catch (e) { log(`整理报告失败（不影响这一轮）：${e?.message ?? e}`) }
+      log('本轮完成但没有报告正文 ⇒ 已补中性短日报（失败诊断在 failed-<日期>.md，互不掺和）')
+    } catch (e) { log(`补短日报失败：${e?.message ?? e}`) }
   }
 
   /**
@@ -3832,8 +3818,8 @@ let transientRetries = 0
             log(`刷抖音结束（${why}，code=${code}）`)
             if (code !== 0 && !timedOut && !stalled && !outTail.trim()) log('⚠️ 这一轮没有任何输出就退出了（上游把流掐掉 / 进程被收走）—— 日志里不会有 dsh: 报错，别以为日志漏了')
             petSay(outcome.phase === 'completed' ? '这轮挑完啦，结果已经记下了～' : '这轮结果还没有全部确认，主人看一下记录呀')
-            stubReportIfMissing(code)
-            if (code === 0 && outcome.phase === 'completed') demoteStaleFailureBanner()
+            if (code === 0 && outcome.phase === 'completed') ensureDailyReport(outcome)
+            else writeFailureRecord(code)
             reportCfgMutation(cfgBeforeSpawn)
             rotateLogIfBig()
             try {

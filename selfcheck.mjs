@@ -1609,14 +1609,17 @@ try {
   else bad('卡死检测定时器没清 —— 上一轮的计时会继续杀下一轮')
   if (/没有任何输出就退出了/.test(idx)) ok('进程没吐一个字就退出时，日志会明说（不是"日志漏了"）')
   else bad('静默退出不留痕 —— 下一次只能靠猜')
-  /* ── ⑦i 一天里先失败后成功：旧横幅要挪到文末 ──
-   * 🔴 2026-11-06 真事：占位报告只在当天没报告时写，成功那轮的内容被追加在
-   *    「这一轮没跑成」横幅**下面** ⇒ 打开报告第一眼是"没跑成"。
+  /* ── ⑦i 失败记录独立化（数据和展示分家 3/4，2026-11-08）──
+   * 🔴 2026-11-06 真事：旧设计把「没跑成」横幅写进日报，成功那轮的内容被压在横幅**下面**
+   *    ⇒ 打开报告第一眼是"没跑成"，还得专门写「挪横幅」的代码（围栏配对那种补丁）。
+   *    根子是一个文件当三个用。现在失败写独立文件，日报永远是干净的，补丁整个不需要存在。
    */
-  if (/const demoteStaleFailureBanner = /.test(idx)) ok('成功收尾时会把「没跑成」的旧横幅挪到文末（报告第一眼是真结果）')
-  else bad('旧失败横幅不会被挪走 —— 先失败后成功的那天，报告开头还是"没跑成"')
-  if (/code === 0 && outcome\.phase === 'completed'\) demoteStaleFailureBanner\(\)/.test(idx)) ok('只在「code=0 且 phase=completed」时才挪横幅（失败的那轮不动报告）')
-  else bad('挪横幅的条件不对 —— 失败那轮也会被改，或者压根没调用')
+  if (/const writeFailureRecord = /.test(idx) && /failed-\$\{dayKey\(\)\}\.md/.test(idx)) ok('失败轮次诊断写独立文件 failed-<日期>.md（不占日报）')
+  else bad('失败诊断还在写进日报 —— 先失败后成功时报告第一眼又是"没跑成"')
+  if (!/demoteStaleFailureBanner|stubReportIfMissing/.test(idx)) ok('「补横幅 + 挪横幅」的修补代码已删（根子治了，补丁不需要存在）')
+  else bad('stubReportIfMissing / demoteStaleFailureBanner 又回来了 —— 占位横幅机制别再回来')
+  if (/const ensureDailyReport = /.test(idx)) ok('成功但没报告时补的是中性短日报（不是失败横幅）')
+  else bad('成功轮没有日报时没有兜底 —— 面板「看报告」会整个空掉')
   /* ── ⑦h 结果文件被写成两段拼接时要能读出来 ──
    * 🔴 2026-11-06 真事：小模型把 submission.json 写了两遍（`{...}{...}`）⇒ JSON.parse 抛错
    *    ⇒ 收尾以为"没交作业" ⇒ phase=unknown、Toast「结果尚未确认」，其实报告早写好了。
