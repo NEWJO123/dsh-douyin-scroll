@@ -27,19 +27,22 @@ if (!AWEME || !CID) { out({ ok: false, error: '用法: comment-delete.mjs --awem
 try {
   const c = await openPage({ isolated: true })
   const chromed = c.status
-  const cur = String(await c.ev('location.href'))
-  if (!cur.includes('douyin.com')) {
-    await c.send('Page.navigate', { url: 'https://www.douyin.com/' })
-    await sleep(6000)
+  // ⭐ 2026-11-12（网络调研 + CDP 实测）：必须导航到**作品页**让抖音前端接管 XHR
+  //    （prototype.open 被重写）—— 被 hook 的 XHR 发请求会自动补签名；
+  //    fetch 没有被 hook ⇒ 裸奔 403（旧实现两条通道全用 fetch，就是败在这）。
+  //    另：旧的 GET「列表删除」路径已被抖音下线（网关报路径不支持）—— 已从工具里移除。
+  const workUrl = `https://www.douyin.com/video/${AWEME}`
+  await c.send('Page.navigate', { url: workUrl })
+  let sdk = false
+  for (let i = 0; i < 30; i++) {
+    await sleep(1000)
+    sdk = (await c.ev(`(() => ({ sdk: typeof window.bdms === 'object' && !XMLHttpRequest.prototype.open.toString().includes('[native code]') }))()`)).sdk
+    if (sdk) break
   }
+  if (!sdk) { out({ ok: false, error: '页面签名 SDK 未就绪（30 秒）—— 重试一次通常就好' }); c.close(); await sleep(200); throw { __done: true } }
+  if (DRY) { out({ ok: true, dry: true, aweme_id: AWEME, cid: CID, sdk: true, chrome: chromed }); c.close(); await sleep(200); throw { __done: true } }
 
-  if (DRY) {
-    out({ ok: true, dry: true, aweme_id: AWEME, cid: CID, chrome: chromed })
-    c.close()
-    await sleep(200)
-    throw { __done: true }
-  }
-
+  // POST /comment/delete/ —— 走被 hook 的 XHR（自动签名），不能换 fetch
   const js = `(async function(){
     var AWEME = ${JSON.stringify(AWEME)};
     var CID = ${JSON.stringify(CID)};
@@ -53,38 +56,18 @@ try {
       os_name:'Windows', os_version:'10', platform:'PC'
     };
     function qs(d){ return Object.keys(d).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(d[k]);}).join('&'); }
-    var COMMON2 = Object.assign({}, COMMON, { aweme_id: AWEME, cid: CID });
-    // 两个已知端点形态都试：GET /comment/list/delete/ 是抓包看到的；POST /comment/delete/ 是老文档
-    var attempts = [];
-    // A) GET list/delete（页面抓包形态）
-    try {
-      var u1 = '/aweme/v1/web/comment/list/delete/?' + qs(Object.assign({}, COMMON2, { app_name: 'aweme' }));
-      var r1 = await fetch(u1, { method: 'GET', credentials: 'include', headers: { 'Referer': 'https://www.douyin.com/' } });
-      var t1 = await r1.text();
-      var j1 = {};
-      try { j1 = JSON.parse(t1) } catch (e) {}
-      attempts.push({ via: 'GET list/delete', http: r1.status, status_code: j1.status_code, head: t1.slice(0, 160) });
-      if (r1.status === 200 && (j1.status_code === 0 || j1.status_code === '0')) {
-        return JSON.stringify({ ok: true, via: 'GET list/delete', http: r1.status, status_code: j1.status_code, attempts: attempts });
-      }
-    } catch (e) { attempts.push({ via: 'GET list/delete', error: String((e && e.message) || e) }); }
-    // B) POST /comment/delete/
-    try {
-      var u2 = '/aweme/v1/web/comment/delete/?' + qs(Object.assign({}, COMMON, { app_name: 'aweme' }));
-      var r2 = await fetch(u2, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': 'https://www.douyin.com/' },
-        body: new URLSearchParams(Object.assign({}, COMMON2)).toString()
-      });
-      var t2 = await r2.text();
-      var j2 = {};
-      try { j2 = JSON.parse(t2) } catch (e) {}
-      attempts.push({ via: 'POST delete', http: r2.status, status_code: j2.status_code, head: t2.slice(0, 160) });
-      if (r2.status === 200 && (j2.status_code === 0 || j2.status_code === '0')) {
-        return JSON.stringify({ ok: true, via: 'POST delete', http: r2.status, status_code: j2.status_code, attempts: attempts });
-      }
-    } catch (e) { attempts.push({ via: 'POST delete', error: String((e && e.message) || e) }); }
-    return JSON.stringify({ ok: false, attempts: attempts });
+    return await new Promise(function(resolve){
+      var url = '/aweme/v1/web/comment/delete/?' + qs(Object.assign({}, COMMON, { app_name: 'aweme' }));
+      var body = 'aweme_id=' + encodeURIComponent(AWEME) + '&cid=' + encodeURIComponent(CID);
+      var x = new XMLHttpRequest();
+      var done = function(){ resolve(JSON.stringify({ http: x.status, body: (x.responseText||'').slice(0, 400) })); };
+      x.open('POST', url, true);
+      x.withCredentials = true;
+      x.timeout = 20000;
+      x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+      x.onload = done; x.onerror = done; x.ontimeout = done; x.onabort = done;
+      x.send(body);
+    });
   })()`
 
   const raw = await c.ev(js)
@@ -93,7 +76,10 @@ try {
 
   let res
   try { res = JSON.parse(raw) } catch { out({ ok: false, error: '页面没返回可解析结果', raw: String(raw).slice(0, 400) }); process.exit(1) }
-  out({ ...res, aweme_id: AWEME, cid: CID, chrome: chromed })
+  let j = {}
+  try { j = JSON.parse(res.body || '{}') } catch { /* 非 JSON 如实报 */ }
+  const ok = res.http === 200 && (j.status_code === 0 || j.status_code === '0')
+  out({ ok, http: res.http, status_code: j.status_code ?? null, msg: j.msg || '', aweme_id: AWEME, cid: CID, chrome: chromed })
 } catch (e) {
   if (!(e && e.__done)) out({ ok: false, error: String(e?.message ?? e) })
 }

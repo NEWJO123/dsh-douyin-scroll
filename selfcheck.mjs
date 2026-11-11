@@ -1791,6 +1791,13 @@ try {
     if (!/document\.execCommand\('insertText'/.test(mui) && /Input\.insertText/.test(mui)) {
       ok('真 @ 的打字走 CDP Input.insertText（execCommand 会把新 UI 的编辑器搞消失）')
     } else bad('comment-mention-ui 又用 execCommand 打字了 —— 新 UI 下编辑器会整个消失，发布按钮自然找不到')
+    // ⭐ 2026-11-12（网络调研 + CDP 实测）：删除评论必须走被抖音 hook 的 XHR（自动补签名），
+    //    fetch 裸奔 403；GET /comment/list/delete/ 路径已被下线（404 Unsupported path）。
+    const del = readFileSync(join(here, 'tools', 'comment-delete.mjs'), 'utf8')
+    if (!/fetch\(/.test(del) && /new XMLHttpRequest\(\)/.test(del)) ok('删除评论走被 hook 的 XHR（自动签名；fetch 裸奔 403）')
+    else bad('comment-delete 又用 fetch 发删除请求 —— 无签名必 403')
+    if (!/comment\/list\/delete/.test(del)) ok('已下线的 comment/list/delete 路径不再出现（404 Unsupported path）')
+    else bad('comment-delete 还带着已下线的 comment/list/delete 路径 —— 404 Unsupported path')
   }
 
   // #5 webhook 地址不校验 = 本机变内网跳板
