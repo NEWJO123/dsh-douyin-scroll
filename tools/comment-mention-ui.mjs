@@ -340,12 +340,15 @@ try {
       return e ? String(e.innerText||'').indexOf(${JSON.stringify(lead)}) >= 0 : false;
     })()`)
     if (body) {
-      await c.ev(`document.execCommand('insertText', false, ${JSON.stringify(' ' + body)})`)
+      // ⭐ 2026-11-11（Issue #19 跟进实测）：execCommand('insertText') 在抖音新 UI 里
+      //    会把整个编辑器搞消失（实测 editor 直接 gone，连带「找不到发布箭头」）——
+      //    改用 CDP Input.insertText（浏览器级输入，编辑器保持存活）。下同。
+      await c.send('Input.insertText', { text: ' ' + body })
       await sleep(600)
     }
     // 如果真的没自动插入 mention，就把 @昵称 补回去（否则名字不会蓝）
     if (!hasToken) {
-      await c.ev(`document.execCommand('insertText', false, ${JSON.stringify(lead + ' ')})`)
+      await c.send('Input.insertText', { text: lead + ' ' })
       await sleep(400)
     }
   }
@@ -360,13 +363,17 @@ try {
     throw { __done: true }
   }
 
-  // ⑥ 点右下角红色箭头发布（svg 里 fill=FE2C55，往上找到 ≥24px 的可点容器）
+  // ⑥ 点发布按钮（svg 里 fill=FE2C55，往上找到 ≥24px 的可点容器）
+  // ⭐ 2026-11-11（Issue #19 跟进实测）：新 UI 的发布按钮**还在**（FE2C55 svg，36×36，
+  //    在编辑器的祖先容器里），之前找不到的真因是打字方式（execCommand）把编辑器搞消失
+  //    ⇒ 后面自然什么都找不到。去掉「必须在编辑器右下方」的坐标约束（窄/宽窗口布局不同），
+  //    只要求 svg 在编辑器的祖先容器里（循环结构天然保证）+ 可见。
   const btn = JSON.parse(await c.ev(`(function(){ ${DOM_HELPERS}
     var editor=[].slice.call(document.querySelectorAll('.public-DraftEditor-content')).find(visible);
     if(!editor)return '{}';
     var er=editor.getBoundingClientRect();
-    for(var root=editor.parentElement,d=0;root&&d<8;root=root.parentElement,d++){
-      var svgs=[].slice.call(root.querySelectorAll('svg')).filter(function(e){var r=e.getBoundingClientRect();return visible(e)&&/fe2c55/i.test(e.innerHTML||'')&&r.y>=er.y-10&&r.x>=er.x});
+    for(var root=editor.parentElement,d=0;root&&d<10;root=root.parentElement,d++){
+      var svgs=[].slice.call(root.querySelectorAll('svg')).filter(function(e){var r=e.getBoundingClientRect();return visible(e)&&/fe2c55/i.test(e.innerHTML||'')&&r.width>=20&&r.height>=20});
       svgs.sort(function(a,b){return Math.abs(a.getBoundingClientRect().y-er.bottom)-Math.abs(b.getBoundingClientRect().y-er.bottom)});
       if(!svgs.length)continue;
       for (var e=svgs[0],up=0; up<4 && e; up++,e=e.parentElement){
@@ -376,7 +383,7 @@ try {
     }
     return '{}';
   })()`))
-  if (!btn.x) { out({ ok: false, error: '找不到发布箭头', editor_html: editorHtml }); throw { __done: true } }
+  if (!btn.x) { out({ ok: false, error: '找不到发布箭头（抖音可能又改版了，欢迎到 issue 反馈）', editor_html: editorHtml }); throw { __done: true } }
   await click(btn.x, btn.y)
   await sleep(4000)
 

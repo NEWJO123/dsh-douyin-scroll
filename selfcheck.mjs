@@ -1784,6 +1784,13 @@ try {
     if (!/await sleep\(7000\)/.test(cs) && /video-share-icon-container/.test(cs) && /for \(let t = 0; t < 30/.test(cs)) {
       ok('分享图标改成轮询等它真出现（不再固定死等 7 秒 —— Issue #19 根因 3）')
     } else bad('card-share 又回到固定 sleep(7000) —— 页面 30 秒才画好的机器必挂')
+    // ⭐ 2026-11-11 跟进实测：execCommand('insertText') 在抖音新 UI 里会把整个编辑器
+    //    搞消失（连带「找不到发布箭头」—— #19 作者的 ⑥ 步失败正是这个）——
+    //    打字必须走 CDP Input.insertText（编辑器保持存活）。
+    const mui = readFileSync(join(here, 'tools', 'comment-mention-ui.mjs'), 'utf8')
+    if (!/document\.execCommand\('insertText'/.test(mui) && /Input\.insertText/.test(mui)) {
+      ok('真 @ 的打字走 CDP Input.insertText（execCommand 会把新 UI 的编辑器搞消失）')
+    } else bad('comment-mention-ui 又用 execCommand 打字了 —— 新 UI 下编辑器会整个消失，发布按钮自然找不到')
   }
 
   // #5 webhook 地址不校验 = 本机变内网跳板
