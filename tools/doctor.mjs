@@ -36,6 +36,7 @@ const metadata = {
   '浏览器': { id: 'browser', category: 'environment', required: true },
   '无头浏览器': { id: 'browser_process', category: 'environment', required: false },
   '签名器运行时': { id: 'signer', category: 'environment', required: true, action: REPAIR_ENVIRONMENT },
+  '签名 SDK（bdms）': { id: 'bdms', category: 'info', required: false },
   '关键文件': { id: 'plugin_files', category: 'environment', required: true },
   '人设': { id: 'persona', category: 'info', required: false },
 }
@@ -139,6 +140,37 @@ if (home) {
   } else {
     row('签名器运行时', 'warn', `装了一半（jsdom:${jsdomOk ? '有' : '缺'}，SDK ${haveSdk}/${sdkNames.length}）`,
       'node tools/signer-setup.mjs 补齐；真签自检：node tools/signer-setup.mjs --check')
+  }
+}
+
+/* ── 8b. 签名 SDK（bdms）版本预警（2026-11-12 网络调研产物）──
+ * py 签名器（dy-signer，自实现 a_bogus）是全插件唯一「自养签名」设施 ——
+ * 抖音升级 bdms 字节码它就失效。版本由作品页就绪时自动记录
+ * （lib/douyin-work.mjs → state/bdms-version.json），这里读出来做前后对比：
+ * 版本变了 ⇒ 预警「拉评论可能要靠兜底通道」，失效从「突然」变「提前知道」。 */
+if (home) {
+  try {
+    const bf = join(home, 'state', 'bdms-version.json')
+    if (existsSync(bf)) {
+      // ⭐ 剥 BOM（记事本手写的记录会带 —— Cookie 的 BOM 坑同款，防御性处理）
+      let rawText = readFileSync(bf, 'utf8')
+      if (rawText.charCodeAt(0) === 0xfeff) rawText = rawText.slice(1)
+      const rec = JSON.parse(rawText)
+      const cur = String(rec.version || '')
+      const prev = String(rec.prev || '')
+      if (cur && prev && cur !== prev) {
+        row('签名 SDK（bdms）', 'warn', `检测到升级：${prev} → ${cur}（${String(rec.at || '').slice(0, 10)}）`,
+          '抖音签名 SDK 变了 —— py 签名器（拉评论）可能失效：拉不到评论时属预期，页面兜底会自动接住（变慢但可用）；持续失败请到仓库反馈')
+      } else if (cur) {
+        row('签名 SDK（bdms）', 'ok', `${cur}（${String(rec.at || '').slice(0, 10)} 记录，未变化）`)
+      } else {
+        row('签名 SDK（bdms）', 'warn', '记录里没有版本号 —— 下次评论/发布操作后会重新记录')
+      }
+    } else {
+      row('签名 SDK（bdms）', 'warn', '还没有记录 —— 跑一轮评论/发布相关操作后会自动检测')
+    }
+  } catch (e) {
+    row('签名 SDK（bdms）', 'warn', `读不到版本记录：${String(e?.message ?? e).slice(0, 80)}`)
   }
 }
 

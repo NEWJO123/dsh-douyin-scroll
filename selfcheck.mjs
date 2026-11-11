@@ -2046,6 +2046,16 @@ try {
     if (/Math\.max\(1, Math\.min\(Math\.trunc\(Number\(cfg\.manualPerRun\)/.test(idx)) ok('manualPerRun 直改 config 塞负数也会被钳到 1-30（手动轮不再必空）')
     else bad('manualPerRun 的 budget 钳制丢了 —— 直改 config 塞负数会让手动轮提交全拒')
   } catch (e) { bad(`值班链路守卫失败：${e.message}`) }
+
+  /* ⭐ 2026-11-12（网络调研产物）：bdms 版本预警 —— py 签名器失效从「突然」变「提前知道」 */
+  try {
+    const dw = readFileSync(join(here, 'lib', 'douyin-work.mjs'), 'utf8')
+    const doc = readFileSync(join(here, 'tools', 'doctor.mjs'), 'utf8')
+    if (/noteBdmsVersion/.test(dw) && /bdms-version\.json/.test(dw)) ok('作品页就绪时自动记录 bdms 版本（签名 SDK 升级可追踪）')
+    else bad('bdms 版本记录丢了 —— py 签名器失效会是「突然」的')
+    if (/检测到升级/.test(doc) && /charCodeAt\(0\) === 0xfeff/.test(doc)) ok('doctor 读 bdms 版本对比预警（剥 BOM 防御，手写记录也不炸）')
+    else bad('doctor 的 bdms 版本预警丢了（或没剥 BOM）—— 签名 SDK 升级没人知道')
+  } catch (e) { bad(`bdms 预警守卫失败：${e.message}`) }
 } catch (e) { bad(`采集门槛检查失败：${e.message}`) }
 
 /* ── 5. Python 能否编译 + 判断层能否跑 ── */

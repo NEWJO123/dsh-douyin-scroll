@@ -332,8 +332,8 @@ dsh-douyin-scroll/
 │   ├── forward-run.mjs               # 命令行一键：拉候选 + 弹通知
 │   ├── api-comments.py               # 签名拉评论
 │   ├── notice-read.py                # 签名读通知（含 @ 我）
-│   ├── api-reply.py                  # 签名回评论（只读先通才写）
-│   ├── comment-api.mjs               # 无头页面里发评论/回复
+│   ├── api-reply.py                  # 签名回评论（**备用通道**：日常回评论走 comment-api.mjs —— 页面 XHR 自动签名，不依赖自实现签名器）
+│   ├── comment-api.mjs               # 无头页面里发评论/回复（发布后回读确认可见性）
 │   ├── comment-mention-ui.mjs        # 真 @ 提及（只有 UI 点选才算数）
 │   ├── comment-delete.mjs            # 删自己的评论（页面里 POST /comment/delete/）
 │   ├── comment-reply.mjs             # 真实 UI 回某条评论（保守方案）
