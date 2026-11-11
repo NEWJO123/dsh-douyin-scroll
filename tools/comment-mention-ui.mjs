@@ -388,7 +388,34 @@ try {
   await sleep(4000)
 
   const editorAfter = await c.ev(`(function(){ ${DOM_HELPERS}  var e=[].slice.call(document.querySelectorAll('.public-DraftEditor-content')).find(visible); return e ? String(e.innerText||'').slice(0,60) : '(gone)'; })()`)
-  out({ ok: true, published: true, aweme_id: work.aweme_id, work_url: work.work_url, aweme_type: work.aweme_type, mention: NAME, ...(replyInfo || {}), popup_row: row, editor_html: editorHtml, editor_after: editorAfter, chrome: chromed })
+
+  /**
+   * ⭐ 2026-11-12：发布后回读确认**可见性**（真发验证发现：publish 成功 + 编辑器清空
+   *    ≠ 评论可见 —— 内容可能被平台审核/过滤）。用页面 XHR 拉顶层评论列表，
+   *    按正文前 30 字匹配，3 次重试；读不到 ⇒ visible=false（如实带出，宿主标注）。
+   */
+  let visible = null
+  const probe = String(TEXT || '').slice(0, 30)
+  if (probe) {
+    for (let attempt = 1; attempt <= 3 && visible === null; attempt++) {
+      await sleep(attempt === 1 ? 1500 : 1800)
+      const rj = await c.ev(`(function(){
+        return new Promise(function(resolve){
+          var x = new XMLHttpRequest();
+          var done = function(){ resolve(x.responseText || '') };
+          x.open('GET', '/aweme/v1/web/comment/list/?aweme_id=${JSON.stringify(AWEME)}&count=20&cursor=0&item_type=0&device_platform=webapp&aid=6383&channel=channel_pc_web&pc_client_type=1&version_code=190500&version_name=19.5.0&cookie_enabled=true&platform=PC&app_name=aweme', true);
+          x.withCredentials = true; x.timeout = 15000;
+          x.onload = done; x.onerror = function(){ resolve('') }; x.ontimeout = function(){ resolve('') };
+          x.send(null);
+        });
+      })()`)
+      let jj = null
+      try { jj = JSON.parse(rj || '{}') } catch { jj = null }
+      if (jj && jj.comments && jj.comments.some((cm) => String(cm.text || '').includes(probe))) visible = true
+      if (attempt === 3 && visible === null) visible = false
+    }
+  }
+  out({ ok: true, published: true, visible, aweme_id: work.aweme_id, work_url: work.work_url, aweme_type: work.aweme_type, mention: NAME, ...(replyInfo || {}), popup_row: row, editor_html: editorHtml, editor_after: editorAfter, chrome: chromed })
 } catch (e) {
   if (!(e && e.__done)) out({ ok: false, error: String(e?.message ?? e) })
 } finally {

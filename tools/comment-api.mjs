@@ -195,6 +195,27 @@ try {
           }
         }
       }
+    } else if (o.cid) {
+      /**
+       * ⭐ 2026-11-12：顶层普通评论也回读确认**可见性**（真发验证发现：publish 200 +
+       *    有 cid，但重读评论列表可能读不到 —— 疑似平台审核/过滤）。3 次重试，
+       *    读到 ⇒ visible=true；3 次都没读到 ⇒ visible=false（如实带出，宿主会标注
+       *    两种可能：热度排够不着 / 被平台过滤 —— 不武断）。
+       */
+      for (var attempt3 = 1; attempt3 <= 3; attempt3++) {
+        await new Promise(function(z){ setTimeout(z, attempt3 === 1 ? 1200 : 1800) });
+        var tl2 = await request('GET', '/aweme/v1/web/comment/list/?' + qs(Object.assign({}, COMMON, {
+          aweme_id: AWEME, count: '20', cursor: '0', item_type: '0'
+        }))).then(function(x){ return x.body }).catch(function(){ return '' });
+        var tjj2 = null; try { tjj2 = JSON.parse(tl2) } catch(e) {}
+        if (tjj2 && tjj2.comments) {
+          for (var k3 = 0; k3 < tjj2.comments.length; k3++) {
+            if (String(tjj2.comments[k3].cid) === o.cid) { o.visible = true; break; }
+          }
+        }
+        if (o.visible) break;
+      }
+      if (o.visible !== true) o.visible = false;
     }
     return JSON.stringify(o);
   })()`
@@ -233,6 +254,19 @@ try {
         verified: true, level: 1, ok: false, found_at_top: true,
         warn: '⚠️ 已核实：这条跑到了**顶层评论列表**里 —— 楼根填错，它没进楼。'
           + '虽然发出去了，但位置在评论区第一层，不是回在对方楼下。',
+      }
+    } else if (!usedRoot && cid) {
+      // ⭐ 2026-11-12：顶层普通评论的可见性回读结果（页面 JS 已带 o.visible）
+      if (res.visible === true) {
+        placement = { verified: true, level: 1, ok: true, note: '已回读评论列表确认可见' }
+      } else if (res.visible === false) {
+        placement = { verified: false, ok: null,
+          warn: '发布接口 200 且有 cid，但重读 3 次评论列表都没读到 —— 两种可能：'
+            + '评论列表按热度排（0 赞的够不着），或内容被平台审核/过滤。'
+            + '不等于发送失败，也不能确认对方可见 —— 请人工核对或稍后回读。',
+        }
+      } else {
+        placement = { verified: false, ok: null, note: '回读没得出结论（列表读取失败）—— 不等于失败' }
       }
     } else {
       placement = {

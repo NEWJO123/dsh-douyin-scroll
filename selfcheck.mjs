@@ -1798,6 +1798,14 @@ try {
     else bad('comment-delete 又用 fetch 发删除请求 —— 无签名必 403')
     if (!/comment\/list\/delete/.test(del)) ok('已下线的 comment/list/delete 路径不再出现（404 Unsupported path）')
     else bad('comment-delete 还带着已下线的 comment/list/delete 路径 —— 404 Unsupported path')
+    // ⭐ 2026-11-12（真发验证的教训固化）：publish 200 + cid ≠ 可见（内容可能被平台
+    //    审核/过滤）—— 发布成功后必须回读评论列表确认可见性，两条发布路径都要有。
+    const cap = readFileSync(join(here, 'tools', 'comment-api.mjs'), 'utf8')
+    const mui2 = readFileSync(join(here, 'tools', 'comment-mention-ui.mjs'), 'utf8')
+    if (/o\.visible/.test(cap) && /顶层普通评论也回读/.test(cap)) ok('comment-api 顶层评论发布后回读可见性（不只回复有）')
+    else bad('comment-api 顶层评论没有回读可见性 —— 「发了但看不见」会悄悄溜过')
+    if (/let visible = null/.test(mui2) && /visible, aweme_id/.test(mui2)) ok('真 @ 发布后也回读可见性（visible 字段如实带出）')
+    else bad('mention 真发没有回读可见性 —— published:true 不可靠的问题又回来了')
   }
 
   // #5 webhook 地址不校验 = 本机变内网跳板
