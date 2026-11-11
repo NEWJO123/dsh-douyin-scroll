@@ -31,7 +31,9 @@ const out = (o) => { console.log(JSON.stringify(o, null, 1)); process.exitCode =
 
 if (!AID || !WHO) { out({ ok: false, error: '用法: card-share.mjs <aweme_id> <好友昵称>' }); process.exit(1) }
 
-const _c = await openPage()
+// ⭐ 2026-11-11（Issue #19 根因 1）：不加 isolated 会**复用共享页面**，被 chat-watch 的
+//    10 秒一次的 /chat 导航当场顶掉（实测页面 2 秒后变成 IM 会话页）⇒ 「时好时坏」。
+const _c = await openPage({ isolated: true })
 const chromed = _c.status
 const { send, ev } = _c
 const mv = (x, y) => send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 })
@@ -43,15 +45,43 @@ const click = async (x, y) => {
 
 try {
   await send('Page.navigate', { url: `https://www.douyin.com/video/${AID}` })
-  await sleep(7000)
 
-  const pos = JSON.parse(await ev(`(function(){
-    var ic=document.querySelector('[data-e2e="video-share-icon-container"]');
-    if(!ic) return '{}';
-    var r=ic.getBoundingClientRect();
-    return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});
-  })()`))
-  if (!pos.x) { out({ ok: false, error: '找不到分享图标（视频页没加载好）' }); process.exit(1) }
+  // ⭐ 2026-11-11（Issue #19 根因 3）：固定 sleep(7000) 太短 —— 机器忙 / 无头实例刚启动时
+  //    页面 >30 秒才画完（作者实测 2 秒到 30 秒都有）。改成轮询等分享图标真有尺寸。
+  let pos = {}
+  for (let t = 0; t < 30; t++) {
+    await sleep(1000)
+    pos = JSON.parse(await ev(`(function(){
+      var ic=document.querySelector('[data-e2e="video-share-icon-container"]');
+      if(!ic) return '{}';
+      var r=ic.getBoundingClientRect();
+      if(!(r.width>8 && r.height>8)) return '{}';
+      return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});
+    })()`))
+    if (pos.x) break
+  }
+  if (!pos.x) { out({ ok: false, error: '找不到分享图标（等了 30 秒视频页还没画好）' }); process.exit(1) }
+
+  // ⭐ 2026-11-11（Issue #19 根因 2）：抖音改版 —— [data-e2e="video-share-container"]
+  //    变成 0×0 隐藏壳，真面板是无 data-e2e 的浮层（实测宽 300，祖先链第 2 层就是
+  //    300×309 的内容区）。策略：先按叶子标题「分享给朋友」反查浮层（向上最多 10 层，
+  //    第一个宽>250 且高>100 的祖先）；叶子找不到再退旧标记（兼容改回旧版）。
+  //    面板结构变了也不怕：里面「按昵称找行 → fiber 读 sec_uid」的逻辑不受影响。
+  const PANEL_FN = `function findPanel(){
+    var hit = null;
+    document.querySelectorAll('div,span,p').forEach(function(e){
+      if (!hit && !e.children.length && (e.innerText||'').replace(/\\s+/g,' ').trim() === '分享给朋友') hit = e;
+    });
+    if (hit) {
+      for (var box = hit, i = 0; box && i < 10; i++, box = box.parentElement) {
+        var r = box.getBoundingClientRect();
+        if (r.width > 250 && r.height > 100) return box;
+      }
+    }
+    var sc = document.querySelector('[data-e2e="video-share-container"]');
+    if (sc && (sc.innerText||'').replace(/\\s+/g,' ').trim()) return sc;
+    return null;
+  }`
 
   // 真实轨迹 hover（必须；el.click() 打不开）
   await mv(20, 20); await sleep(250)
@@ -62,16 +92,18 @@ try {
   await mv(pos.x, pos.y)
   await sleep(2000)
 
-  const panel = await ev(`(function(){
-    var sc=document.querySelector('[data-e2e="video-share-container"]');
-    return sc ? (sc.innerText||'').replace(/\\s+/g,' ').slice(0,400) : '';
-  })()`)
+  // 面板可能比 hover 晚 1-2 秒才展开 ⇒ 轮询等它，最多 4 秒
+  let panel = ''
+  for (let t = 0; t < 8; t++) {
+    await sleep(500)
+    panel = await ev(`(function(){${PANEL_FN};var sc=findPanel();return sc ? (sc.innerText||'').replace(/\\s+/g,' ').slice(0,400) : ''})()`)
+    if (panel) break
+  }
   if (!panel) { out({ ok: false, error: '分享面板没展开' }); process.exit(1) }
 
   // --peek：把面板里每一行连同它 fiber 里的 id 都打出来（排查重名用）
   if (PEEK) {
-    const rows = await ev(`(function(){
-      var sc = document.querySelector('[data-e2e="video-share-container"]');
+    const rows = await ev(`(function(){${PANEL_FN};var sc = findPanel();
       if (!sc) return '[]';
       var out = [];
       sc.querySelectorAll('div').forEach(function(e){
@@ -104,9 +136,8 @@ try {
   }
 
   // 找「WHO」那一行：同时拿到 昵称 + **sec_uid** + 「分享」按钮坐标 —— 昵称会重名，sec_uid 不会
-  const found = await ev(`(function(){
+  const found = await ev(`(function(){${PANEL_FN};var sc = findPanel();
     var who = ${JSON.stringify(WHO)};
-    var sc = document.querySelector('[data-e2e="video-share-container"]');
     if(!sc) return JSON.stringify({err:'no-panel'});
     function secOf(node){
       var fk = Object.keys(node).find(function(k){ return k.indexOf('__reactFiber$')===0 });
@@ -174,8 +205,7 @@ try {
   await click(b.x, b.y)
   await sleep(2500)
 
-  const after = await ev(`(function(){
-    var sc=document.querySelector('[data-e2e="video-share-container"]');
+  const after = await ev(`(function(){${PANEL_FN};var sc=findPanel();
     return JSON.stringify({
       panelStillOpen: sc ? sc.getBoundingClientRect().height > 10 : false,
       panelText: sc ? (sc.innerText||'').replace(/\\s+/g,' ').slice(0,200) : '',

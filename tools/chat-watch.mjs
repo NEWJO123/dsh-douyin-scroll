@@ -126,7 +126,9 @@ const openConversation = async (ev, send, nick, secUid) => {
 const startedAt = Date.now()
 out({ ok: true, phase: 'start', to: TO, to_id: TOID, every_s: EVERY, seconds: SECONDS, inbox: INBOX })
 
-const c = await openPage({ url: 'https://www.douyin.com/chat' })
+// ⭐ 2026-11-11（Issue #19 根因 1）：isolated 独占页面 —— 不加的话这里复用共享页面，
+//    10 秒一次的 /chat 导航会把值班/发卡片的页面当场顶掉（实测「时好时坏」的真凶）。
+const c = await openPage({ url: 'https://www.douyin.com/chat', isolated: true })
 try {
   const url = String(await c.ev('location.href'))
   if (!url.includes('/chat')) {

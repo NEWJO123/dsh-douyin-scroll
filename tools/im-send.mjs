@@ -533,7 +533,7 @@ async function main() {
    *    只读，不发任何东西。
    */
   if (LIST) {
-    const c = await openPage({ url: 'https://www.douyin.com/chat' })
+    const c = await openPage({ url: 'https://www.douyin.com/chat', isolated: true })
     try {
       const url = String(await c.ev('location.href'))
       if (!url.includes('/chat')) {
@@ -594,7 +594,7 @@ async function main() {
     if (text.length > 1800) return out({ ok: false, error: `正文太长（${text.length} 字），抖音信信放不下，拆开发` })
   }
 
-  const c = await openPage({ url: 'https://www.douyin.com/chat' })
+  const c = await openPage({ url: 'https://www.douyin.com/chat', isolated: true })
   const chromed = c.status
   try {
     // 确保停在 /chat

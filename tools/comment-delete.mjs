@@ -25,7 +25,7 @@ const out = (o) => { console.log(JSON.stringify(o, null, 1)); process.exitCode =
 if (!AWEME || !CID) { out({ ok: false, error: '用法: comment-delete.mjs --aweme <id> --cid <cid>' }); process.exit(1) }
 
 try {
-  const c = await openPage()
+  const c = await openPage({ isolated: true })
   const chromed = c.status
   const cur = String(await c.ev('location.href'))
   if (!cur.includes('douyin.com')) {

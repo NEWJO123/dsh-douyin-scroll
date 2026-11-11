@@ -1763,6 +1763,29 @@ try {
     ok('MCP 层把子脚本的 error / hint / stderr_tail 原样透出')
   } else bad('MCP 层又把 error 吞了（Issue #8②）')
 
+  /* ⭐ 2026-11-11（Issue #19 · P13579）：无头脚本的页面必须各开各的（isolated），
+   *    分享面板要兼容抖音改版（旧 data-e2e 标记已变 0×0 隐藏壳）。
+   *    原来所有脚本复用共享页面 ⇒ chat-watch 每 10 秒的 /chat 导航把发卡片/私信的
+   *    页面当场顶掉 ⇒ 值班发送「时好时坏」；分享面板选择器在改版后永远失效。 */
+  {
+    const offenders = []
+    for (const f of readdirSync(join(here, 'tools')).filter((x) => x.endsWith('.mjs'))) {
+      const t = readFileSync(join(here, 'tools', f), 'utf8')
+      for (const m of t.matchAll(/openPage\(([^)]*)\)/g)) {
+        if (!/isolated/.test(m[1])) offenders.push(`${f}: openPage(${m[1].trim() || '无参'})`)
+      }
+    }
+    if (!offenders.length) ok('无头脚本全部 isolated 独占页面（互不抢占 —— Issue #19 根因 1）')
+    else bad(`这些 openPage 没加 isolated —— 会被别的脚本顶掉页面（Issue #19 根因 1）：${offenders.join('、')}`)
+    const cs = readFileSync(join(here, 'tools', 'card-share.mjs'), 'utf8')
+    if (/分享给朋友/.test(cs) && /findPanel/.test(cs) && /width > 250 && r\.height > 100/.test(cs)) {
+      ok('分享面板兼容抖音改版（标题反查浮层优先，旧 data-e2e 标记兜底 —— Issue #19 根因 2）')
+    } else bad('card-share 又只认 [data-e2e="video-share-container"] —— 抖音改版后分享面板永远「没展开」')
+    if (!/await sleep\(7000\)/.test(cs) && /video-share-icon-container/.test(cs) && /for \(let t = 0; t < 30/.test(cs)) {
+      ok('分享图标改成轮询等它真出现（不再固定死等 7 秒 —— Issue #19 根因 3）')
+    } else bad('card-share 又回到固定 sleep(7000) —— 页面 30 秒才画好的机器必挂')
+  }
+
   // #5 webhook 地址不校验 = 本机变内网跳板
   const notifyText = readFileSync(join(here, 'lib', 'notify.mjs'), 'utf8')
   if (/export function checkWebhookTarget/.test(notifyText) && /checkWebhookTarget\(target/.test(notifyText)) {
