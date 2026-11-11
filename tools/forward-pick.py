@@ -287,6 +287,19 @@ def main():
             f.write("- %s\n\n" % r["share_url"])
     print("\n清单 -> %s" % OUT_MD)
 
+    # ⭐ 2026-11-11（挖坑坐实）：forward 清单每轮一个文件、永不清理 —— 一年约 1000 个。
+    #    只留最近 10 个，老的删掉。
+    try:
+        out_dir = os.path.dirname(OUT_MD)
+        olds = sorted(
+            (os.path.join(out_dir, n) for n in os.listdir(out_dir) if n.startswith("forward-") and n.endswith(".md")),
+            key=lambda p: os.stat(p).st_mtime,
+        )
+        for old in olds[:-10]:
+            os.remove(old)
+    except Exception:
+        pass  # 清理失败无所谓，别影响主流程
+
 
 if __name__ == "__main__":
     main()

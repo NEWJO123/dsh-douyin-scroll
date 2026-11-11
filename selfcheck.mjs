@@ -2007,6 +2007,23 @@ try {
     if (/家目录不可写/.test(homePy) && /stage.*home|"home"/.test(homePy)) ok('家目录不可写时给人话（OneDrive / 网络盘不再全程懵）')
     else bad('_home.py 的家目录不可写处理丢了 —— 又要抛 OSError 堆栈')
   } catch (e) { bad(`安装坑守卫失败：${e.message}`) }
+
+  /* ⭐ 2026-11-11：值班运行链路挖出的坑（判重双源 / seen 无限增长 / 清单堆积 / 重复语义 / 负数额度） */
+  try {
+    const duty = readFileSync(join(here, 'prompts', 'duty.md'), 'utf8')
+    const fpp = readFileSync(join(here, 'tools', 'forward-pick.py'), 'utf8')
+    const toastSrc = readFileSync(join(here, 'lib', 'toast.mjs'), 'utf8')
+    if (/alreadyPicked/.test(idx) && /alreadyPicked/.test(duty)) ok('证据包带「最近已推列表」，duty.md 引导直接跳过（判重权威数据对模型可见）')
+    else bad('判重还是双源分裂 —— 模型看不到 ledger，重复推荐会白跑一轮')
+    if (/最后 200 行/.test(duty)) ok('duty.md 引导读 seen.md 最后 200 行（不再整文件读进上下文）')
+    else bad('seen.md 截断指引丢了 —— 几个月后判重表撑爆上下文，判重失效')
+    if (/olds\[:-10\]/.test(fpp) && /forward-/.test(fpp)) ok('forward 清单只留最近 10 个（不再一年堆约 1000 个文件）')
+    else bad('forward-*.md 的清理丢了 —— out/ 目录无限堆积')
+    if (/都是最近推过的/.test(toastSrc)) ok('通知区分「挑了但全是重复」（不再「新增 0 条」却列出视频）')
+    else bad('picksBody 的重复语义文案丢了 —— 「新增 0 条」+ 列出视频会让人困惑')
+    if (/Math\.max\(1, Math\.min\(Math\.trunc\(Number\(cfg\.manualPerRun\)/.test(idx)) ok('manualPerRun 直改 config 塞负数也会被钳到 1-30（手动轮不再必空）')
+    else bad('manualPerRun 的 budget 钳制丢了 —— 直改 config 塞负数会让手动轮提交全拒')
+  } catch (e) { bad(`值班链路守卫失败：${e.message}`) }
 } catch (e) { bad(`采集门槛检查失败：${e.message}`) }
 
 /* ── 5. Python 能否编译 + 判断层能否跑 ── */

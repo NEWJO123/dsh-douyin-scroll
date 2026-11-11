@@ -3620,11 +3620,19 @@ let transientRetries = 0
         }
         list.push(item)
       }
+      // ⭐ 2026-11-11（挖坑坐实）：判重的权威数据（ledger）值班模型看不到 —— 它只看
+      //    自己写的 seen.md，漏记就会把推荐流里刷出来的旧视频再挑一遍 ⇒ 提交被去重，
+      //    白跑一轮。证据包里带上最近两天已推的 ID + 标题，duty.md 引导直接跳过。
+      const dayKeys = [dayKey(), dayKey(new Date(Date.now() - 86_400_000))]
+      const alreadyMap = new Map()
+      for (const d of dayKeys) for (const p of dayRecommendations(stateDir, d)) if (!alreadyMap.has(p.id)) alreadyMap.set(p.id, String(p.title || '').slice(0, 40))
+      const alreadyPicked = [...alreadyMap.entries()].map(([id, title]) => ({ id, title }))
       writeJson(join(stateDir, 'round-evidence.json'), {
         builtAt: new Date().toISOString(),
         sources: picked.meta || [],
         dropped: picked.dropped || {},
         thresholds: picked.thresholds || {},
+        alreadyPicked,
         count: list.length,
         list,
       })
@@ -3695,7 +3703,11 @@ let transientRetries = 0
       // ⭐ 先把闸拉上（防双开），再去异步准备证据包 + 起那一轮 —— 准备证据要十几秒，
       //    同步做会把宿主卡住（HTTP 请求和定时器都在这条线程上）。
       dutyRunning = true
-      const round = beginRound(stateDir, { why, budget: manual ? Number(cfg.manualPerRun) || 3 : Math.max(0, quota - picked), reportBefore: reportTextOfDay() })
+      const round = beginRound(stateDir, { why, budget: manual
+        // ⭐ 2026-11-11：manualPerRun 直改 config.json 可以塞负数（面板有 1-30 钳制，
+        //    直改绕过）—— 不钳的话手动轮的 budget 是负数，提交永远被拒，整轮白跑
+        ? Math.max(1, Math.min(Math.trunc(Number(cfg.manualPerRun) || 3), 30))
+        : Math.max(1, quota - picked), reportBefore: reportTextOfDay() })
       lastFailure = null
       bumpState({
         dutyRunningAt: round.startedAt,
