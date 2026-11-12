@@ -2056,6 +2056,14 @@ try {
     if (/检测到升级/.test(doc) && /charCodeAt\(0\) === 0xfeff/.test(doc)) ok('doctor 读 bdms 版本对比预警（剥 BOM 防御，手写记录也不炸）')
     else bad('doctor 的 bdms 版本预警丢了（或没剥 BOM）—— 签名 SDK 升级没人知道')
   } catch (e) { bad(`bdms 预警守卫失败：${e.message}`) }
+
+  /* ⭐ 2026-11-12（Issue #21）：会话标题辨识化 —— DSH 拿 prompt 首句当会话标题，
+   * 固定首句会让会话列表堆积同名条目（用户实测 8-10 天堆 99 个）。首行带日期/轮次。 */
+  try {
+    if (/刷抖音值班 \$\{roundTag\}/.test(idx) && /const roundTag = `\$\{roundDay\} \$\{nowBJT\.slice/.test(idx)) {
+      ok('值班会话标题带日期/轮次唯一标识（不再堆 99 个同名 —— Issue #21）')
+    } else bad('会话标题又变回固定首句 —— 列表会堆积同名条目，没法按日清理（Issue #21）')
+  } catch (e) { bad(`会话标题守卫失败：${e.message}`) }
 } catch (e) { bad(`采集门槛检查失败：${e.message}`) }
 
 /* ── 5. Python 能否编译 + 判断层能否跑 ── */

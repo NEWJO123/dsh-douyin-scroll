@@ -3132,7 +3132,17 @@ const TRANSIENT_RE = /请求被拦截|Illegal API invocation|unapproved channel|
     const roundDay = round?.day || dayKey()
     const commentOn = Boolean(cfg.autoComment && cfg.mentionName && cfg.commentExecutor !== 'off')
 
-    return `你是这个账号的抖音助手。`
+    /**
+     * ⭐ 2026-11-12（Issue #21）：DSH 拿提示词的**第一句**当会话标题 —— 固定第一句
+     *    会让会话列表堆积一堆同名条目（用户实测 8-10 天堆了 99 个「你是这个账号的
+     *    抖音助手。」）。第一行改成带日期/时段/轮次的唯一标识 ⇒ 标题变成
+     *    「…（本轮：2026-11-12 00:43 · 轮次 a1b2c3d4）」—— 可辨识、可按日清理。
+     *    轮身份信息放括号里，模型读到的指令语义完全不变。
+     */
+    const roundTag = `${roundDay} ${nowBJT.slice(11, 16)}`
+      + (why === 'manual' ? ' · 手动' : '')
+      + (round?.id ? ` · 轮次 ${String(round.id).slice(0, 8)}` : '')
+    return `你是这个账号的抖音助手（本轮：刷抖音值班 ${roundTag}）。`
       + `⏰ **现在时间（真实北京时间）：${nowBJT}** —— 报告里凡是提到时间，一律用这个，**别自己猜**。`
       + `⭐ 这一轮的工作目录是 ${stateDir}（插件家），**报告和判重表都写在这里面**。`
       + ownerDoc
