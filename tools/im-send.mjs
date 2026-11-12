@@ -104,7 +104,40 @@ const readMessages = async (ev) => {
       }
       var pc = found.parsedContent || {};
       var text = String(pc.text || pc.content_title || '').replace(/\\s+/g, ' ').trim();
-      out.push({ own: side, text: text, awe: pc.aweType || 0, item: pc.itemId ? String(pc.itemId) : '' });
+      /**
+       * ⭐ 2026-11-12（收衍生仓库 kHolmesXX/dsh-fish_live_in_douyin fish.11 的做法）：
+       *   群聊场景 parsedContent 里没有 sender，但 React fiber 的 message 对象上
+       *   （或它的 sender/user/author/fromUser/userInfo 里）可能带着昵称 ——
+       *   存在都试一遍，取不到就 sender:''（不猜、不编）。≤40 字。
+       *   私信（1v1）场景 from 已有方向，sender 锦上添花；群聊是刚需（谁发的）。
+       */
+      var sender = '';
+      (function(){
+        var KEYS = ['nickname','nickName','nick','displayName','userName','username'];
+        var cands = [found.sender, found.user, found.author, found.fromUser, found.userInfo];
+        for (var k in found) {
+          if (k === 'parsedContent' || k === 'sender' || k === 'user' || k === 'author') continue;
+          var v = found[k];
+          if (v && typeof v === 'object' && !Array.isArray(v)) cands.push(v);
+        }
+        for (var i = 0; i < cands.length && !sender; i++) {
+          var o = cands[i];
+          if (!o || typeof o !== 'object') continue;
+          for (var j = 0; j < KEYS.length; j++) {
+            var v2 = o[KEYS[j]];
+            if (typeof v2 === 'string' && v2.trim()) { sender = v2.trim().slice(0, 40); break; }
+          }
+          if (sender) break;
+          var u = o.user || o.author || o.sender;
+          if (u && typeof u === 'object') {
+            for (var j2 = 0; j2 < KEYS.length; j2++) {
+              var v3 = u[KEYS[j2]];
+              if (typeof v3 === 'string' && v3.trim()) { sender = v3.trim().slice(0, 40); break; }
+            }
+          }
+        }
+      })();
+      out.push({ own: side, text: text, awe: pc.aweType || 0, item: pc.itemId ? String(pc.itemId) : '', sender: sender });
     });
     return JSON.stringify(out);
   })()`)
@@ -647,9 +680,12 @@ async function main() {
         verified_open: true,
         count: msgs.length, mine: cnt('me'), them: cnt('them'), unknown: cnt('unknown'),
         sender_attribution: 'avatar-side（36px 头像落在列表左/右半边；unknown = 该组没有头像可继承）',
+        // ⭐ 2026-11-12（收衍生仓库 fish.11）：群聊场景从 fiber 挖到的发言人昵称
+        //    （1v1 私信里 from 已有方向，此字段多为空 —— 群聊是刚需）
         // 最新的在最后一条
         messages: ordered.slice(-60).map((m) => ({
           from: m.from,
+          sender: m.sender || undefined,
           text: String(m.text || '').slice(0, 160),
           awe: m.awe || undefined,
           item: m.item || undefined,

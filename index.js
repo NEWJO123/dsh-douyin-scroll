@@ -4047,9 +4047,11 @@ let transientRetries = 0
         cwState.notified += fresh.length
         chatWatchLog(`新消息 ${fresh.length} 条（群「${nick}」）：${String(fresh[0].text || '').slice(0, 60)}`)
         // 转达给值班 —— 群里的话都是素材，值班自己判断要不要回（回个人用 douyin_dm，回群不承诺）
+        // ⭐ 2026-11-12（收衍生仓库 fish.11）：sender（fiber 挖到的发言人昵称）随消息带出，
+        //    转达时能说「谁说的」—— 群消息的 from 全是 unknown（头像全在左半边），sender 是唯一署名。
         const gtext = [
           `【抖音群聊·自动转达】群「${nick}」来了 ${fresh.length} 条新消息：`,
-          ...fresh.slice(-5).map((m) => `- ${String(m.text || '').slice(0, 100)}`),
+          ...fresh.slice(-5).map((m) => `- ${String(m.sender || '').trim() ? `${String(m.sender).trim()}：` : ''}${String(m.text || '').slice(0, 100)}`),
           `（群里谁都在说话，**默认不要回** —— 除非有人 @小鱼 或明确在跟鱼说话；`,
           `🔴 网页端往群里发消息，群里人**可能**收不到（手机端正常）—— 这是在鱼号上试到的，别的号不一定；`,
           `所以**绝对不要**用 douyin_dm/im-send 往这个群里发任何东西；真要回话就douyin_dm 私聊那个人，或者记下来等主人在的时候说。）`,
