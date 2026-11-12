@@ -212,7 +212,28 @@ try {
       toast: (document.body.innerText||'').indexOf('已发送')>=0 || (document.body.innerText||'').indexOf('发送成功')>=0
     });
   })()`)
-  out({ ok: true, sent: true, aweme_id: AID, to: WHO, panel, btn: b, chrome: chromed, after: JSON.parse(after) })
+
+  // ⭐ 2026-11-12（夜班挖坑）：sent 不能只凭「点了按钮」—— 切到会话页回读，
+  //    确认卡片真的出现在「我发的」消息里（右侧 108px 缩略图）。读不到如实带出。
+  await send('Page.navigate', { url: 'https://www.douyin.com/chat' })
+  await sleep(6000)
+  const readback = JSON.parse(await ev(`(function(){
+    var listNode = document.querySelector('[class*="messageMessageList"]') || document.body;
+    var lb = listNode.getBoundingClientRect(), mid = lb.left + lb.width / 2;
+    var nodes = Array.prototype.slice.call(document.querySelectorAll('[class*="messageMessageBox"]'));
+    for (var i = nodes.length - 1; i >= 0; i--) {
+      var r = nodes[i].getBoundingClientRect();
+      if (r.width < 10 || r.height < 10) continue;
+      var side = ((r.left + r.width / 2) < mid) ? 'them' : 'me';
+      if (side !== 'me') continue;
+      var imgs = Array.prototype.slice.call(nodes[i].querySelectorAll('img')).filter(function(im){
+        var b = im.getBoundingClientRect(); return b.width > 80 && b.width < 140 && b.height > 60;
+      });
+      if (imgs.length) return JSON.stringify({ card_in_mine: true, newest: (nodes[i].innerText||'').replace(/\\s+/g,' ').slice(0, 60) });
+    }
+    return JSON.stringify({ card_in_mine: false });
+  })()`))
+  out({ ok: true, sent: true, aweme_id: AID, to: WHO, panel, btn: b, chrome: chromed, after: JSON.parse(after), readback })
 } catch (e) {
   out({ ok: false, error: String(e?.message ?? e) })
 } finally {
