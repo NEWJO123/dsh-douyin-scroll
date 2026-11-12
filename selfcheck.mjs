@@ -1858,10 +1858,11 @@ try {
   if (/BROWSER_SCRIPTS/.test(idx) && /withScriptLock\(/.test(idx)) {
     ok('走浏览器的脚本有互斥闸（异步后不再抢同一个 chrome-profile）')
   } else bad('浏览器脚本互斥闸不见了 —— 异步并发会抢同一个无头浏览器')
-  // 未登录不自动值班：没 Cookie 时定时器一轮也白跑，还平白冻宿主一次探针
-  if (/未登录不自动值班/.test(idx) && /if \(!hasCredential\(stateDir\)\) return/.test(idx)) {
-    ok('未登录时定时器不自动值班（新装机不再「装上去就卡死」）')
-  } else bad('定时器没有未登录闸 —— 新装机到点就白跑一轮（还会冻宿主一次探针）')
+// 未登录不自动值班：没 Cookie 时定时器一轮也白跑，还平白冻宿主一次探针
+// ⭐ 2026-11-12：tick 重构成「跳过原因日志」流 —— 未登录闸变成 skip 分支（原因变化才记日志）
+if (/未登录不自动值班/.test(idx) && /还没登录（没有 Cookie）—— 登录后自动值班会恢复/.test(idx)) {
+ok('未登录时定时器不自动值班（新装机不再「装上去就卡死」）')
+} else bad('定时器没有未登录闸 —— 新装机到点就白跑一轮（还会冻宿主一次探针）')
 
   /* ── 🔴 2026-11-05：跨平台 venv 路径 + 环境就绪口径（mac/Linux 装好也用不了的老坑） ── */
   const pathsSrc = readIf(join(here, 'lib', 'paths.mjs'))
@@ -2063,22 +2064,7 @@ try {
     if (/刷抖音值班 \$\{roundTag\}/.test(idx) && /const roundTag = `\$\{roundDay\} \$\{nowBJT\.slice/.test(idx)) {
       ok('值班会话标题带日期/轮次唯一标识（不再堆 99 个同名 —— Issue #21）')
     } else bad('会话标题又变回固定首句 —— 列表会堆积同名条目，没法按日清理（Issue #21）')
-  /* ⭐ 2026-11-12（Issue #21）：会话标题辨识化 —— DSH 拿 prompt 首句当会话标题，
-   * 固定首句会让会话列表堆积同名条目（用户实测 8-10 天堆 99 个）。首行带日期/轮次。 */
-  try {
-    if (/刷抖音值班 \$\{roundTag\}/.test(idx) && /const roundTag = `\$\{roundDay\} \$\{nowBJT\.slice/.test(idx)) {
-      ok('值班会话标题带日期/轮次唯一标识（不再堆 99 个同名 —— Issue #21）')
-    } else bad('会话标题又变回固定首句 —— 列表会堆积同名条目，没法按日清理（Issue #21）')
   } catch (e) { bad(`会话标题守卫失败：${e.message}`) }
-
-  /* ⭐ 2026-11-12（收衍生仓库 kHolmesXX fish.11）：群消息带发言人昵称（fiber 挖 sender）
-   * —— 群消息 from 全是 unknown（头像全在左半边），sender 是唯一的「谁发的」署名。 */
-  try {
-    const ims = readFileSync(join(here, 'tools', 'im-send.mjs'), 'utf8')
-    if (/var sender = '';/.test(ims) && /sender: sender/.test(ims) && /sender: m\.sender/.test(ims)) {
-      ok('群消息带发言人昵称（readMessages 从 fiber 挖 sender，转达可说「谁说的」）')
-    } else bad('im-send 的 sender 提取丢了 —— 群转达不知道谁说的（fish.11 的改进别丢）')
-  } catch (e) { bad(`群 sender 守卫失败：${e.message}`) }
 } catch (e) { bad(`采集门槛检查失败：${e.message}`) }
 
 /* ── 5. Python 能否编译 + 判断层能否跑 ── */

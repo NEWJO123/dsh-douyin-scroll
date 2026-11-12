@@ -3935,6 +3935,8 @@ let transientRetries = 0
   /* ─────────────── 谷时定时器 ───────────────
    * 🔴 定时器回调里抛的异常**没人接**，会直接把整个宿主进程带走 ⇒ 必须自己兜住所有异常。
    */
+  /** ⭐ 2026-11-12：谷时定时器最近一次「自动跳过」的原因（变化才记日志，避免刷屏） */
+  let lastAutoSkip = ''
   const tick = () => {
     try {
       refreshCfg()
@@ -3944,18 +3946,38 @@ let transientRetries = 0
       //    现在「有没有任何一个时段开着」本身就是开关：全关 = 只手动跑。
       const now = new Date()
       const st = readJson(dutyStateFile, {})
-      if (!autoEnabled(cfg) || countsToday(now).auto >= Number(cfg.perDay || 0)) return
-      // ⭐ 未登录不自动值班（2026-10-31，B 站「装了就卡死」）：没 Cookie 时这一轮
-      //    注定失败，白冻结宿主一次探测 —— 装完插件安安静静等用户先登录。手动跑不受影响。
-      if (!hasCredential(stateDir)) return
-      // ⭐ 把所有生效的时段拼成一个列表：内置中午/晚上 + 用户自定义
-      //    自定义按「开始日期一次」去重，key 用 `custom:<下标>`；设置保存时保留/重映射已用记录。
-      const range = scheduledWindows(cfg, now, st.windows || {})
-      for (const w of range) {
-        if (!w.active) continue
-        const result = runDuty(`window:${w.key}`)
-        if (result.started) bumpState({ windows: { ...(st.windows || {}), [w.key]: true } })
-        return
+      /**
+       * ⭐ 2026-11-12（夜班挖坑）：下面几个 return 原来**全部静默** —— 用户问
+       *    「值班为什么没跑」时，日志里一个字都没有，排障要挖 config + ledger
+       *    才能定位（今晚自己就踩了）。改成：跳过原因**变化时才记一条日志**
+       *    （不刷屏）+ 落 state（lastAutoSkip，面板/排障可见）。
+       */
+      let skip = ''
+      if (!autoEnabled(cfg) || countsToday(now).auto >= Number(cfg.perDay || 0)) {
+        skip = countsToday(now).auto >= Number(cfg.perDay || 0)
+          ? `今日自动额度已满（${countsToday(now).auto}/${Number(cfg.perDay || 0)}）`
+          : '自动计划已暂停'
+      } else if (!hasCredential(stateDir)) {
+        // ⭐ 未登录不自动值班（2026-10-31，B 站「装了就卡死」）：没 Cookie 时这一轮
+        //    注定失败，白冻结宿主一次探测 —— 装完插件安安静静等用户先登录。手动跑不受影响。
+        skip = '还没登录（没有 Cookie）—— 登录后自动值班会恢复'
+      } else {
+        // ⭐ 把所有生效的时段拼成一个列表：内置中午/晚上 + 用户自定义
+        //    自定义按「开始日期一次」去重，key 用 `custom:<下标>`；设置保存时保留/重映射已用记录。
+        const range = scheduledWindows(cfg, now, st.windows || {})
+        const w = range.find((x) => x.active)
+        if (!w) skip = '所有时段都关着（中午/晚上/自定义）—— 开任意一个时段，自动值班就恢复'
+        else {
+          const result = runDuty(`window:${w.key}`)
+          if (result.started) bumpState({ windows: { ...(st.windows || {}), [w.key]: true } })
+          lastAutoSkip = ''
+          return
+        }
+      }
+      if (skip !== lastAutoSkip) {
+        log(`值班自动跳过：${skip} —— 想立即跑一轮可点「现在跑一轮」`)
+        lastAutoSkip = skip
+        try { bumpState({ lastAutoSkip: skip }) } catch { /* 状态写不进就算了 */ }
       }
     } catch (e) {
       log(`定时器这一跳出错（已兜住，不影响宿主）：${e?.stack ?? e}`)
