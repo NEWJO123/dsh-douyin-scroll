@@ -57,6 +57,9 @@ import {
 } from './lib/memory.mjs'
 // 🔴 她的脑子（对话 + 白名单动作）。主人 2026-10-24：不能"收到消息乱回"。
 import { matchLocalIntent, askModel, runAction, PET_ACTIONS } from './lib/pet-brain.mjs'
+// 🔴 只读桌宠「小鱼」长期记忆（atoms/profile）。⚠️ 只许接 /pet/chat 的本地脑/模型兜底，
+//    绝不接值班/评论/私信等任何对外发送路径 —— 主人的隐私一个字都不许出去。
+import { createMemoryBridge } from './lib/pet-memory-bridge.mjs'
 // 🔴 她的眼睛（看主人在干什么）。主人：「要像人一样」。
 import { translateEvents } from './lib/pet-observe.mjs'
 // 🔴 她的日记（主人：「可以查看她今天写了什么感人的言论」）。
@@ -4409,6 +4412,10 @@ let transientRetries = 0
      ══════════════════════════════════════════════════════════════════════ */
   // 她跟主人的对话上下文（内存，最多 8 条；不入盘，重启即清）
   let petChatHistory = []
+  /* ⭐ 2026-11-14：桌宠长期记忆的只读桥。一个插件实例只建一次。
+   * 🔴 只允许下面的 /api/douyin-duty/pet/chat 本地脑/模型兜底用 ——
+   *    值班 / chatWatch / 评论 / 私信任何对外路径都不许碰它。 */
+  const memoryBridge = createMemoryBridge({ ctx, log })
   /* ⭐ 2026-10-25 拆分：`petSay` 从"写状态文件 + 写日记"改成**只在内存里记一句**。
    *
    *  原来它做两件事：
@@ -5574,9 +5581,18 @@ let transientRetries = 0
         }
 
         const t0 = Date.now()
+        /* ⭐ 2026-11-14：只读桌宠长期记忆 —— 只在这条「主人自己跟小鱼说话」的
+         * 本地脑/模型兜底路径上召回。bridge 设计成永不抛错，这里再兜一层：
+         * 拿不到记忆就按没有记忆正常聊，绝不影响回复、绝不落到对外发送路径。 */
+        const mem = await memoryBridge.recall(q, { topK: 4, maxChars: 500 })
+          .catch(() => ({ ok: false, text: '', items: [] }))
+        if (mem && mem.text) log(`桌宠对话[记忆]：带上 ${Array.isArray(mem.items) ? mem.items.length : 0} 条桌宠记忆`)
         let r
         try {
-          r = await askModel({ llm, route, text: q, history: petChatHistory, maxTokens: 320 })
+          r = await askModel({
+            llm, route, text: q, history: petChatHistory, maxTokens: 320,
+            memoryBrief: mem && typeof mem.text === 'string' ? mem.text : '',
+          })
         } catch (e) {
           log(`桌宠对话[模型]失败：${e?.message ?? e}`)
           return sendJson(res, 200, {
